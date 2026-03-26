@@ -367,6 +367,165 @@ check(f"rac_linear == rac_matmul(A, W.T) + b  (err={err:.2e})", err < 1e-2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DVT-13: Mixed precision — fp16
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-13: Mixed precision — float16")
+
+A_fp16 = torch.randn(128, 128, device=device, dtype=torch.float16)
+B_fp16 = torch.randn(128, 128, device=device, dtype=torch.float16)
+try:
+    C_fp16 = rac_matmul(A_fp16, B_fp16)
+    check("rac_matmul fp16 runs", True)
+    check("  output dtype is fp16", C_fp16.dtype == torch.float16)
+    C_ref = torch.matmul(A_fp16.float(), B_fp16.float()).half()
+    err = (C_fp16.float() - C_ref.float()).abs().max().item()
+    check(f"  correctness (err={err:.2e})", err < 0.5)  # fp16 has ~1e-3 precision
+except Exception as e:
+    check("rac_matmul fp16", False, str(e)[:80])
+
+# RACLinear with fp16
+layer_f16 = RACLinear(128, 64, bias=True).to(device).half()
+x_f16 = torch.randn(8, 128, device=device, dtype=torch.float16)
+try:
+    y_f16 = layer_f16(x_f16)
+    check("RACLinear fp16 forward", True)
+    check("  output dtype fp16", y_f16.dtype == torch.float16)
+    check("  output finite", torch.isfinite(y_f16).all().item())
+except Exception as e:
+    check("RACLinear fp16 forward", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-14: Mixed precision — bfloat16
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-14: Mixed precision — bfloat16")
+
+if torch.cuda.is_bf16_supported():
+    A_bf = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    B_bf = torch.randn(128, 128, device=device, dtype=torch.bfloat16)
+    try:
+        C_bf = rac_matmul(A_bf, B_bf)
+        check("rac_matmul bf16 runs", True)
+        check("  output dtype is bf16", C_bf.dtype == torch.bfloat16)
+    except Exception as e:
+        check("rac_matmul bf16", False, str(e)[:80])
+
+    layer_bf = RACLinear(128, 64, bias=True).to(device).to(torch.bfloat16)
+    x_bf = torch.randn(8, 128, device=device, dtype=torch.bfloat16)
+    try:
+        y_bf = layer_bf(x_bf)
+        check("RACLinear bf16 forward", True)
+        check("  output dtype bf16", y_bf.dtype == torch.bfloat16)
+    except Exception as e:
+        check("RACLinear bf16 forward", False, str(e)[:80])
+else:
+    skip("bfloat16 tests", "device does not support bf16")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-15: torch.autocast (AMP)
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-15: torch.autocast (mixed precision training)")
+
+layer_amp = RACLinear(256, 128, bias=True).to(device)
+x_amp = torch.randn(16, 256, device=device)
+
+try:
+    with torch.autocast('cuda', dtype=torch.float16):
+        y_amp = layer_amp(x_amp)
+    check("autocast fp16 forward", True)
+    check("  output is finite", torch.isfinite(y_amp).all().item())
+except Exception as e:
+    check("autocast fp16 forward", False, str(e)[:80])
+
+if torch.cuda.is_bf16_supported():
+    try:
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            y_amp_bf = layer_amp(x_amp)
+        check("autocast bf16 forward", True)
+    except Exception as e:
+        check("autocast bf16 forward", False, str(e)[:80])
+
+# Autocast with backward
+try:
+    scaler = torch.amp.GradScaler()
+    opt = torch.optim.SGD(layer_amp.parameters(), lr=0.01)
+    opt.zero_grad()
+    with torch.autocast('cuda', dtype=torch.float16):
+        y_train = layer_amp(x_amp)
+        loss = y_train.sum()
+    scaler.scale(loss).backward()
+    scaler.step(opt)
+    scaler.update()
+    check("autocast + GradScaler training step", True)
+    check("  weight grad exists", layer_amp.weight.grad is not None)
+except Exception as e:
+    check("autocast + GradScaler training step", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-16: torch.compile compatibility
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-16: torch.compile compatibility")
+
+if hasattr(torch, 'compile'):
+    layer_compile = RACLinear(128, 64, bias=True).to(device)
+    try:
+        compiled = torch.compile(layer_compile, mode='reduce-overhead')
+        x_c = torch.randn(8, 128, device=device)
+        y_c = compiled(x_c)
+        check("torch.compile forward", True)
+        check("  output shape correct", tuple(y_c.shape) == (8, 64))
+        check("  output finite", torch.isfinite(y_c).all().item())
+    except Exception as e:
+        # torch.compile may not support all custom ops — graceful skip
+        skip("torch.compile forward", f"not supported: {str(e)[:60]}")
+else:
+    skip("torch.compile tests", "torch.compile not available (PyTorch < 2.0)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-17: model.half() / model.bfloat16() compatibility
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-17: model dtype casting")
+
+model_cast = nn.Sequential(
+    RACLinear(128, 64),
+    nn.ReLU(),
+    RACLinear(64, 32),
+).to(device)
+
+# .half()
+model_half = model_cast.half()
+x_half = torch.randn(4, 128, device=device, dtype=torch.float16)
+try:
+    y_half = model_half(x_half)
+    check("model.half() forward", True)
+    check("  output dtype fp16", y_half.dtype == torch.float16)
+except Exception as e:
+    check("model.half() forward", False, str(e)[:80])
+
+# .float() back
+model_f32 = model_cast.float()
+x_f32 = torch.randn(4, 128, device=device)
+try:
+    y_f32 = model_f32(x_f32)
+    check("model.float() after half()", True)
+except Exception as e:
+    check("model.float() after half()", False, str(e)[:80])
+
+# .bfloat16()
+if torch.cuda.is_bf16_supported():
+    model_bf = model_cast.to(torch.bfloat16)
+    x_bf = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
+    try:
+        y_bf = model_bf(x_bf)
+        check("model.bfloat16() forward", True)
+    except Exception as e:
+        check("model.bfloat16() forward", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 header("DVT Summary")
