@@ -278,10 +278,11 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 }
 
 /* ── HIP kernel wrappers ─────────────────────────────────────────────────── */
-/* Define RAC_NO_KERNELS before including to suppress these (e.g. if the
-   benchmark file provides its own kernel definitions).                      */
+/* Define RAC_DEFINE_KERNELS to include these kernel wrappers.
+   When linking with a benchmark that defines its own kernels, leave
+   this undefined to avoid duplicate symbol errors with -fgpu-rdc.   */
 
-#ifndef RAC_NO_KERNELS
+#ifdef RAC_DEFINE_KERNELS
 
 __global__
 void rac_rotate_batch_kernel(float2 *v, float *theta, float2 *out, int n) {
@@ -307,7 +308,7 @@ void rac_matmul_kernel(float *A, float *B, float *C, int M, int N, int K) {
     C[m * N + n] = sum;
 }
 
-#endif /* RAC_NO_KERNELS */
+#endif /* RAC_DEFINE_KERNELS */
 
 /* ── Context ─────────────────────────────────────────────────────────────── */
 

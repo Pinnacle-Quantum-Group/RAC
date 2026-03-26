@@ -160,10 +160,31 @@ static int check_correctness(float *rac_out, float *blas_out, int M, int N,
     return failures == 0;
 }
 
-/* ── RAC matmul kernel (GPU) ─────────────────────────────────────────────── */
+/* ── RAC kernel definitions for benchmark ─────────────────────────────────── */
 
-extern __global__ void rac_matmul_kernel(float *A, float *B, float *C,
-                                          int M, int N, int K);
+__global__
+void rac_matmul_kernel(float *A, float *B, float *C, int M, int N, int K) {
+    int m = blockIdx.y * blockDim.y + threadIdx.y;
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= M || n >= N) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < K; k++) {
+        float a_val  = A[m * K + k];
+        float b_val  = B[k * N + n];
+        float2 va    = make_float2(a_val, 0.0f);
+        float mag_b  = fabsf(b_val);
+        float angle_b = (b_val >= 0.0f) ? 0.0f : 3.14159265f;
+        sum += rac_project(va, angle_b) * mag_b;
+    }
+    C[m * N + n] = sum;
+}
+
+__global__
+void rac_rotate_batch_kernel(float2 *v, float *theta, float2 *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = rac_rotate(v[i], theta[i]);
+}
 
 /* ── Benchmark: single size ──────────────────────────────────────────────── */
 
@@ -339,8 +360,6 @@ static void bench_primitives(void) {
     /* rotate_batch */
     dim3 block(256);
     dim3 grid((N + 255) / 256);
-
-    extern __global__ void rac_rotate_batch_kernel(float2*, float*, float2*, int);
 
     CHECK_GPU(cudaDeviceSynchronize());
     unsigned long long ep0 = energy_mj();
