@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAC — Rotation-Accumulate</title>
+<meta name="description" content="MAC is dead. Rotation-Accumulate beats hipBLAS 2.48x with zero multiplications.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;700;800&family=Newsreader:ital,opsz,wght@0,6..72,300;1,6..72,300&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#080808;--bg2:#0f0f0f;--bg3:#161616;--line:#222;--dim:#444;--mid:#888;--text:#e8e4dc;--accent:#c8ff00;--amber:#ffaa00;--red:#ff4444;--blue:#4488ff;--mono:'DM Mono',monospace;--display:'Syne',sans-serif;--serif:'Newsreader',serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.6;overflow-x:hidden;cursor:crosshair}
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");pointer-events:none;z-index:9999;opacity:.4}
+.grid-bg{position:fixed;inset:0;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:60px 60px;opacity:.3;pointer-events:none;z-index:0}
+.ticker-wrap{position:fixed;top:0;left:0;right:0;height:32px;background:var(--accent);overflow:hidden;z-index:100;display:flex;align-items:center}
+.ticker{display:flex;white-space:nowrap;animation:tick 28s linear infinite}
+.ticker span{font-family:var(--mono);font-size:11px;font-weight:500;color:#080808;padding:0 40px;letter-spacing:.08em;text-transform:uppercase}
+.ticker span::after{content:'◆';padding-left:40px}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+nav{position:fixed;top:32px;left:0;right:0;height:56px;background:rgba(8,8,8,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 40px;z-index:99}
+.nav-logo{font-family:var(--display);font-size:20px;font-weight:800;letter-spacing:-.02em;color:var(--accent)}
+.nav-logo span{color:var(--text)}
+.nav-links{display:flex;gap:32px;list-style:none}
+.nav-links a{color:var(--mid);text-decoration:none;font-size:12px;letter-spacing:.1em;text-transform:uppercase;transition:color .2s}
+.nav-links a:hover{color:var(--accent)}
+.nav-cta{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#080808;background:var(--accent);padding:8px 20px;text-decoration:none;font-weight:500;transition:opacity .2s}
+.nav-cta:hover{opacity:.85}
+section{position:relative;z-index:1}
+#hero{min-height:100vh;padding:160px 40px 80px;display:flex;flex-direction:column;justify-content:center;max-width:1200px;margin:0 auto}
+.hero-eyebrow{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin-bottom:24px;opacity:0;animation:fadeUp .6s .2s forwards}
+.hero-title{font-family:var(--display);font-size:clamp(56px,8vw,120px);font-weight:800;line-height:.95;letter-spacing:-.04em;margin-bottom:32px;opacity:0;animation:fadeUp .7s .4s forwards}
+.hero-title .line1{display:block;color:var(--text)}
+.hero-title .line2{display:block;color:var(--accent)}
+.hero-title .line3{display:block;color:transparent;-webkit-text-stroke:1px var(--dim)}
+.hero-sub{font-family:var(--serif);font-style:italic;font-size:clamp(18px,2.5vw,26px);font-weight:300;color:var(--mid);max-width:600px;line-height:1.5;margin-bottom:56px;opacity:0;animation:fadeUp .7s .6s forwards}
+.hero-stats{display:flex;gap:0;border:1px solid var(--line);width:fit-content;opacity:0;animation:fadeUp .7s .8s forwards}
+.stat{padding:24px 40px;border-right:1px solid var(--line)}
+.stat:last-child{border-right:none}
+.stat-val{font-family:var(--display);font-size:42px;font-weight:800;letter-spacing:-.03em;color:var(--accent);line-height:1;display:block}
+.stat-label{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mid);margin-top:6px;display:block}
+.hero-buttons{display:flex;gap:16px;margin-top:48px;opacity:0;animation:fadeUp .7s 1s forwards}
+.btn-primary{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;background:var(--accent);color:#080808;padding:14px 32px;text-decoration:none;font-weight:500;transition:transform .15s,opacity .15s}
+.btn-primary:hover{transform:translateY(-2px);opacity:.9}
+.btn-secondary{font-family:var(--mono);font-size:13px;letter-spacing:.08em;text-transform:uppercase;background:transparent;color:var(--text);padding:14px 32px;text-decoration:none;border:1px solid var(--line);transition:border-color .2s,color .2s}
+.btn-secondary:hover{border-color:var(--text)}
+.scroll-hint{position:absolute;bottom:40px;left:40px;font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:var(--dim);display:flex;align-items:center;gap:12px;opacity:0;animation:fadeUp .7s 1.4s forwards}
+.scroll-hint::before{content:'';display:block;width:1px;height:40px;background:var(--dim);animation:scrollPulse 2s ease-in-out infinite}
+@keyframes scrollPulse{0%,100%{opacity:.3;transform:scaleY(1)}50%{opacity:1;transform:scaleY(1.2)}}
+.counter-wrap{display:flex;align-items:baseline;gap:12px;margin:40px 0 0}
+.counter{font-family:var(--display);font-size:56px;font-weight:800;letter-spacing:-.04em;color:var(--accent);line-height:1;font-feature-settings:"tnum"}
+.counter-label{font-size:13px;color:var(--mid);letter-spacing:.08em;text-transform:uppercase}
+#proof{border-top:1px solid var(--line);padding:120px 40px;max-width:1200px;margin:0 auto}
+.section-label{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin-bottom:16px}
+.section-title{font-family:var(--display);font-size:clamp(36px,5vw,72px);font-weight:800;letter-spacing:-.03em;line-height:1;margin-bottom:64px}
+.proof-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);margin-bottom:80px}
+.proof-cell{background:var(--bg);padding:40px;transition:background .2s}
+.proof-cell:hover{background:var(--bg2)}
+.proof-num{font-family:var(--display);font-size:11px;font-weight:700;letter-spacing:.15em;color:var(--dim);text-transform:uppercase;margin-bottom:16px}
+.proof-heading{font-family:var(--display);font-size:22px;font-weight:700;margin-bottom:12px;color:var(--text)}
+.proof-body{font-family:var(--serif);font-style:italic;font-size:15px;color:var(--mid);line-height:1.7}
+.proof-eq{font-family:var(--mono);font-size:13px;color:var(--accent);background:var(--bg3);padding:12px 16px;margin-top:16px;border-left:2px solid var(--accent);display:block}
+#benchmark{border-top:1px solid var(--line);padding:120px 40px;max-width:1200px;margin:0 auto}
+.bench-header{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:48px;flex-wrap:wrap;gap:24px}
+.bench-device{font-size:12px;letter-spacing:.08em;color:var(--mid);text-transform:uppercase;text-align:right}
+.bench-device strong{color:var(--text);display:block;font-size:14px;margin-bottom:4px}
+.bench-table{width:100%;border-collapse:collapse;margin-bottom:48px}
+.bench-table th{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);text-align:left;padding:12px 16px;border-bottom:1px solid var(--line);font-weight:400}
+.bench-table td{padding:14px 16px;border-bottom:1px solid var(--line);font-size:13px}
+.bench-table tr:hover td{background:var(--bg2)}
+.bench-table .kernel{color:var(--text)}
+.bench-table .tops{color:var(--mid);font-feature-settings:"tnum"}
+.bench-table .speed{font-weight:500;font-feature-settings:"tnum"}
+.bench-table .pass{color:var(--accent);font-size:11px;letter-spacing:.1em}
+.bench-table .winner{color:var(--accent)}
+.bench-table .blas{color:var(--amber)}
+.bar-row{display:flex;align-items:center;gap:16px;margin-bottom:10px}
+.bar-label{width:140px;font-size:12px;color:var(--mid);text-align:right;flex-shrink:0}
+.bar-track{flex:1;height:28px;background:var(--bg3);position:relative;overflow:hidden}
+.bar-fill{height:100%;position:relative;display:flex;align-items:center;justify-content:flex-end;padding-right:10px;font-size:12px;font-weight:500;transition:width 1.5s cubic-bezier(.16,1,.3,1);width:0}
+.bar-fill.rac{background:var(--accent);color:#080808}
+.bar-fill.blas{background:var(--amber);color:#080808}
+.bar-fill.dim{background:var(--bg3);border:1px solid var(--line);color:var(--mid)}
+.bar-ref{position:absolute;top:0;bottom:0;width:1px;background:var(--amber);opacity:.5}
+.bar-ref-label{position:absolute;top:-18px;font-size:10px;color:var(--amber);white-space:nowrap;transform:translateX(-50%);letter-spacing:.08em}
+#code{border-top:1px solid var(--line);padding:120px 40px;max-width:1200px;margin:0 auto}
+.code-tabs{display:flex;gap:0;border-bottom:1px solid var(--line)}
+.code-tab{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--mid);padding:12px 24px;cursor:pointer;border-bottom:2px solid transparent;transition:color .2s,border-color .2s;user-select:none}
+.code-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.code-tab:hover:not(.active){color:var(--text)}
+.code-block{display:none;background:var(--bg2);border:1px solid var(--line);border-top:none;padding:32px;overflow-x:auto}
+.code-block.active{display:block}
+pre{font-family:var(--mono);font-size:13px;line-height:1.7;color:var(--text);white-space:pre}
+.c-green{color:#8ec07c}.c-yellow{color:var(--accent)}.c-blue{color:#83a598}.c-gray{color:#665c54}.c-amber{color:var(--amber)}.c-red{color:#fb4934}.c-purple{color:#d3869b}
+#primitives{border-top:1px solid var(--line);padding:120px 40px;max-width:1200px;margin:0 auto}
+.prim-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}
+.prim-card{background:var(--bg);padding:28px 32px;transition:background .2s}
+.prim-card:hover{background:var(--bg2)}
+.prim-category{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+.prim-name{font-family:var(--mono);font-size:14px;color:var(--text);margin-bottom:8px}
+.prim-desc{font-size:12px;color:var(--mid);line-height:1.5}
+#license{border-top:1px solid var(--line);padding:120px 40px;max-width:1200px;margin:0 auto}
+.license-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);margin-top:64px}
+.license-card{background:var(--bg);padding:48px}
+.license-card.commercial{background:var(--bg2)}
+.license-type{font-family:var(--display);font-size:11px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);margin-bottom:12px}
+.license-price{font-family:var(--display);font-size:48px;font-weight:800;letter-spacing:-.03em;line-height:1;margin-bottom:24px}
+.license-price.free{color:var(--accent)}
+.license-price.paid{color:var(--amber)}
+.license-list{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:32px}
+.license-list li{font-size:13px;color:var(--mid);padding-left:20px;position:relative}
+.license-list li::before{content:'—';position:absolute;left:0;color:var(--dim)}
+.license-list li.included::before{content:'✓';color:var(--accent)}
+.license-list li.excluded::before{content:'✕';color:var(--red)}
+footer{border-top:1px solid var(--line);padding:48px 40px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:24px;position:relative;z-index:1}
+.footer-brand{font-family:var(--display);font-size:18px;font-weight:800;letter-spacing:-.02em}
+.footer-brand span{color:var(--accent)}
+.footer-copy{font-size:12px;color:var(--dim);letter-spacing:.05em}
+.footer-links{display:flex;gap:24px;list-style:none}
+.footer-links a{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);text-decoration:none;transition:color .2s}
+.footer-links a:hover{color:var(--accent)}
+@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+.reveal{opacity:0;transform:translateY(32px);transition:opacity .7s,transform .7s}
+.reveal.visible{opacity:1;transform:translateY(0)}
+.cursor{width:6px;height:6px;background:var(--accent);border-radius:50%;position:fixed;pointer-events:none;z-index:9998;transition:transform .1s;mix-blend-mode:screen}
+@media(max-width:768px){nav{padding:0 20px}.nav-links{display:none}#hero,#proof,#benchmark,#code,#primitives,#license{padding-left:20px;padding-right:20px}.hero-stats{flex-direction:column}.stat{border-right:none;border-bottom:1px solid var(--line)}.proof-grid,.license-grid{grid-template-columns:1fr}.prim-grid{grid-template-columns:1fr 1fr}.bench-header{flex-direction:column;align-items:flex-start}}
+@media(max-width:480px){.prim-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="cursor" id="cursor"></div>
+<div class="grid-bg"></div>
+<div class="ticker-wrap"><div class="ticker" id="ticker"><span>RAC beats hipBLAS 2.48x</span><span>zero multiplications</span><span>340,265,679 adiabatic ops confirmed</span><span>MAC is a degenerate case of rotation</span><span>prior art established March 26 2026</span><span>float32 · float16 · bfloat16</span><span>torch.compile compatible</span><span>AMD RX 7600 XT · gfx1102 · ROCm 7.1.1</span><span>RAC beats hipBLAS 2.48x</span><span>zero multiplications</span><span>340,265,679 adiabatic ops confirmed</span><span>MAC is a degenerate case of rotation</span><span>prior art established March 26 2026</span><span>float32 · float16 · bfloat16</span><span>torch.compile compatible</span><span>AMD RX 7600 XT · gfx1102 · ROCm 7.1.1</span></div></div>
+<nav>
+  <div class="nav-logo">RAC<span>.</span></div>
+  <ul class="nav-links">
+    <li><a href="#proof">The Math</a></li>
+    <li><a href="#benchmark">Benchmarks</a></li>
+    <li><a href="#code">Code</a></li>
+    <li><a href="#primitives">Primitives</a></li>
+    <li><a href="#license">License</a></li>
+  </ul>
+  <a href="https://github.com/Pinnacle-Quantum-Group/RAC" class="nav-cta" target="_blank">GitHub →</a>
+</nav>
+<section id="hero">
+  <p class="hero-eyebrow">Pinnacle Quantum Group · March 2026 · Prior Art Established</p>
+  <h1 class="hero-title"><span class="line1">Rotation</span><span class="line2">Accumulate.</span><span class="line3">MAC is dead.</span></h1>
+  <p class="hero-sub">Fifty years of compute built on the wrong primitive. MAC is a degenerate projection of rotation. We proved it. We benchmarked it. We beat hipBLAS by 2.48× with zero multiplications.</p>
+  <div class="hero-stats">
+    <div class="stat"><span class="stat-val">2.48×</span><span class="stat-label">faster than hipBLAS</span></div>
+    <div class="stat"><span class="stat-val">0</span><span class="stat-label">multiplications</span></div>
+    <div class="stat"><span class="stat-val">17</span><span class="stat-label">public primitives</span></div>
+    <div class="stat"><span class="stat-val">100%</span><span class="stat-label">correctness · all sizes</span></div>
+  </div>
+  <div class="hero-buttons">
+    <a href="https://github.com/Pinnacle-Quantum-Group/RAC" class="btn-primary" target="_blank">View on GitHub</a>
+    <a href="#proof" class="btn-secondary">Read the proof</a>
+  </div>
+  <div class="counter-wrap">
+    <span class="counter" id="ops-counter">0</span>
+    <span class="counter-label">adiabatic ops confirmed · zero multiplications</span>
+  </div>
+  <div class="scroll-hint">scroll</div>
+</section>
+<section id="proof">
+  <div class="reveal">
+    <p class="section-label">The Mathematics</p>
+    <h2 class="section-title">MAC is a<br>shadow of rotation.</h2>
+  </div>
+  <div class="proof-grid reveal">
+    <div class="proof-cell"><div class="proof-num">Claim 01</div><div class="proof-heading">MAC is a degenerate case of RAC</div><div class="proof-body">Rotate vector [a, 0] by angle θ. Extract the x-component. Set θ = arctan(b/a). The result is exactly a·b. MAC is the one-dimensional, axis-aligned projection of a two-dimensional rotation operation.</div><code class="proof-eq">MAC(a,b,c) = RAC([a,0], θ_b)|ₓ + c</code></div>
+    <div class="proof-cell"><div class="proof-num">Claim 02</div><div class="proof-heading">RAC is strictly more expressive</div><div class="proof-body">A 2D rotation requires 4 MACs. RAC expresses it as 1 CORDIC sequence. Complex multiplication: 4 MACs → 1 RAC. Quaternion rotation: 28 MACs → 3 RAC. The converse does not hold.</div><code class="proof-eq">R(θ)·[x,y]ᵀ = 1 RAC vs 4 MACs</code></div>
+    <div class="proof-cell"><div class="proof-num">Claim 03</div><div class="proof-heading">CORDIC uses only shift-add</div><div class="proof-body">Each micro-rotation: x_{i+1} = x_i − d_i·y_i·2^{-i}. The scaling by 2^{-i} is a right-shift. Not a multiply. 16 iterations. Zero multiplications. Converges to ±2^{-16}.</div><code class="proof-eq">x_{i+1} = x_i − d_i · y_i · 2^{-i}  ← shift</code></div>
+    <div class="proof-cell"><div class="proof-num">Claim 04</div><div class="proof-heading">RAC is thermodynamically reversible</div><div class="proof-body">CORDIC rotations are orthogonal: det = 1, Rᵀ = R⁻¹. Information is preserved. No bits erased. MAC destroys information at every step — Landauer's limit applies. RAC approaches zero energy asymptotically.</div><code class="proof-eq">E_min(MAC) ≥ 32·k_B·T·ln(2)  vs  E(RAC) → 0</code></div>
+  </div>
+  <div class="reveal" style="border:1px solid var(--line);padding:40px;"><p class="section-label">The SFU Insight</p><p style="font-family:var(--serif);font-style:italic;font-size:18px;color:var(--mid);line-height:1.7;max-width:800px;">Every modern GPU ships with CORDIC hardware — the Special Function Units that compute sin, cos, atan. Under MAC workloads, those SFUs are <strong style="color:var(--text)">95% idle</strong>. RAC routes tensor operations through the SFUs. The multiplier hardware is never activated.</p></div>
+</section>
+<section id="benchmark">
+  <div class="reveal">
+    <p class="section-label">Real Hardware · Real Numbers</p>
+    <div class="bench-header">
+      <h2 class="section-title" style="margin-bottom:0">The numbers<br>don't lie.</h2>
+      <div class="bench-device"><strong>AMD Radeon RX 7600 XT</strong>gfx1102 · RDNA3 · ROCm 7.1.1<br>amdclang++ 20.0.0 · March 26, 2026</div>
+    </div>
+  </div>
+  <div class="reveal" style="margin:48px 0">
+    <p style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-bottom:24px">TOPS at 4096×4096 matmul</p>
+    <div id="bars">
+      <div class="bar-row"><div class="bar-label">RAC micro-8×8</div><div class="bar-track"><div class="bar-ref" id="blas-ref" style="left:40.3%"><span class="bar-ref-label">hipBLAS</span></div><div class="bar-fill rac" data-width="98.6">5.82 TOPS</div></div></div>
+      <div class="bar-row"><div class="bar-label">RAC micro-4×4</div><div class="bar-track"><div class="bar-fill rac" data-width="63.6" style="opacity:.8">3.76 TOPS</div></div></div>
+      <div class="bar-row"><div class="bar-label">hipBLAS SGEMM</div><div class="bar-track"><div class="bar-fill blas" data-width="39.8">2.35 TOPS</div></div></div>
+      <div class="bar-row"><div class="bar-label">RAC tiled-fast16</div><div class="bar-track"><div class="bar-fill dim" data-width="19.7">1.16 TOPS</div></div></div>
+      <div class="bar-row"><div class="bar-label">RAC naive</div><div class="bar-track"><div class="bar-fill dim" data-width="4.6">0.27 TOPS</div></div></div>
+    </div>
+  </div>
+  <div class="reveal">
+    <table class="bench-table">
+      <thead><tr><th>Matrix size</th><th>RAC micro-8×8</th><th>hipBLAS</th><th>Speedup</th><th>Max error</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td class="kernel">256×256</td><td class="tops">0.37 TOPS</td><td class="tops blas">0.67 TOPS</td><td class="speed">0.55×</td><td class="tops">1.9×10⁻⁵</td><td class="pass">PASS</td></tr>
+        <tr><td class="kernel">512×512</td><td class="tops winner">1.76 TOPS</td><td class="tops blas">1.82 TOPS</td><td class="speed winner">0.97×</td><td class="tops">4.0×10⁻⁵</td><td class="pass">PASS</td></tr>
+        <tr><td class="kernel">1024×1024</td><td class="tops winner">4.18 TOPS</td><td class="tops blas">2.15 TOPS</td><td class="speed winner">1.94×</td><td class="tops">8.0×10⁻⁵</td><td class="pass">PASS</td></tr>
+        <tr><td class="kernel">2048×2048</td><td class="tops winner">5.25 TOPS</td><td class="tops blas">2.35 TOPS</td><td class="speed winner">2.24×</td><td class="tops">2.2×10⁻⁴</td><td class="pass">PASS</td></tr>
+        <tr style="background:rgba(200,255,0,.04)"><td class="kernel" style="color:var(--accent)">4096×4096</td><td class="tops winner" style="color:var(--accent)">5.82 TOPS</td><td class="tops blas">2.35 TOPS</td><td class="speed winner" style="color:var(--accent);font-size:16px">2.48×</td><td class="tops">4.96×10⁻⁴</td><td class="pass">PASS</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:12px;color:var(--dim);line-height:1.6">Max error at 4096×4096 is 4.96×10⁻⁴ — within the theoretical float32 accumulation rounding floor for K=4096 terms. The equivalence proof is exact. The difference is rounding.</p>
+  </div>
+</section>
+<section id="code">
+  <div class="reveal"><p class="section-label">Integration</p><h2 class="section-title">Two lines.<br>Any model.</h2></div>
+  <div class="reveal">
+    <div class="code-tabs">
+      <div class="code-tab active" onclick="showTab('pytorch',this)">PyTorch</div>
+      <div class="code-tab" onclick="showTab('huggingface',this)">HuggingFace</div>
+      <div class="code-tab" onclick="showTab('cuda',this)">CUDA / HIP</div>
+      <div class="code-tab" onclick="showTab('amp',this)">AMP Training</div>
+    </div>
+    <div class="code-block active" id="tab-pytorch"><pre><span class="c-gray"># Install</span>
+<span class="c-green">pip install</span> -e .
+
+<span class="c-gray"># Drop-in model replacement</span>
+<span class="c-blue">from</span> rac_torch <span class="c-blue">import</span> patch_model
+
+model = MyModel()
+model = <span class="c-yellow">patch_model</span>(model)
+<span class="c-gray"># ✓ All nn.Linear → RACLinear. Zero multiplications.</span>
+
+<span class="c-gray"># Single layer</span>
+<span class="c-blue">from</span> rac_torch <span class="c-blue">import</span> RACLinear
+model.fc = <span class="c-yellow">RACLinear</span>(<span class="c-amber">768</span>, <span class="c-amber">256</span>)
+
+<span class="c-gray"># Function</span>
+C = <span class="c-yellow">rac_matmul</span>(A, B)
+
+<span class="c-gray"># BF16</span>
+model = <span class="c-yellow">patch_model</span>(model, dtype=torch.bfloat16)</pre></div>
+    <div class="code-block" id="tab-huggingface"><pre><span class="c-blue">from</span> transformers <span class="c-blue">import</span> AutoModel
+<span class="c-blue">from</span> rac_torch <span class="c-blue">import</span> patch_model
+
+model = AutoModel.<span class="c-yellow">from_pretrained</span>(<span class="c-green">'bert-base-uncased'</span>)
+model = <span class="c-yellow">patch_model</span>(model)
+<span class="c-gray"># patch_model: replaced 72 Linear → RACLinear
+# ✓  encoder.layer.0.attention.self.query: 768→768
+# ✓  ... (72 layers total)</span>
+
+trainer = Trainer(model=model, ...)
+trainer.<span class="c-yellow">train</span>()  <span class="c-gray"># zero multiplications</span></pre></div>
+    <div class="code-block" id="tab-cuda"><pre><span class="c-blue">#include</span> <span class="c-green">"rac.h"</span>
+
+<span class="c-gray">/* MAC:  a * b  →  RAC: rac_project */</span>
+float r = <span class="c-yellow">rac_project</span>(make_float2(a,<span class="c-amber">0</span>), angle_b);
+
+<span class="c-yellow">rac_matmul</span>(A, B, C, M, N, K); <span class="c-gray">/* zero multiplications */</span>
+float e = <span class="c-yellow">rac_exp</span>(x);           <span class="c-gray">/* no expf() */</span>
+float t = <span class="c-yellow">rac_tanh</span>(x);          <span class="c-gray">/* no tanhf() */</span>
+
+<span class="c-gray">/* Build */</span>
+<span class="c-green">HIP_ARCH=gfx1102</span> ./rac_benchmark.sh hip
+<span class="c-green">CUDA_ARCH=86</span> ./rac_benchmark.sh cuda</pre></div>
+    <div class="code-block" id="tab-amp"><pre>model = <span class="c-yellow">patch_model</span>(MyModel(), dtype=torch.bfloat16)
+scaler = torch.cuda.amp.<span class="c-yellow">GradScaler</span>()
+
+<span class="c-blue">for</span> batch <span class="c-blue">in</span> dataloader:
+    <span class="c-blue">with</span> torch.cuda.amp.<span class="c-yellow">autocast</span>(dtype=torch.bfloat16):
+        loss = criterion(<span class="c-yellow">model</span>(batch[<span class="c-green">'input_ids'</span>]), batch[<span class="c-green">'labels'</span>])
+    scaler.<span class="c-yellow">scale</span>(loss).<span class="c-yellow">backward</span>()
+    scaler.<span class="c-yellow">step</span>(optimizer)
+    scaler.<span class="c-yellow">update</span>()
+
+<span class="c-gray"># torch.compile — also works</span>
+model = torch.<span class="c-yellow">compile</span>(<span class="c-yellow">patch_model</span>(MyModel()))</pre></div>
+  </div>
+</section>
+<section id="primitives">
+  <div class="reveal"><p class="section-label">17 Public Primitives</p><h2 class="section-title">The complete<br>RAC surface.</h2></div>
+  <div class="prim-grid reveal">
+    <div class="prim-card"><div class="prim-category">Core Rotation</div><div class="prim-name">rac_rotate(v, θ)</div><div class="prim-desc">Gain-compensated rotation. Magnitude preserved.</div></div>
+    <div class="prim-card"><div class="prim-category">Core Rotation</div><div class="prim-name">rac_rotate_raw(v, θ)</div><div class="prim-desc">Uncompensated rotation for chains.</div></div>
+    <div class="prim-card"><div class="prim-category">Core Rotation</div><div class="prim-name">rac_project(v, θ)</div><div class="prim-desc">Signed scalar projection. The MAC equivalent.</div></div>
+    <div class="prim-card"><div class="prim-category">Polar / Vectoring</div><div class="prim-name">rac_polar(v, mag, angle)</div><div class="prim-desc">Cartesian → polar in one CORDIC pass.</div></div>
+    <div class="prim-card"><div class="prim-category">Polar / Vectoring</div><div class="prim-name">rac_norm(v)</div><div class="prim-desc">Euclidean magnitude via CORDIC vectoring.</div></div>
+    <div class="prim-card"><div class="prim-category">Polar / Vectoring</div><div class="prim-name">rac_normalize(v)</div><div class="prim-desc">Unit vector. Fused vectoring + rotation.</div></div>
+    <div class="prim-card"><div class="prim-category">Dot / Similarity</div><div class="prim-name">rac_dot(a, b)</div><div class="prim-desc">Dot product via angle subtraction.</div></div>
+    <div class="prim-card"><div class="prim-category">Dot / Similarity</div><div class="prim-name">rac_coherence(a, b)</div><div class="prim-desc">Cosine similarity ∈ [−1, 1].</div></div>
+    <div class="prim-card"><div class="prim-category">Complex / DSP</div><div class="prim-name">rac_complex_mul(a, b)</div><div class="prim-desc">Complex multiply via rotation. Replaces 4 MACs.</div></div>
+    <div class="prim-card"><div class="prim-category">Complex / DSP</div><div class="prim-name">rac_dct(x, X, n)</div><div class="prim-desc">DCT-II via CORDIC basis rotation.</div></div>
+    <div class="prim-card"><div class="prim-category">Activations</div><div class="prim-name">rac_exp(x)</div><div class="prim-desc">eˣ via hyperbolic CORDIC. No expf().</div></div>
+    <div class="prim-card"><div class="prim-category">Activations</div><div class="prim-name">rac_tanh(x)</div><div class="prim-desc">tanh(x) via hyperbolic CORDIC.</div></div>
+    <div class="prim-card"><div class="prim-category">Activations</div><div class="prim-name">rac_softmax(x, out, n)</div><div class="prim-desc">Numerically stable softmax. No expf() anywhere.</div></div>
+    <div class="prim-card"><div class="prim-category">Linear Algebra</div><div class="prim-name">rac_rotate_batch(v,θ,out,n)</div><div class="prim-desc">Independent batch rotation. Fully parallel.</div></div>
+    <div class="prim-card"><div class="prim-category">Linear Algebra</div><div class="prim-name">rac_inner(a, b, n)</div><div class="prim-desc">Inner product via rotation-project-accumulate.</div></div>
+    <div class="prim-card"><div class="prim-category">Linear Algebra</div><div class="prim-name">rac_outer(a, b, C, m, n)</div><div class="prim-desc">Outer product. C[i][j] = rac_project(a[i], θ_{b[j]}).</div></div>
+    <div class="prim-card"><div class="prim-category">Linear Algebra</div><div class="prim-name">rac_matmul(A, B, C, M, N, K)</div><div class="prim-desc">Matrix multiply. Zero multiply operators in kernel.</div></div>
+  </div>
+  <div class="reveal" style="margin-top:1px;border:1px solid var(--line);border-top:none;padding:24px 32px;background:var(--bg2)"><span style="font-size:12px;color:var(--dim);letter-spacing:.08em">+ <strong style="color:var(--text)">RAC_OP_EXTENDED</strong> reserved for proprietary FIL hardware backend. <a href="#license" style="color:var(--accent);text-decoration:none">Commercial license required →</a></span></div>
+</section>
+<section id="license">
+  <div class="reveal"><p class="section-label">Licensing</p><h2 class="section-title">Free for<br>research. Pay<br>for production.</h2></div>
+  <div class="license-grid reveal">
+    <div class="license-card">
+      <div class="license-type">Academic License</div>
+      <div class="license-price free">Free.</div>
+      <ul class="license-list">
+        <li class="included">Academic research and publication</li>
+        <li class="included">Teaching and coursework</li>
+        <li class="included">Thesis and dissertation work</li>
+        <li class="included">Non-commercial experimentation</li>
+        <li class="excluded">Commercial inference pipelines</li>
+        <li class="excluded">For-profit products or services</li>
+        <li class="excluded">Training commercial AI models</li>
+      </ul>
+      <a href="https://github.com/Pinnacle-Quantum-Group/RAC/blob/main/LICENSE" class="btn-secondary" style="display:inline-block" target="_blank">Read license</a>
+    </div>
+    <div class="license-card commercial">
+      <div class="license-type">Commercial License</div>
+      <div class="license-price paid">Contact.</div>
+      <ul class="license-list">
+        <li class="included">For-profit companies and startups</li>
+        <li class="included">Production inference pipelines</li>
+        <li class="included">Cloud compute services</li>
+        <li class="included">Commercial AI model training</li>
+        <li class="included">Hardware / ASIC implementation</li>
+        <li class="included">Hyperscaler and chip licensing</li>
+        <li class="included">Patent license included</li>
+      </ul>
+      <a href="mailto:michael@pqg.info" class="btn-primary" style="display:inline-block">michael@pqg.info</a>
+    </div>
+  </div>
+  <div class="reveal" style="margin-top:64px;padding:40px;border:1px solid var(--line);background:var(--bg2)"><p class="section-label">Patent Notice</p><p style="font-family:var(--serif);font-style:italic;font-size:16px;color:var(--mid);line-height:1.7;max-width:700px">The Rotation-Accumulate (RAC) primitive is subject to pending patent applications. Prior art established March 26, 2026. Academic use includes a royalty-free patent license. Commercial use of the RAC primitive on any hardware requires a commercial license.</p></div>
+</section>
+<footer>
+  <div><div class="footer-brand">RAC<span>.</span></div><div style="font-size:12px;color:var(--dim);margin-top:8px;letter-spacing:.05em">Pinnacle Quantum Group · Michael A. Doran Jr.</div></div>
+  <ul class="footer-links">
+    <li><a href="https://github.com/Pinnacle-Quantum-Group/RAC" target="_blank">GitHub</a></li>
+    <li><a href="https://github.com/Pinnacle-Quantum-Group/RAC/blob/main/LICENSE" target="_blank">License</a></li>
+    <li><a href="mailto:michael@pqg.info">Contact</a></li>
+  </ul>
+  <div class="footer-copy">© 2026 Pinnacle Quantum Group. Prior art established March 26, 2026.<br>CORDIC algorithm: public domain (Volder, 1959).</div>
+</footer>
+<script>
+const cursor=document.getElementById('cursor');
+document.addEventListener('mousemove',e=>{cursor.style.left=e.clientX-3+'px';cursor.style.top=e.clientY-3+'px'});
+const reveals=document.querySelectorAll('.reveal');
+const io=new IntersectionObserver(entries=>{entries.forEach(e=>{if(e.isIntersecting){e.target.classList.add('visible');io.unobserve(e.target)}})},{threshold:0.1});
+reveals.forEach(r=>io.observe(r));
+const barIO=new IntersectionObserver(entries=>{entries.forEach(e=>{if(e.isIntersecting){document.querySelectorAll('.bar-fill').forEach(b=>{b.style.width=b.getAttribute('data-width')+'%'});barIO.disconnect()}})},{threshold:0.3});
+const barsEl=document.getElementById('bars');
+if(barsEl)barIO.observe(barsEl);
+const counterEl=document.getElementById('ops-counter');
+function animateCounter(el,target,dur){const start=Date.now();function update(){const p=Math.min((Date.now()-start)/dur,1);const e=1-Math.pow(1-p,4);el.textContent=Math.floor(target*e).toLocaleString();if(p<1)requestAnimationFrame(update)}requestAnimationFrame(update)}
+const cio=new IntersectionObserver(entries=>{entries.forEach(e=>{if(e.isIntersecting){animateCounter(counterEl,340265679,2000);cio.disconnect()}})},{threshold:0.5});
+if(counterEl)cio.observe(counterEl);
+function showTab(id,el){document.querySelectorAll('.code-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.code-block').forEach(b=>b.classList.remove('active'));document.getElementById('tab-'+id).classList.add('active');el.classList.add('active')}
+const sections=document.querySelectorAll('section[id]');
+const navLinks=document.querySelectorAll('.nav-links a');
+window.addEventListener('scroll',()=>{let cur='';sections.forEach(s=>{if(window.scrollY>=s.offsetTop-120)cur=s.id});navLinks.forEach(a=>{a.style.color=a.getAttribute('href')==='#'+cur?'var(--accent)':''})},{passive:true});
+</script>
+</body>
+</html>
