@@ -778,4 +778,19 @@ const cel=document.getElementById('ops-counter');
 function animCount(el,t,d){const s=Date.now();function u(){const p=Math.min((Date.now()-s)/d,1);const e=1-Math.pow(1-p,4);el.textContent=Math.floor(t*e).toLocaleString();if(p<1)requestAnimationFrame(u)}requestAnimationFrame(u)}
 const cio=new IntersectionObserver(e=>{e.forEach(x=>{if(x.isIntersecting){animCount(cel,340265679,2200);cio.disconnect()}})},{threshold:0.5});
 if(cel)cio.observe(cel);
-function showTab(id,el){document.querySelectorAll('.code-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.code-block').forEach(b=>b.classList.remove('active'));document.getElementById('tab-'+id).classLi
+function showTab(id,el){
+  document.querySelectorAll('.code-tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.code-block').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+id).classList.add('active');
+  el.classList.add('active');
+}
+const secs=document.querySelectorAll('section[id]');
+const navAs=document.querySelectorAll('.nav-links a');
+window.addEventListener('scroll',()=>{
+  let cur='';
+  secs.forEach(s=>{if(window.scrollY>=s.offsetTop-120)cur=s.id});
+  navAs.forEach(a=>{a.style.color=a.getAttribute('href')==='#'+cur?'var(--orange)':''});
+},{passive:true});
+</script>
+</body>
+</html>
