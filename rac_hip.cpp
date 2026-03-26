@@ -16,7 +16,7 @@
 #ifdef __HIP_DEVICE_COMPILE__
   #define RAC_SINF(x)  __ocml_sin_f32(x)
   #define RAC_COSF(x)  __ocml_cos_f32(x)
-  #define RAC_DIVF(a,b) __ocml_div_f32(a,b)
+  #define RAC_DIVF(a,b) ((a)/(b))  /* maps to v_rcp_f32 + v_mul on AMD SFU */
   #define RAC_POWF(a,b) __ocml_pow_f32(a,b)
 #else
   #define RAC_SINF(x)  sinf(x)
