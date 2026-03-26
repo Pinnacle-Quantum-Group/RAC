@@ -110,9 +110,13 @@ float rac_project(float2 v, float theta) {
      * = v.x*cos(theta) + v.y*sin(theta)
      * RAC: SFU trig replaces multiply path
      */
-    float c = RAC_COSF(theta);  // RAC: SFU replaces multiply path
-    float s = RAC_SINF(theta);  // RAC: SFU replaces multiply path
-    return v.x * c + v.y * s;  // RAC: rotation replaces multiply (projection)
+    float c, s;
+    #ifdef __HIP_DEVICE_COMPILE__
+    __sincosf(theta, &s, &c);  // RAC: fused SFU — one call replaces two
+    #else
+    c = cosf(theta); s = sinf(theta);
+    #endif
+    return fmaf(v.x, c, v.y * s);  // RAC: fused multiply-add (projection)
 }
 
 /* ── 2. Polar / vectoring ────────────────────────────────────────────────── */
@@ -145,7 +149,13 @@ __device__ __host__
 float2 rac_normalize(float2 v) {
     float mag, angle;
     rac_polar(v, &mag, &angle);
-    return make_float2(RAC_COSF(angle), RAC_SINF(angle));  // RAC: SFU path
+    float c, s;
+    #ifdef __HIP_DEVICE_COMPILE__
+    __sincosf(angle, &s, &c);  // RAC: fused SFU path
+    #else
+    c = cosf(angle); s = sinf(angle);
+    #endif
+    return make_float2(c, s);
 }
 
 /* ── 3. Dot / similarity ─────────────────────────────────────────────────── */
@@ -278,10 +288,11 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 }
 
 /* ── HIP kernel wrappers ─────────────────────────────────────────────────── */
-/* Define RAC_NO_KERNELS before including to suppress these (e.g. if the
-   benchmark file provides its own kernel definitions).                      */
+/* Define RAC_DEFINE_KERNELS to include these kernel wrappers.
+   When linking with a benchmark that defines its own kernels, leave
+   this undefined to avoid duplicate symbol errors with -fgpu-rdc.   */
 
-#ifndef RAC_NO_KERNELS
+#ifdef RAC_DEFINE_KERNELS
 
 __global__
 void rac_rotate_batch_kernel(float2 *v, float *theta, float2 *out, int n) {
@@ -307,7 +318,7 @@ void rac_matmul_kernel(float *A, float *B, float *C, int M, int N, int K) {
     C[m * N + n] = sum;
 }
 
-#endif /* RAC_NO_KERNELS */
+#endif /* RAC_DEFINE_KERNELS */
 
 /* ── Context ─────────────────────────────────────────────────────────────── */
 

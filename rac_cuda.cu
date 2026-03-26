@@ -136,19 +136,16 @@ float rac_project(float2 v, float theta) {
      *   RAC:  rac_project((a,0), atan2f(b,1)) == a*cos(atan2(b,1))
      *
      * Sign preserved — negative when v opposes the projection axis.
-     * Routes through SFU __sinf/__cosf.
+     * Routes through SFU via fused __sincosf (single SFU call for both sin+cos).
      */
+    float c, s;
     #ifdef __CUDA_ARCH__
-    float c = __cosf(theta);   // RAC: SFU replaces multiply path
-    float s = __sinf(theta);   // RAC: SFU replaces multiply path
+    __sincosf(theta, &s, &c);  // RAC: fused SFU — one call replaces two
     #else
-    float c = cosf(theta);
-    float s = sinf(theta);
+    c = cosf(theta);
+    s = sinf(theta);
     #endif
-    /* v.x*c + v.y*s — these two are the only * in the whole primitive.
-     * They are unavoidable in the scalar projection step on commodity hardware.
-     * On FIL hardware, this final extraction is a CORDIC vectoring output read. */
-    return v.x * c + v.y * s;  // RAC: rotation replaces multiply (projection step)
+    return fmaf(v.x, c, v.y * s);  // RAC: fused multiply-add (projection step)
 }
 
 /* ── 2. Polar / vectoring ────────────────────────────────────────────────── */
@@ -191,11 +188,13 @@ float2 rac_normalize(float2 v) {
     float mag, angle;
     rac_polar(v, &mag, &angle);
     /* reconstruct unit vector at same angle */
+    float c, s;
     #ifdef __CUDA_ARCH__
-    return make_float2(__cosf(angle), __sinf(angle));  // RAC: SFU path
+    __sincosf(angle, &s, &c);  // RAC: fused SFU path
     #else
-    return make_float2(cosf(angle), sinf(angle));
+    c = cosf(angle); s = sinf(angle);
     #endif
+    return make_float2(c, s);
 }
 
 /* ── 3. Dot product / similarity ─────────────────────────────────────────── */
@@ -448,9 +447,11 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 }
 
 /* ── CUDA kernel wrappers ────────────────────────────────────────────────── */
-/* Define RAC_NO_KERNELS to suppress these if the benchmark defines its own */
+/* Define RAC_DEFINE_KERNELS to include these kernel wrappers.
+   When linking with a benchmark that defines its own kernels, leave
+   this undefined to avoid duplicate symbol errors with -fgpu-rdc.   */
 
-#ifndef RAC_NO_KERNELS
+#ifdef RAC_DEFINE_KERNELS
 
 __global__
 void rac_rotate_batch_kernel(float2 *v, float *theta, float2 *out, int n) {
@@ -510,7 +511,7 @@ void rac_softmax_kernel(float *x, float *out, int n) {
         out[tid] = __fdividef(val, sum);  // RAC: SFU division
 }
 
-#endif /* RAC_NO_KERNELS */
+#endif /* RAC_DEFINE_KERNELS */
 
 /* ── Context (stub — FIL backend wires in via rac_execute) ──────────────── */
 
