@@ -448,6 +448,9 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 }
 
 /* ── CUDA kernel wrappers ────────────────────────────────────────────────── */
+/* Define RAC_NO_KERNELS to suppress these if the benchmark defines its own */
+
+#ifndef RAC_NO_KERNELS
 
 __global__
 void rac_rotate_batch_kernel(float2 *v, float *theta, float2 *out, int n) {
@@ -506,6 +509,8 @@ void rac_softmax_kernel(float *x, float *out, int n) {
     if (tid < n)
         out[tid] = __fdividef(val, sum);  // RAC: SFU division
 }
+
+#endif /* RAC_NO_KERNELS */
 
 /* ── Context (stub — FIL backend wires in via rac_execute) ──────────────── */
 
