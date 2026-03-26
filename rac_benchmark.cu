@@ -223,6 +223,11 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
 
     printf("  RAC:    %.2f ms/iter  %.4f TOPS  energy=%llu mJ\n",
            t_rac / iters, rac_tops, e_rac / (unsigned long long)iters);
+    if (e_rac > 0) {
+        double rac_nj_per_op = (double)e_rac * 1e6 / (ops * iters);  /* mJ → nJ */
+        double rac_tops_per_w = rac_tops / ((double)e_rac / (t_rac));  /* TOPS/(mJ/ms)=TOPS/W */
+        printf("  RAC energy/op: %.4f nJ/op  %.2f TOPS/W\n", rac_nj_per_op, rac_tops_per_w);
+    }
 
     /* ── Vendor BLAS benchmark ── */
     float alpha = 1.0f, beta = 0.0f;
@@ -280,11 +285,23 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
     const char *blas_name = RAC_HIP ? "hipBLAS" : "cuBLAS";
     printf("  %s: %.2f ms/iter  %.4f TOPS  energy=%llu mJ\n",
            blas_name, t_blas / iters, blas_tops, e_blas / (unsigned long long)iters);
+    if (e_blas > 0) {
+        double blas_nj_per_op = (double)e_blas * 1e6 / (ops * iters);
+        double blas_tops_per_w = blas_tops / ((double)e_blas / (t_blas));
+        printf("  %s energy/op: %.4f nJ/op  %.2f TOPS/W\n", blas_name, blas_nj_per_op, blas_tops_per_w);
+    }
     printf("  Speedup: RAC/%s = %.3fx\n", blas_name, t_blas / t_rac);
 
-    if (e_rac > 0 && e_blas > 0)
-        printf("  Energy:  RAC/%s = %.3fx\n",
+    if (e_rac > 0 && e_blas > 0) {
+        printf("  Energy ratio: RAC/%s = %.3fx\n",
                blas_name, (double)e_rac / (double)e_blas);
+        double rac_nj = (double)e_rac * 1e6 / (ops * iters);
+        double blas_nj = (double)e_blas * 1e6 / (ops * iters);
+        printf("  Energy/op:    RAC=%.4f nJ  %s=%.4f nJ  (%.1f%% %s)\n",
+               rac_nj, blas_name, blas_nj,
+               fabs(1.0 - rac_nj / blas_nj) * 100.0,
+               rac_nj < blas_nj ? "savings" : "overhead");
+    }
 
     /* correctness — RAC vs BLAS (row-major trick: B^T * A^T in col-major = A*B row-major) */
     check_correctness(hC_rac, hC_blas, M, N, 1e-3f);
@@ -326,13 +343,20 @@ static void bench_primitives(void) {
     extern __global__ void rac_rotate_batch_kernel(float2*, float*, float2*, int);
 
     CHECK_GPU(cudaDeviceSynchronize());
+    unsigned long long ep0 = energy_mj();
     double t0 = now_ms();
     for (int i = 0; i < iters; i++)
         rac_rotate_batch_kernel<<<grid, block>>>(dV, dTheta, dOut, N);
     CHECK_GPU(cudaDeviceSynchronize());
     double t_rot = (now_ms() - t0) / iters;
-    printf("  rac_rotate_batch: %.3f ms/iter  %.2f Gop/s\n",
-           t_rot, N / (t_rot * 1e6));
+    unsigned long long ep_rot = energy_mj() - ep0;
+    double gops = N / (t_rot * 1e6);
+    printf("  rac_rotate_batch: %.3f ms/iter  %.2f Gop/s\n", t_rot, gops);
+    if (ep_rot > 0) {
+        double nj_per_rot = (double)ep_rot * 1e6 / ((double)N * iters);
+        double tops_per_w = (gops * 1e-3) / ((double)ep_rot / (t_rot * iters));
+        printf("    energy: %.4f nJ/rotation  %.2f TOPS/W\n", nj_per_rot, tops_per_w);
+    }
 
     cudaFree(dV); cudaFree(dOut); cudaFree(dTheta);
 }
