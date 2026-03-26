@@ -41,7 +41,7 @@ __constant__ float rac_atanh_table[RAC_ITERS] = {
  * The * 0.5f operations are 2^-i scaling — these are shifts, not multiplies.
  * Marked accordingly.
  */
-__device__ __forceinline__
+__device__ __host__ __forceinline__
 float2 _rac_cordic_rotate_raw(float2 v, float theta) {
     float x = v.x;
     float y = v.y;
@@ -63,7 +63,7 @@ float2 _rac_cordic_rotate_raw(float2 v, float theta) {
 }
 
 /* Hyperbolic CORDIC for exp/tanh */
-__device__ __forceinline__
+__device__ __host__ __forceinline__
 float2 _rac_cordic_hyperbolic(float x_in, float y_in, float z_in) {
     float x = x_in;
     float y = y_in;

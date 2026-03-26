@@ -25,16 +25,23 @@
   #define RAC_POWF(a,b) powf(a,b)
 #endif
 
-/* ── CORDIC tables in HIP constant memory ────────────────────────────────── */
+/* ── CORDIC tables ─────────────────────────────────────────────────────── */
+/* Device constant memory for GPU kernels, host-visible copy for CPU paths */
 
-__constant__ float rac_atan_table[RAC_ITERS] = {
+#ifdef __HIP_DEVICE_COMPILE__
+__constant__
+#endif
+static const float rac_atan_table[RAC_ITERS] = {
     0.78539816f, 0.46364761f, 0.24497866f, 0.12435499f,
     0.06241881f, 0.03123983f, 0.01562373f, 0.00781234f,
     0.00390623f, 0.00195312f, 0.00097656f, 0.00048828f,
     0.00024414f, 0.00012207f, 0.00006104f, 0.00003052f
 };
 
-__constant__ float rac_atanh_table[RAC_ITERS] = {
+#ifdef __HIP_DEVICE_COMPILE__
+__constant__
+#endif
+static const float rac_atanh_table[RAC_ITERS] = {
     0.54930614f, 0.25541281f, 0.12565721f, 0.06258157f,
     0.03126017f, 0.01562627f, 0.00781265f, 0.00390626f,
     0.00195313f, 0.00097656f, 0.00048828f, 0.00024414f,
@@ -43,7 +50,7 @@ __constant__ float rac_atanh_table[RAC_ITERS] = {
 
 /* ── CORDIC core ─────────────────────────────────────────────────────────── */
 
-__device__ __forceinline__
+__device__ __host__ __forceinline__
 float2 _rac_cordic_rotate_raw(float2 v, float theta) {
     float x = v.x, y = v.y, angle = theta, scale = 1.0f;
 
@@ -59,7 +66,7 @@ float2 _rac_cordic_rotate_raw(float2 v, float theta) {
     return make_float2(x, y);
 }
 
-__device__ __forceinline__
+__device__ __host__ __forceinline__
 float2 _rac_cordic_hyperbolic(float x_in, float y_in, float z_in) {
     float x = x_in, y = y_in, z = z_in, scale = 0.5f;
     int iter_map[RAC_ITERS] = {1,2,3,4,4,5,6,7,8,9,10,11,12,13,13,14};
