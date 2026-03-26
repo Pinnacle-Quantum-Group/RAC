@@ -11,7 +11,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdlib.h>
-#include <string.h>
+
 
 /* ── CORDIC arctangent table ─────────────────────────────────────────────── */
 /* atan(2^-i) for i = 0..15, precomputed */
@@ -429,12 +429,8 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 
                 /* encode scalars as rotation vectors */
                 float2 va = make_float2(a_val, 0.0f);
-                #ifdef __CUDA_ARCH__
-                float angle_b = __fdividef(b_val, 1.0f); /* identity, angle IS b for unit encoding */
-                #else
-                float angle_b = atan2f(0.0f, b_val >= 0 ? 1.0f : -1.0f);
-                #endif
-                float mag_b = (b_val >= 0) ? b_val : -b_val; /* |b| */
+                float mag_b  = fabsf(b_val);
+                float angle_b = (b_val >= 0.0f) ? 0.0f : 3.14159265f;
 
                 float proj = rac_project(va, angle_b);  // RAC: rotation replaces multiply
                 sum += proj * mag_b;                      // RAC: magnitude scaling
@@ -512,12 +508,13 @@ struct rac_context_t {
 
 rac_context rac_create_context(rac_backend backend) {
     rac_context ctx = (rac_context)malloc(sizeof(struct rac_context_t));
+    if (!ctx) return NULL;
     ctx->backend = backend;
     return ctx;
 }
 
 void rac_destroy_context(rac_context ctx) {
-    free(ctx);
+    if (ctx) free(ctx);
 }
 
 int rac_query_capability(rac_context ctx, rac_op_type op) {

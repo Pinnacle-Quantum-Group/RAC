@@ -302,11 +302,12 @@ struct rac_context_t { rac_backend backend; };
 
 rac_context rac_create_context(rac_backend backend) {
     rac_context ctx = (rac_context)malloc(sizeof(struct rac_context_t));
+    if (!ctx) return NULL;
     ctx->backend = backend;
     return ctx;
 }
 
-void rac_destroy_context(rac_context ctx) { free(ctx); }
+void rac_destroy_context(rac_context ctx) { if (ctx) free(ctx); }
 
 int rac_query_capability(rac_context ctx, rac_op_type op) {
     if (op == RAC_OP_EXTENDED) return 0;

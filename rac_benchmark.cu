@@ -99,6 +99,11 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
     float *hB = (float*)malloc(szB);
     float *hC_rac    = (float*)malloc(szC);
     float *hC_cublas = (float*)malloc(szC);
+    if (!hA || !hB || !hC_rac || !hC_cublas) {
+        fprintf(stderr, "Host malloc failed for %dx%d matmul\n", M, N);
+        free(hA); free(hB); free(hC_rac); free(hC_cublas);
+        return;
+    }
 
     srand(42);
     for (int i = 0; i < M * K; i++) hA[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
@@ -176,8 +181,7 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
         printf("  Energy:  RAC/cuBLAS = %.3fx\n",
                (double)e_rac / (double)e_cublas);
 
-    /* correctness — RAC vs cuBLAS */
-    /* note: cuBLAS result is transposed due to column-major; compare element-wise */
+    /* correctness — RAC vs cuBLAS (row-major trick: B^T * A^T in col-major = A*B row-major) */
     check_correctness(hC_rac, hC_cublas, M, N, 1e-3f);
 
     cublasDestroy(handle);
@@ -228,9 +232,8 @@ int main(int argc, char **argv) {
     /* device info */
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
-    printf("Device: %s  (SM %d.%d)  SFUs/SM: %d  SMs: %d\n",
+    printf("Device: %s  (SM %d.%d)  SMs: %d\n",
            prop.name, prop.major, prop.minor,
-           prop.multiProcessorCount,   /* proxy for SFU count */
            prop.multiProcessorCount);
 
     nvml_init();

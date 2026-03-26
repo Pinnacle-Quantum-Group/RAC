@@ -50,7 +50,7 @@ build_hip() {
         --offload-arch=${HIP_ARCH} \
         -I. \
         rac_benchmark.cu rac_hip.cpp \
-        -lrocblas \
+        -lrocblas -D__HIP_PLATFORM_AMD__ \
         -o rac_benchmark_hip
 
     echo "   Build: OK → rac_benchmark_hip"

@@ -24,8 +24,11 @@
 extern "C" {
 #endif
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__)
   #include <cuda_runtime.h>
+  #define RAC_FLOAT2 float2
+#elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  #include <hip/hip_runtime.h>
   #define RAC_FLOAT2 float2
 #else
   typedef struct { float x; float y; } float2;
