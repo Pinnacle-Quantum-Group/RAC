@@ -12,7 +12,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-
 /* ── CORDIC arctangent table ─────────────────────────────────────────────── */
 /* atan(2^-i) for i = 0..15, precomputed */
 __constant__ float rac_atan_table[RAC_ITERS] = {
@@ -324,7 +323,11 @@ float rac_tanh(float x) {
         x
     );
     /* result.x = cosh(x), result.y = sinh(x) */
+    #ifdef __CUDA_ARCH__
     return __fdividef(result.y, result.x);  // RAC: SFU division replaces multiply chain
+    #else
+    return result.y / result.x;
+    #endif
 }
 
 __device__ __host__
@@ -349,7 +352,11 @@ void rac_softmax(float *x, float *out, int n) {
         sum += out[i];
     }
 
+    #ifdef __CUDA_ARCH__
     float inv_sum = __fdividef(1.0f, sum);  // RAC: SFU division
+    #else
+    float inv_sum = 1.0f / sum;
+    #endif
     for (int i = 0; i < n; i++) {
         out[i] = out[i] * inv_sum;          // RAC: normalization scaling
     }
@@ -471,33 +478,33 @@ void rac_softmax_kernel(float *x, float *out, int n) {
     /* single-block softmax for demonstration */
     extern __shared__ float sdata[];
     int tid = threadIdx.x;
-    if (tid >= n) return;
 
-    /* load and find max via shared memory reduction */
-    sdata[tid] = x[tid];
+    /* load — threads beyond n get -INFINITY so they don't corrupt max reduction */
+    sdata[tid] = (tid < n) ? x[tid] : -INFINITY;
     __syncthreads();
 
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < n)
+        if (tid < s)
             sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
         __syncthreads();
     }
     float max_val = sdata[0];
     __syncthreads();
 
-    /* compute exp and store */
-    float val = rac_exp(x[tid] - max_val);  // RAC: hyperbolic CORDIC replaces expf
+    /* compute exp and store — threads beyond n contribute 0 to sum */
+    float val = (tid < n) ? rac_exp(x[tid] - max_val) : 0.0f;  // RAC: hyperbolic CORDIC
     sdata[tid] = val;
     __syncthreads();
 
     /* reduce sum */
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < n) sdata[tid] += sdata[tid + s];
+        if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float sum = sdata[0];
 
-    out[tid] = __fdividef(val, sum);  // RAC: SFU division
+    if (tid < n)
+        out[tid] = __fdividef(val, sum);  // RAC: SFU division
 }
 
 /* ── Context (stub — FIL backend wires in via rac_execute) ──────────────── */
