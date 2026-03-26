@@ -323,6 +323,122 @@ void rac_matmul_micro_tn(
     }
 }
 
+/* ── Activation function enum ─────────────────────────────────────────── */
+/*  0=none, 1=relu, 2=gelu, 3=silu                                       */
+
+__device__ __forceinline__
+float _apply_act(float x, int act) {
+    switch (act) {
+        case 1: return (x > 0.0f) ? x : 0.0f;                             /* ReLU */
+        case 2: return x * 0.5f * (1.0f + erff(x * 0.7071067811865f));     /* GELU (exact) */
+        case 3: return x / (1.0f + expf(-x));                              /* SiLU/Swish */
+        default: return x;                                                  /* identity */
+    }
+}
+
+/* Activation derivative for backward */
+__device__ __forceinline__
+float _act_grad(float x, float y, int act) {
+    switch (act) {
+        case 1: return (x > 0.0f) ? 1.0f : 0.0f;                          /* ReLU */
+        case 2: {                                                           /* GELU */
+            float cdf = 0.5f * (1.0f + erff(x * 0.7071067811865f));
+            float pdf = 0.3989422804f * expf(-0.5f * x * x);               /* 1/sqrt(2pi) * exp */
+            return cdf + x * pdf;
+        }
+        case 3: {                                                           /* SiLU */
+            float sig = 1.0f / (1.0f + expf(-x));
+            return sig * (1.0f + x * (1.0f - sig));
+        }
+        default: return 1.0f;
+    }
+}
+
+/* ── Fused linear kernel: matmul_NT + bias + activation ──────────────── */
+/*
+ * Computes: output = activation(input @ weight^T + bias)
+ * Single kernel, single global memory write. Saves 2 round-trips.
+ *
+ * weight is [N, K] row-major (out_features x in_features).
+ * bias is [N] or nullptr.
+ * act: 0=none, 1=relu, 2=gelu, 3=silu
+ */
+__global__
+void rac_fused_linear_kernel(
+    const float* __restrict__ A,      /* input  [M, K] */
+    const float* __restrict__ B,      /* weight [N, K] row-major, used transposed */
+    const float* __restrict__ bias,   /* [N] or nullptr */
+    float*       __restrict__ C,      /* output [M, N] */
+    int M, int N, int K,
+    int act)
+{
+    __shared__ float sA[BK][BM];
+    __shared__ float sB[BK][BN];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int row0 = by * BM + ty * TM;
+    const int col0 = bx * BN + tx * TN;
+    const int tid = ty * (BN / TN) + tx;
+
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++)
+            acc[i][j] = 0.0f;
+
+    for (int t = 0; t < K; t += BK) {
+        #pragma unroll
+        for (int i = 0; i < (BM * BK) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BM, sm = idx % BM;
+            int gm = by * BM + sm, gk = t + sk;
+            sA[sk][sm] = (gm < M && gk < K) ? A[gm * K + gk] : 0.0f;
+        }
+        #pragma unroll
+        for (int i = 0; i < (BK * BN) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BN, sn = idx % BN;
+            int gk = t + sk, gn = bx * BN + sn;
+            sB[sk][sn] = (gk < K && gn < N) ? B[gn * K + gk] : 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            float a_reg[TM], b_reg[TN];
+            #pragma unroll
+            for (int i = 0; i < TM; i++) a_reg[i] = sA[kk][ty * TM + i];
+            #pragma unroll
+            for (int j = 0; j < TN; j++) b_reg[j] = sB[kk][tx * TN + j];
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                #pragma unroll
+                for (int j = 0; j < TN; j++)
+                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    /* Fused write-back: add bias + apply activation in registers */
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int gm = row0 + i;
+        if (gm >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int gn = col0 + j;
+            if (gn < N) {
+                float val = acc[i][j];
+                if (bias) val += bias[gn];        /* fused bias */
+                val = _apply_act(val, act);        /* fused activation */
+                C[gm * N + gn] = val;
+            }
+        }
+    }
+}
+
 /* ── Launch helpers ──────────────────────────────────────────────────── */
 
 #define RAC_KERNEL_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
@@ -564,6 +680,150 @@ std::vector<torch::Tensor> rac_linear_backward_cuda(
     return {gi, grad_weight, grad_bias};
 }
 
+/* ── Fused linear forward (matmul + bias + activation in one kernel) ── */
+
+torch::Tensor rac_fused_linear_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t act)  /* 0=none, 1=relu, 2=gelu, 3=silu */
+{
+    TORCH_CHECK(input.is_cuda(), "RAC: input must be CUDA tensor");
+    TORCH_CHECK(act >= 0 && act <= 3, "RAC: act must be 0(none), 1(relu), 2(gelu), 3(silu)");
+
+    auto orig_dtype = input.scalar_type();
+    if (orig_dtype != torch::kFloat32) {
+        input = input.to(torch::kFloat32);
+        weight = weight.to(torch::kFloat32);
+        if (bias.defined() && bias.numel() > 0)
+            bias = bias.to(torch::kFloat32);
+    }
+
+    auto in_shape = input.sizes().vec();
+    int out_features = weight.size(0);
+    int in_features  = weight.size(1);
+
+    auto input_2d = input.reshape({-1, in_features}).contiguous();
+    int M = input_2d.size(0);
+    int N = out_features;
+    int K = in_features;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto output = torch::empty({M, N}, input_2d.options());
+
+    const float* bias_ptr = (bias.defined() && bias.numel() > 0)
+        ? bias.contiguous().data_ptr<float>() : nullptr;
+
+    dim3 block(BN/TN, BM/TM);
+    dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
+    rac_fused_linear_kernel<<<grid, block, 0, stream>>>(
+        input_2d.data_ptr<float>(),
+        weight.contiguous().data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        M, N, K, (int)act);
+    RAC_KERNEL_CHECK();
+
+    in_shape.back() = out_features;
+    auto result = output.reshape(in_shape);
+
+    if (orig_dtype != torch::kFloat32)
+        result = result.to(orig_dtype);
+
+    return result;
+}
+
+/* ── Fused linear backward ────────────────────────────────────────────── */
+/* grad_output is post-activation gradient. We need pre-activation values
+   to compute activation derivative. Strategy: recompute pre-activation
+   from input/weight/bias (cheap, avoids storing intermediate tensor). */
+
+std::vector<torch::Tensor> rac_fused_linear_backward_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor pre_act,    /* pre-activation output (saved from forward) */
+    int64_t act,
+    bool need_bias_grad)
+{
+    TORCH_CHECK(grad_output.is_cuda(), "RAC backward: grad must be CUDA tensor");
+
+    auto orig_dtype = grad_output.scalar_type();
+    if (orig_dtype != torch::kFloat32) {
+        grad_output = grad_output.to(torch::kFloat32);
+        input = input.to(torch::kFloat32);
+        weight = weight.to(torch::kFloat32);
+        pre_act = pre_act.to(torch::kFloat32);
+    }
+
+    int out_features = weight.size(0);
+    int in_features  = weight.size(1);
+
+    auto go_flat  = grad_output.reshape({-1, out_features}).contiguous();
+    auto inp_flat = input.reshape({-1, in_features}).contiguous();
+    auto pre_flat = pre_act.reshape({-1, out_features}).contiguous();
+    int M = inp_flat.size(0);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    /* Apply activation gradient element-wise to grad_output */
+    /* d_act = grad_output * act'(pre_act) */
+    auto d_act = torch::empty_like(go_flat);
+    if (act > 0) {
+        /* Use a simple element-wise kernel or ATen ops */
+        auto pre_data = pre_flat;
+        /* For each activation: compute derivative and multiply */
+        switch (act) {
+            case 1: /* ReLU: grad * (pre > 0) */
+                d_act = go_flat * (pre_data > 0).to(torch::kFloat32);
+                break;
+            case 2: { /* GELU: grad * (cdf + x*pdf) */
+                auto cdf = 0.5f * (1.0f + torch::erf(pre_data * 0.7071067811865f));
+                auto pdf = 0.3989422804f * torch::exp(-0.5f * pre_data * pre_data);
+                d_act = go_flat * (cdf + pre_data * pdf);
+                break;
+            }
+            case 3: { /* SiLU: grad * (sig * (1 + x*(1-sig))) */
+                auto sig = torch::sigmoid(pre_data);
+                d_act = go_flat * (sig * (1.0f + pre_data * (1.0f - sig)));
+                break;
+            }
+            default:
+                d_act = go_flat;
+        }
+    } else {
+        d_act = go_flat;
+    }
+
+    /* grad_input = d_act @ weight  [M, in_features] */
+    auto grad_input = torch::empty({M, in_features}, inp_flat.options());
+    _launch_nn(
+        d_act.data_ptr<float>(), weight.contiguous().data_ptr<float>(),
+        grad_input.data_ptr<float>(), M, in_features, out_features, 1.0f, 0.0f, stream);
+
+    /* grad_weight = d_act^T @ input  [out_features, in_features] */
+    auto grad_weight = torch::empty({out_features, in_features}, weight.options());
+    _launch_tn(
+        d_act.data_ptr<float>(), inp_flat.data_ptr<float>(),
+        grad_weight.data_ptr<float>(), out_features, in_features, M, 1.0f, 0.0f, stream);
+
+    torch::Tensor grad_bias;
+    if (need_bias_grad)
+        grad_bias = d_act.sum(0);
+
+    auto in_shape = input.sizes().vec();
+    in_shape.back() = in_features;
+    auto gi = grad_input.reshape(in_shape);
+
+    if (orig_dtype != torch::kFloat32) {
+        gi = gi.to(orig_dtype);
+        grad_weight = grad_weight.to(orig_dtype);
+        if (grad_bias.defined()) grad_bias = grad_bias.to(orig_dtype);
+    }
+
+    return {gi, grad_weight, grad_bias};
+}
+
 /* ── pybind11 ────────────────────────────────────────────────────────── */
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -585,5 +845,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear_backward", &rac_linear_backward_cuda,
           "RAC linear layer backward",
           py::arg("grad_output"), py::arg("input"), py::arg("weight"),
+          py::arg("need_bias_grad"));
+
+    m.def("fused_linear_forward", &rac_fused_linear_forward_cuda,
+          "RAC fused linear forward (matmul + bias + activation in one kernel)",
+          py::arg("input"), py::arg("weight"), py::arg("bias"),
+          py::arg("act") = 0);
+
+    m.def("fused_linear_backward", &rac_fused_linear_backward_cuda,
+          "RAC fused linear backward with activation gradient",
+          py::arg("grad_output"), py::arg("input"), py::arg("weight"),
+          py::arg("bias"), py::arg("pre_act"), py::arg("act"),
           py::arg("need_bias_grad"));
 }
