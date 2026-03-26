@@ -187,8 +187,8 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
     }
 
     srand(42);
-    for (int i = 0; i < M * K; i++) hA[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
-    for (int i = 0; i < K * N; i++) hB[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+    for (int i = 0; i < M * K; i++) hA[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+    for (int i = 0; i < K * N; i++) hB[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
 
     /* device data */
     float *dA, *dB, *dC;
