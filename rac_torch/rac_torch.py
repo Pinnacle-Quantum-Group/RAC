@@ -86,7 +86,9 @@ class RACMatmulFunction(Function):
         grad_A = grad_B = None
 
         if _rac_available() and grad_C.is_cuda and grad_C.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            grads = _rac.matmul_backward(grad_C.contiguous(), A, B)
+            grads = _rac.matmul_backward(
+                grad_C.contiguous(), A, B,
+                ctx.needs_input_grad[0], ctx.needs_input_grad[1])
             if ctx.needs_input_grad[0]: grad_A = grads[0]
             if ctx.needs_input_grad[1]: grad_B = grads[1]
         else:

@@ -325,6 +325,8 @@ void rac_matmul_micro_tn(
 
 /* ── Launch helpers ──────────────────────────────────────────────────── */
 
+#define RAC_KERNEL_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+
 static void _launch_nn(
     const float* A, const float* B, float* C,
     int M, int N, int K, float alpha, float beta,
@@ -334,10 +336,12 @@ static void _launch_nn(
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
         rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     } else {
         dim3 block(BN/TN, BM/TM);  /* 16x16 = 256 threads */
         dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
         rac_matmul_micro_nn<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     }
 }
 
@@ -351,10 +355,12 @@ static void _launch_nt(
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
         rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     } else {
         dim3 block(BN/TN, BM/TM);
         dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
         rac_matmul_micro_nt<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     }
 }
 
@@ -367,10 +373,12 @@ static void _launch_tn(
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
         rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     } else {
         dim3 block(BN/TN, BM/TM);
         dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
         rac_matmul_micro_tn<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     }
 }
 
@@ -416,7 +424,9 @@ torch::Tensor rac_matmul_forward_cuda(
 std::vector<torch::Tensor> rac_matmul_backward_cuda(
     torch::Tensor grad_C,
     torch::Tensor A,
-    torch::Tensor B)
+    torch::Tensor B,
+    bool need_grad_A,
+    bool need_grad_B)
 {
     TORCH_CHECK(grad_C.is_cuda(), "RAC backward: grad must be CUDA tensor");
 
@@ -434,21 +444,24 @@ std::vector<torch::Tensor> rac_matmul_backward_cuda(
     int M = A.size(0), K = A.size(1), N = B.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    /* dA = grad_C[M,N] @ B[K,N]^T → [M,K] */
-    auto grad_A = torch::empty({M, K}, A.options());
-    _launch_nt(
-        grad_C.data_ptr<float>(), B.data_ptr<float>(), grad_A.data_ptr<float>(),
-        M, K, N, 1.0f, 0.0f, stream);
+    /* dA = grad_C[M,N] @ B[K,N]^T → [M,K]  (skip if not needed) */
+    torch::Tensor grad_A;
+    if (need_grad_A) {
+        grad_A = torch::empty({M, K}, A.options());
+        _launch_nt(
+            grad_C.data_ptr<float>(), B.data_ptr<float>(), grad_A.data_ptr<float>(),
+            M, K, N, 1.0f, 0.0f, stream);
+        if (orig_dtype != torch::kFloat32) grad_A = grad_A.to(orig_dtype);
+    }
 
-    /* dB = A[M,K]^T @ grad_C[M,N] → [K,N] */
-    auto grad_B = torch::empty({K, N}, B.options());
-    _launch_tn(
-        A.data_ptr<float>(), grad_C.data_ptr<float>(), grad_B.data_ptr<float>(),
-        K, N, M, 1.0f, 0.0f, stream);
-
-    if (orig_dtype != torch::kFloat32) {
-        grad_A = grad_A.to(orig_dtype);
-        grad_B = grad_B.to(orig_dtype);
+    /* dB = A[M,K]^T @ grad_C[M,N] → [K,N]  (skip if not needed) */
+    torch::Tensor grad_B;
+    if (need_grad_B) {
+        grad_B = torch::empty({K, N}, B.options());
+        _launch_tn(
+            A.data_ptr<float>(), grad_C.data_ptr<float>(), grad_B.data_ptr<float>(),
+            K, N, M, 1.0f, 0.0f, stream);
+        if (orig_dtype != torch::kFloat32) grad_B = grad_B.to(orig_dtype);
     }
 
     return {grad_A, grad_B};
@@ -562,7 +575,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("matmul_backward", &rac_matmul_backward_cuda,
           "RAC matrix multiply backward",
-          py::arg("grad_C"), py::arg("A"), py::arg("B"));
+          py::arg("grad_C"), py::arg("A"), py::arg("B"),
+          py::arg("need_grad_A") = true, py::arg("need_grad_B") = true);
 
     m.def("linear_forward",  &rac_linear_forward_cuda,
           "RAC linear layer forward (input @ weight.T + bias)",
