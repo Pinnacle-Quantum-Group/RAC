@@ -63,6 +63,7 @@ try:
         benchmark_model, rac_info, _rac_available,
         FusedRACLinear, RACFusedLinearFunction,
         RACFusedQKV, RACFusedFFN,
+        RACAttention, RACTransformerBlock,
         rac_matmul_adaptive,
         ACT_NONE, ACT_RELU, ACT_GELU, ACT_SILU,
     )
@@ -346,7 +347,40 @@ check("ACT_SILU == 3", ACT_SILU == 3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# BVT-13: rac_matmul_adaptive
+# BVT-13b: RACAttention and RACTransformerBlock instantiation
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-13b: RACAttention / RACTransformerBlock")
+
+attn = RACAttention(d_model=128, n_heads=4)
+check("RACAttention(128, 4) creates", True)
+check("  qkv weight shape", tuple(attn.qkv.weight.shape) == (384, 128))
+check("  out_proj weight shape", tuple(attn.out_proj.weight.shape) == (128, 128))
+check("  repr contains 'RAC'", 'RAC' in repr(attn))
+
+block = RACTransformerBlock(d_model=128, n_heads=4, ff_dim=512)
+check("RACTransformerBlock creates", True)
+check("  attn is RACAttention", isinstance(block.attn, RACAttention))
+check("  ffn is RACFusedFFN", isinstance(block.ffn, RACFusedFFN))
+
+# CPU forward
+x_cpu = torch.randn(1, 8, 128)
+try:
+    y = attn(x_cpu)
+    check("RACAttention CPU forward", True)
+    check("  output shape", tuple(y.shape) == (1, 8, 128))
+except Exception as e:
+    check("RACAttention CPU forward", False, str(e)[:60])
+
+try:
+    y = block(x_cpu)
+    check("RACTransformerBlock CPU forward", True)
+    check("  output shape", tuple(y.shape) == (1, 8, 128))
+except Exception as e:
+    check("RACTransformerBlock CPU forward", False, str(e)[:60])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-14: rac_matmul_adaptive
 # ═══════════════════════════════════════════════════════════════════════════
 header("BVT-13: rac_matmul_adaptive")
 

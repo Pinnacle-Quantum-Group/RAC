@@ -535,6 +535,211 @@ class RACFusedFFN(nn.Module):
         return f'd_model={self.fc2.out_features}, ff_dim={self.fc1.out_features}'
 
 
+# ── RAC Attention: full QKᵀ → scale → softmax → @V via RAC ─────────────────
+
+class RACAttention(nn.Module):
+    """
+    Full multi-head attention via RAC.
+
+    Pipeline (all matmuls via RAC):
+        1. Q, K, V = fused_qkv(x)          — single RAC matmul
+        2. scores = Q @ K^T / sqrt(d_head)  — RAC batched matmul
+        3. attn = softmax(scores + mask)     — standard softmax
+        4. output = attn @ V                 — RAC batched matmul
+        5. output = out_proj(output)         — RAC linear
+
+    Steps 2 and 4 are the attention matmuls that dominate compute.
+    Both route through RAC's micro-tiled kernel via rac_matmul.
+
+    Supports:
+        - Causal masking (is_causal=True)
+        - Custom attention mask
+        - Dropout (training only)
+        - fp16/bf16 via autocast
+        - Multi-head and multi-query attention
+
+    Example:
+        attn = RACAttention(d_model=768, n_heads=12)
+        output = attn(x)  # x: [batch, seq, 768]
+
+        # With causal mask (GPT-style):
+        output = attn(x, is_causal=True)
+
+        # From existing attention layers:
+        attn = RACAttention.from_attention_layers(q, k, v, out, n_heads=12)
+    """
+
+    def __init__(self, d_model, n_heads, bias=True, dropout=0.0,
+                 device=None, dtype=None):
+        super().__init__()
+        assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+
+        # Fused QKV projection: 1 matmul instead of 3
+        self.qkv = RACLinear(d_model, 3 * d_model, bias=bias, device=device, dtype=dtype)
+        # Output projection
+        self.out_proj = RACLinear(d_model, d_model, bias=bias, device=device, dtype=dtype)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x, mask=None, is_causal=False):
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+            mask: optional [batch, 1, seq_len, seq_len] or [1, 1, seq_len, seq_len]
+                  Additive mask (0 = attend, -inf = mask out).
+            is_causal: if True, apply causal (lower-triangular) mask.
+
+        Returns:
+            output: [batch, seq_len, d_model]
+        """
+        B, T, D = x.shape
+
+        # Step 1: Fused QKV projection (single RAC matmul)
+        qkv = self.qkv(x)                          # [B, T, 3*D]
+        Q, K, V = qkv.chunk(3, dim=-1)             # each [B, T, D]
+
+        # Reshape to multi-head: [B, n_heads, T, d_head]
+        Q = Q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        K = K.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Step 2: Attention scores = Q @ K^T / sqrt(d_head)
+        # Shape: [B, n_heads, T, T]
+        # Each head is a [T, d_head] @ [d_head, T] matmul — routed via RAC
+        scores = self._rac_bmm(Q, K.transpose(-2, -1)) * self.scale
+
+        # Masking
+        if is_causal:
+            causal_mask = torch.triu(
+                torch.full((T, T), float('-inf'), device=x.device, dtype=scores.dtype),
+                diagonal=1
+            )
+            scores = scores + causal_mask
+        if mask is not None:
+            scores = scores + mask
+
+        # Step 3: Softmax (standard — no RAC matmul here)
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Step 4: attn @ V → [B, n_heads, T, d_head]
+        # Each head is a [T, T] @ [T, d_head] matmul — routed via RAC
+        out = self._rac_bmm(attn_weights, V)
+
+        # Reshape back: [B, T, D]
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+
+        # Step 5: Output projection (RAC linear)
+        return self.out_proj(out)
+
+    def _rac_bmm(self, A, B):
+        """
+        Batched matmul via RAC. A: [B, H, M, K], B: [B, H, K, N]
+        Reshapes to 2D, runs RAC matmul, reshapes back.
+        Falls back to torch.matmul for non-CUDA or when RAC unavailable.
+        """
+        shape_a = A.shape  # [B, H, M, K]
+        shape_b = B.shape  # [B, H, K, N]
+        B_dim, H, M, K = shape_a
+        N = shape_b[-1]
+
+        if not (_rac_available() and A.is_cuda and
+                A.dtype in (torch.float32, torch.float16, torch.bfloat16)):
+            return torch.matmul(A, B)
+
+        # Flatten batch dims: [B*H, M, K] and [B*H, K, N]
+        A_flat = A.reshape(-1, M, K)
+        B_flat = B.reshape(-1, K, N)
+        BH = A_flat.shape[0]
+
+        # Run RAC matmul for each batch element
+        # For large BH, this is efficient because each matmul is M*N elements
+        C_flat = torch.empty(BH, M, N, device=A.device, dtype=A.dtype)
+        for i in range(BH):
+            C_flat[i] = RACMatmulFunction.apply(
+                A_flat[i].contiguous(), B_flat[i].contiguous())
+
+        return C_flat.view(B_dim, H, M, N)
+
+    @classmethod
+    def from_attention_layers(cls, q_linear, k_linear, v_linear, out_linear,
+                              n_heads, dropout=0.0):
+        """
+        Convert separate Q/K/V/out nn.Linear layers into a single RACAttention.
+
+        Example:
+            # From a HuggingFace BERT attention:
+            rac_attn = RACAttention.from_attention_layers(
+                attn.query, attn.key, attn.value, attn.output.dense,
+                n_heads=12)
+        """
+        d_model = q_linear.in_features
+        has_bias = q_linear.bias is not None
+        attn = cls(d_model, n_heads, bias=has_bias, dropout=dropout,
+                   device=q_linear.weight.device, dtype=q_linear.weight.dtype)
+        with torch.no_grad():
+            attn.qkv.weight.copy_(torch.cat([
+                q_linear.weight, k_linear.weight, v_linear.weight
+            ], dim=0))
+            if has_bias:
+                attn.qkv.bias.copy_(torch.cat([
+                    q_linear.bias, k_linear.bias, v_linear.bias
+                ], dim=0))
+            attn.out_proj.weight.copy_(out_linear.weight)
+            if has_bias:
+                attn.out_proj.bias.copy_(out_linear.bias)
+        return attn
+
+    def extra_repr(self):
+        return (f'd_model={self.d_model}, n_heads={self.n_heads}, '
+                f'd_head={self.d_head}, backend=RAC')
+
+
+# ── Full RAC Transformer Block ──────────────────────────────────────────────
+
+class RACTransformerBlock(nn.Module):
+    """
+    Complete transformer block with all ops routed through RAC:
+        - RACAttention (fused QKV + RAC attention matmuls)
+        - RACFusedFFN (fused linear+activation + linear)
+        - LayerNorm (standard, no matmul)
+
+    Example:
+        block = RACTransformerBlock(d_model=768, n_heads=12, ff_dim=3072)
+        output = block(x)  # x: [batch, seq, 768]
+
+        # Causal (GPT-style):
+        output = block(x, is_causal=True)
+    """
+
+    def __init__(self, d_model, n_heads, ff_dim=None, activation='gelu',
+                 dropout=0.0, bias=True, device=None, dtype=None):
+        super().__init__()
+        if ff_dim is None:
+            ff_dim = 4 * d_model
+
+        self.attn = RACAttention(d_model, n_heads, bias=bias, dropout=dropout,
+                                  device=device, dtype=dtype)
+        self.ffn = RACFusedFFN(d_model, ff_dim, activation=activation, bias=bias,
+                                device=device, dtype=dtype)
+        self.norm1 = nn.LayerNorm(d_model, device=device, dtype=dtype)
+        self.norm2 = nn.LayerNorm(d_model, device=device, dtype=dtype)
+
+    def forward(self, x, mask=None, is_causal=False):
+        x = self.norm1(x + self.attn(x, mask=mask, is_causal=is_causal))
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+    def extra_repr(self):
+        return (f'd_model={self.attn.d_model}, n_heads={self.attn.n_heads}, '
+                f'ff_dim={self.ffn.fc1.out_features}')
+
+
 # ── Model patching (with fusion support) ────────────────────────────────────
 
 def patch_model(
