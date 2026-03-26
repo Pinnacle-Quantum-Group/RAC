@@ -20,10 +20,7 @@
  *   Traditional:  A * B (matmul)       = rac_matmul(A, B, C, M, N, K)
  */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
+/* Platform runtime includes — must precede extern "C" (C++ templates) */
 #if defined(__CUDACC__)
   #include <cuda_runtime.h>
   #define RAC_FLOAT2 float2
@@ -33,6 +30,10 @@ extern "C" {
 #else
   typedef struct { float x; float y; } float2;
   #define RAC_FLOAT2 float2
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 #define RAC_K_INV  0.60725f   /* CORDIC gain compensation: K^-1 */
