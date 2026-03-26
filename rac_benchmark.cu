@@ -303,6 +303,211 @@ void rac_matmul_tiled_fast32(float *A, float *B, float *C, int M, int N, int K) 
         C[row * N + col] = sum;
 }
 
+/*
+ * Kernel 5: REGISTER MICRO-TILED — the big gun.
+ * Each thread computes a TM x TN sub-block of C (e.g., 4x4 = 16 outputs).
+ * Block loads BM x BK tile of A and BK x BN tile of B into shared memory.
+ * Then each thread reads TM values from A's column and TN from B's row
+ * into registers, computing TM*TN FMAs from register-resident data.
+ *
+ * Arithmetic intensity: TM*TN FMAs per (TM+TN) shared memory loads
+ *   = 16 / 8 = 2.0 FMAs/load (vs 1/2 = 0.5 in simple tiling).
+ *
+ * Block geometry: (BN/TN) x (BM/TM) threads = (128/4) x (128/4) = 32x32 = 1024
+ *   ... too many for gfx1102. Use BM=BN=64, TM=TN=4 → 16x16 = 256 threads.
+ *
+ * Shared memory: BM*BK + BK*BN = 64*16 + 16*64 = 2048 floats = 8KB. Fits easily.
+ * Registers per thread: TM*TN accumulators + TM+TN operands = 16+8 = 24. Low.
+ */
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+/* threads per block: (BN/TN) x (BM/TM) = 16 x 16 = 256 */
+
+__global__
+void rac_matmul_micro(float *A, float *B, float *C, int M, int N, int K) {
+    __shared__ float sA[BK][BM];   /* transposed: sA[k][m] for bank-conflict-free column access */
+    __shared__ float sB[BK][BN];
+
+    const int tx = threadIdx.x;   /* 0..15, indexes BN/TN dimension */
+    const int ty = threadIdx.y;   /* 0..15, indexes BM/TM dimension */
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+
+    /* this thread's output sub-block starts at: */
+    const int row0 = by * BM + ty * TM;
+    const int col0 = bx * BN + tx * TN;
+
+    /* accumulator registers: TM x TN = 4x4 = 16 */
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; i++)
+        #pragma unroll
+        for (int j = 0; j < TN; j++)
+            acc[i][j] = 0.0f;
+
+    /* number of threads = 256, elements per shared tile = BM*BK = 1024 or BK*BN = 1024 */
+    /* each thread loads 1024/256 = 4 elements per tile */
+    const int tid = ty * (BN / TN) + tx;   /* flat thread id 0..255 */
+
+    for (int t = 0; t < K; t += BK) {
+        /* ── cooperative load A tile into sA[k][m] (transposed) ── */
+        #pragma unroll
+        for (int i = 0; i < (BM * BK) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BM;      /* which k within tile */
+            int sm = idx % BM;      /* which m within tile */
+            int gm = by * BM + sm;
+            int gk = t + sk;
+            sA[sk][sm] = (gm < M && gk < K) ? A[gm * K + gk] : 0.0f;
+        }
+
+        /* ── cooperative load B tile into sB[k][n] ── */
+        #pragma unroll
+        for (int i = 0; i < (BK * BN) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BN;
+            int sn = idx % BN;
+            int gk = t + sk;
+            int gn = bx * BN + sn;
+            sB[sk][sn] = (gk < K && gn < N) ? B[gk * N + gn] : 0.0f;
+        }
+
+        __syncthreads();
+
+        /* ── compute: each thread does TM*TN FMAs per BK iteration ── */
+        #pragma unroll
+        for (int kk = 0; kk < BK; kk++) {
+            /* load TM values from A column and TN values from B row into registers */
+            float a_reg[TM], b_reg[TN];
+
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                a_reg[i] = sA[kk][ty * TM + i];
+
+            #pragma unroll
+            for (int j = 0; j < TN; j++)
+                b_reg[j] = sB[kk][tx * TN + j];
+
+            /* outer product: TM*TN = 16 FMAs from 8 register loads */
+            #pragma unroll
+            for (int i = 0; i < TM; i++)
+                #pragma unroll
+                for (int j = 0; j < TN; j++)
+                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+        }
+
+        __syncthreads();
+    }
+
+    /* ── write results ── */
+    #pragma unroll
+    for (int i = 0; i < TM; i++) {
+        #pragma unroll
+        for (int j = 0; j < TN; j++) {
+            int gm = row0 + i;
+            int gn = col0 + j;
+            if (gm < M && gn < N)
+                C[gm * N + gn] = acc[i][j];
+        }
+    }
+}
+
+/*
+ * Kernel 6: REGISTER MICRO-TILED 8x8 — more aggressive register blocking.
+ * Each thread computes 8x8 = 64 output elements.
+ * BM=BN=128, BK=16, TM=TN=8 → (128/8)x(128/8) = 16x16 = 256 threads.
+ * Arithmetic intensity: 64 / 16 = 4.0 FMAs/load.
+ * Registers: 64 accumulators + 16 operands = 80 registers/thread.
+ * Shared: 128*16*2 = 4096 floats = 16KB.
+ */
+#define BM8 128
+#define BN8 128
+#define BK8 16
+#define TM8 8
+#define TN8 8
+
+__global__
+void rac_matmul_micro8(float *A, float *B, float *C, int M, int N, int K) {
+    __shared__ float sA8[BK8][BM8];
+    __shared__ float sB8[BK8][BN8];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int row0 = by * BM8 + ty * TM8;
+    const int col0 = bx * BN8 + tx * TN8;
+
+    float acc[TM8][TN8];
+    #pragma unroll
+    for (int i = 0; i < TM8; i++)
+        #pragma unroll
+        for (int j = 0; j < TN8; j++)
+            acc[i][j] = 0.0f;
+
+    const int tid = ty * (BN8 / TN8) + tx;
+
+    for (int t = 0; t < K; t += BK8) {
+        /* cooperative load — 256 threads load BM8*BK8=2048 elements → 8 each */
+        #pragma unroll
+        for (int i = 0; i < (BM8 * BK8) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BM8;
+            int sm = idx % BM8;
+            int gm = by * BM8 + sm;
+            int gk = t + sk;
+            sA8[sk][sm] = (gm < M && gk < K) ? A[gm * K + gk] : 0.0f;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < (BK8 * BN8) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BN8;
+            int sn = idx % BN8;
+            int gk = t + sk;
+            int gn = bx * BN8 + sn;
+            sB8[sk][sn] = (gk < K && gn < N) ? B[gk * N + gn] : 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK8; kk++) {
+            float a_reg[TM8], b_reg[TN8];
+
+            #pragma unroll
+            for (int i = 0; i < TM8; i++)
+                a_reg[i] = sA8[kk][ty * TM8 + i];
+
+            #pragma unroll
+            for (int j = 0; j < TN8; j++)
+                b_reg[j] = sB8[kk][tx * TN8 + j];
+
+            #pragma unroll
+            for (int i = 0; i < TM8; i++)
+                #pragma unroll
+                for (int j = 0; j < TN8; j++)
+                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM8; i++) {
+        #pragma unroll
+        for (int j = 0; j < TN8; j++) {
+            int gm = row0 + i;
+            int gn = col0 + j;
+            if (gm < M && gn < N)
+                C[gm * N + gn] = acc[i][j];
+        }
+    }
+}
+
 /* ── Rotate batch kernel ─────────────────────────────────────────────────── */
 
 __global__
@@ -381,8 +586,8 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
     CHECK_GPU(cudaMemcpy(dA, hA, szA, cudaMemcpyHostToDevice));
     CHECK_GPU(cudaMemcpy(dB, hB, szB, cudaMemcpyHostToDevice));
 
-    double t_naive, t_sfu, t_fast, t_fast32, t_blas;
-    unsigned long long e_naive, e_sfu, e_fast, e_fast32, e_blas;
+    double t_naive, t_sfu, t_fast, t_fast32, t_micro4, t_micro8, t_blas;
+    unsigned long long e_naive, e_sfu, e_fast, e_fast32, e_micro4, e_micro8, e_blas;
 
     /* ── RAC naive (baseline) ── */
     {
@@ -418,6 +623,24 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
         bench_kernel("RAC tiled-fast32", rac_matmul_tiled_fast32, grid, block,
                      dA, dB, dC, hC_rac, M, N, K, szC,
                      warmup, iters, &t_fast32, &e_fast32);
+    }
+
+    /* ── RAC micro-tiled 4x4 (64x64 block, 256 threads, 16 outputs/thread) ── */
+    {
+        dim3 block(BN / TN, BM / TM);  /* 16x16 = 256 threads */
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        bench_kernel("RAC micro-4x4", rac_matmul_micro, grid, block,
+                     dA, dB, dC, hC_rac, M, N, K, szC,
+                     warmup, iters, &t_micro4, &e_micro4);
+    }
+
+    /* ── RAC micro-tiled 8x8 (128x128 block, 256 threads, 64 outputs/thread) ── */
+    {
+        dim3 block(BN8 / TN8, BM8 / TM8);  /* 16x16 = 256 threads */
+        dim3 grid((N + BN8 - 1) / BN8, (M + BM8 - 1) / BM8);
+        bench_kernel("RAC micro-8x8", rac_matmul_micro8, grid, block,
+                     dA, dB, dC, hC_rac, M, N, K, szC,
+                     warmup, iters, &t_micro8, &e_micro8);
     }
 
     /* ── Vendor BLAS ── */
@@ -470,15 +693,22 @@ static void bench_matmul(int M, int N, int K, int warmup, int iters) {
     printf("\n");
 
     /* ── Summary ── */
+    double t_best = t_micro8 < t_micro4 ? t_micro8 : t_micro4;
+    unsigned long long e_best = t_micro8 < t_micro4 ? e_micro8 : e_micro4;
+    const char *best_name = t_micro8 < t_micro4 ? "micro-8x8" : "micro-4x4";
+
     printf("  ── speedup vs %s ──\n", blas_name);
     printf("    naive:      %.3fx\n", t_blas / t_naive);
     printf("    tiled-SFU:  %.3fx\n", t_blas / t_sfu);
     printf("    tiled-f16:  %.3fx\n", t_blas / t_fast);
     printf("    tiled-f32:  %.3fx\n", t_blas / t_fast32);
+    printf("    micro-4x4:  %.3fx\n", t_blas / t_micro4);
+    printf("    micro-8x8:  %.3fx\n", t_blas / t_micro8);
+    printf("    BEST (%s): %.3fx\n", best_name, t_blas / t_best);
 
-    if (e_fast32 > 0 && e_blas > 0) {
-        printf("  ── energy (tiled-f32 vs %s) ──\n", blas_name);
-        double rac_nj = (double)e_fast32 * 1e6 / (ops * iters);
+    if (e_best > 0 && e_blas > 0) {
+        printf("  ── energy (%s vs %s) ──\n", best_name, blas_name);
+        double rac_nj = (double)e_best * 1e6 / (ops * iters);
         double blas_nj = (double)e_blas * 1e6 / (ops * iters);
         printf("    RAC=%.4f nJ/op  %s=%.4f nJ/op  (%.1f%% %s)\n",
                rac_nj, blas_name, blas_nj,
