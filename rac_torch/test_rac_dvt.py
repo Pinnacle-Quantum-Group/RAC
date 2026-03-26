@@ -26,6 +26,7 @@ from rac_torch import (
     RACLinear, RACMatmulFunction, RACLinearFunction,
     rac_matmul, rac_linear, patch_model, unpatch_model, _rac_available,
     FusedRACLinear, RACFusedQKV, RACFusedFFN, rac_matmul_adaptive,
+    RACAttention, RACTransformerBlock,
     ACT_NONE, ACT_RELU, ACT_GELU, ACT_SILU,
 )
 
@@ -684,6 +685,70 @@ try:
     check("FusedRACLinear autocast", True)
 except Exception as e:
     check("FusedRACLinear autocast", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-25: RACAttention correctness
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-25: RACAttention correctness")
+
+d, h = 128, 4
+attn = RACAttention(d_model=d, n_heads=h).to(device)
+x = torch.randn(2, 16, d, device=device)
+
+# Forward
+y = attn(x)
+check("RACAttention forward shape", tuple(y.shape) == (2, 16, d))
+check("  output finite", torch.isfinite(y).all().item())
+
+# With causal mask
+y_causal = attn(x, is_causal=True)
+check("RACAttention causal forward shape", tuple(y_causal.shape) == (2, 16, d))
+check("  causal output finite", torch.isfinite(y_causal).all().item())
+check("  causal != non-causal", not torch.allclose(y, y_causal, atol=1e-5))
+
+# Backward
+y.sum().backward()
+check("RACAttention backward: qkv grad exists", attn.qkv.weight.grad is not None)
+check("  out_proj grad exists", attn.out_proj.weight.grad is not None)
+check("  qkv grad finite", torch.isfinite(attn.qkv.weight.grad).all().item())
+
+# Custom mask
+mask = torch.zeros(1, 1, 16, 16, device=device)
+mask[:, :, :, 8:] = float('-inf')  # mask out second half
+attn.zero_grad()
+y_masked = attn(x, mask=mask)
+check("RACAttention custom mask shape", tuple(y_masked.shape) == (2, 16, d))
+
+# from_attention_layers
+q_lin = nn.Linear(d, d).to(device)
+k_lin = nn.Linear(d, d).to(device)
+v_lin = nn.Linear(d, d).to(device)
+o_lin = nn.Linear(d, d).to(device)
+attn2 = RACAttention.from_attention_layers(q_lin, k_lin, v_lin, o_lin, n_heads=h)
+check("from_attention_layers creates", isinstance(attn2, RACAttention))
+check("  qkv weight shape", tuple(attn2.qkv.weight.shape) == (3*d, d))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-26: RACTransformerBlock
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-26: RACTransformerBlock correctness")
+
+block = RACTransformerBlock(d_model=128, n_heads=4, ff_dim=512).to(device)
+x = torch.randn(2, 16, 128, device=device)
+
+y = block(x)
+check("RACTransformerBlock forward shape", tuple(y.shape) == (2, 16, 128))
+check("  output finite", torch.isfinite(y).all().item())
+
+y_causal = block(x, is_causal=True)
+check("  causal forward", tuple(y_causal.shape) == (2, 16, 128))
+
+# Training
+y.sum().backward()
+grads_ok = all(p.grad is not None for p in block.parameters() if p.requires_grad)
+check("  all gradients flow", grads_ok)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

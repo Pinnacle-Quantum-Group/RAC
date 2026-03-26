@@ -24,6 +24,7 @@ from rac_torch import (
     RACLinear, rac_matmul, rac_linear,
     patch_model, unpatch_model, benchmark_model, _rac_available,
     FusedRACLinear, RACFusedQKV, RACFusedFFN, rac_matmul_adaptive,
+    RACAttention, RACTransformerBlock,
 )
 
 passed = 0
@@ -549,6 +550,145 @@ err_v = (V_orig - V_f).abs().max().item()
 check(f"QKV fusion preserves Q (err={err_q:.2e})", err_q < 0.01)
 check(f"QKV fusion preserves K (err={err_k:.2e})", err_k < 0.01)
 check(f"QKV fusion preserves V (err={err_v:.2e})", err_v < 0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-15: RACAttention full training
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-15: RACAttention full training")
+
+class RACModel(nn.Module):
+    def __init__(self, d=128, n_heads=4):
+        super().__init__()
+        self.block = RACTransformerBlock(d_model=d, n_heads=n_heads, ff_dim=512)
+        self.head = RACLinear(d, 10)
+    def forward(self, x, is_causal=False):
+        x = self.block(x, is_causal=is_causal)
+        return self.head(x.mean(dim=1))
+
+rac_model = RACModel().to(device)
+opt = torch.optim.Adam(rac_model.parameters(), lr=1e-3)
+X = torch.randn(8, 32, 128, device=device)
+Y = torch.randint(0, 10, (8,), device=device)
+
+losses = []
+for _ in range(20):
+    opt.zero_grad()
+    loss = nn.CrossEntropyLoss()(rac_model(X, is_causal=True), Y)
+    loss.backward()
+    opt.step()
+    losses.append(loss.item())
+
+check(f"RAC attention training converges ({losses[-1]:.3f} < {losses[0]:.3f})",
+      losses[-1] < losses[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-16: RAC vs baseline attention — context length scaling
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-16: Context length scaling benchmark")
+
+print("  Measuring RAC attention vs nn.MultiheadAttention at increasing context lengths")
+print("  Claim: RAC should maintain or improve relative performance at larger contexts\n")
+
+d_model = 128
+n_heads = 4
+
+# Baseline: standard PyTorch MHA
+class BaselineAttn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, batch_first=True, bias=True)
+    def forward(self, x):
+        out, _ = self.mha(x, x, x)
+        return out
+
+baseline = BaselineAttn().to(device).eval()
+rac_attn = RACAttention(d_model, n_heads).to(device).eval()
+
+context_lengths = [32, 64, 128, 256, 512]
+ratios = []
+batch = 4
+n_warmup = 5
+n_iters = 20
+
+for seq_len in context_lengths:
+    x = torch.randn(batch, seq_len, d_model, device=device)
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            baseline(x)
+            rac_attn(x)
+    torch.cuda.synchronize()
+
+    # Time baseline
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(n_iters):
+            baseline(x)
+    torch.cuda.synchronize()
+    t_base = (time.perf_counter() - t0) / n_iters * 1000
+
+    # Time RAC
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(n_iters):
+            rac_attn(x)
+    torch.cuda.synchronize()
+    t_rac = (time.perf_counter() - t0) / n_iters * 1000
+
+    ratio = t_base / t_rac if t_rac > 0 else 0
+    ratios.append(ratio)
+    print(f"  seq={seq_len:4d}  baseline={t_base:.2f}ms  RAC={t_rac:.2f}ms  ratio={ratio:.3f}x")
+
+# Check: ratio at longest context should be >= ratio at shortest
+# (i.e., RAC's advantage should grow or hold steady with context)
+if len(ratios) >= 2:
+    check(f"RAC ratio stable/improving ({ratios[0]:.3f}x → {ratios[-1]:.3f}x)",
+          ratios[-1] >= ratios[0] * 0.8)  # allow 20% tolerance
+    check(f"RAC runs at all context lengths", all(r > 0 for r in ratios))
+else:
+    skip("context scaling", "not enough data points")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-17: RACAttention from_attention_layers round-trip
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-17: Attention layer conversion round-trip")
+
+class VanillaTransformer(nn.Module):
+    def __init__(self, d=128, h=4):
+        super().__init__()
+        self.q = nn.Linear(d, d)
+        self.k = nn.Linear(d, d)
+        self.v = nn.Linear(d, d)
+        self.out = nn.Linear(d, d)
+        self.n_heads = h
+        self.d_head = d // h
+    def forward(self, x):
+        B, T, D = x.shape
+        Q = self.q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        K = self.k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        attn = torch.softmax(Q @ K.transpose(-2, -1) / (self.d_head ** 0.5), dim=-1)
+        out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
+        return self.out(out)
+
+vanilla = VanillaTransformer().to(device)
+x = torch.randn(2, 16, 128, device=device)
+
+with torch.no_grad():
+    y_vanilla = vanilla(x)
+
+rac_from = RACAttention.from_attention_layers(vanilla.q, vanilla.k, vanilla.v, vanilla.out, n_heads=4)
+with torch.no_grad():
+    y_rac = rac_from(x)
+
+err = (y_vanilla - y_rac).abs().max().item()
+check(f"converted attention matches vanilla (err={err:.2e})", err < 0.05)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
