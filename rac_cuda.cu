@@ -11,7 +11,6 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* ── CORDIC arctangent table ─────────────────────────────────────────────── */
 /* atan(2^-i) for i = 0..15, precomputed */
@@ -324,7 +323,11 @@ float rac_tanh(float x) {
         x
     );
     /* result.x = cosh(x), result.y = sinh(x) */
+    #ifdef __CUDA_ARCH__
     return __fdividef(result.y, result.x);  // RAC: SFU division replaces multiply chain
+    #else
+    return result.y / result.x;
+    #endif
 }
 
 __device__ __host__
@@ -349,7 +352,11 @@ void rac_softmax(float *x, float *out, int n) {
         sum += out[i];
     }
 
+    #ifdef __CUDA_ARCH__
     float inv_sum = __fdividef(1.0f, sum);  // RAC: SFU division
+    #else
+    float inv_sum = 1.0f / sum;
+    #endif
     for (int i = 0; i < n; i++) {
         out[i] = out[i] * inv_sum;          // RAC: normalization scaling
     }
@@ -429,12 +436,8 @@ void rac_matmul(float *A, float *B, float *C, int M, int N, int K) {
 
                 /* encode scalars as rotation vectors */
                 float2 va = make_float2(a_val, 0.0f);
-                #ifdef __CUDA_ARCH__
-                float angle_b = __fdividef(b_val, 1.0f); /* identity, angle IS b for unit encoding */
-                #else
-                float angle_b = atan2f(0.0f, b_val >= 0 ? 1.0f : -1.0f);
-                #endif
-                float mag_b = (b_val >= 0) ? b_val : -b_val; /* |b| */
+                float mag_b  = fabsf(b_val);
+                float angle_b = (b_val >= 0.0f) ? 0.0f : 3.14159265f;
 
                 float proj = rac_project(va, angle_b);  // RAC: rotation replaces multiply
                 sum += proj * mag_b;                      // RAC: magnitude scaling
@@ -475,33 +478,33 @@ void rac_softmax_kernel(float *x, float *out, int n) {
     /* single-block softmax for demonstration */
     extern __shared__ float sdata[];
     int tid = threadIdx.x;
-    if (tid >= n) return;
 
-    /* load and find max via shared memory reduction */
-    sdata[tid] = x[tid];
+    /* load — threads beyond n get -INFINITY so they don't corrupt max reduction */
+    sdata[tid] = (tid < n) ? x[tid] : -INFINITY;
     __syncthreads();
 
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < n)
+        if (tid < s)
             sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
         __syncthreads();
     }
     float max_val = sdata[0];
     __syncthreads();
 
-    /* compute exp and store */
-    float val = rac_exp(x[tid] - max_val);  // RAC: hyperbolic CORDIC replaces expf
+    /* compute exp and store — threads beyond n contribute 0 to sum */
+    float val = (tid < n) ? rac_exp(x[tid] - max_val) : 0.0f;  // RAC: hyperbolic CORDIC
     sdata[tid] = val;
     __syncthreads();
 
     /* reduce sum */
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < n) sdata[tid] += sdata[tid + s];
+        if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     float sum = sdata[0];
 
-    out[tid] = __fdividef(val, sum);  // RAC: SFU division
+    if (tid < n)
+        out[tid] = __fdividef(val, sum);  // RAC: SFU division
 }
 
 /* ── Context (stub — FIL backend wires in via rac_execute) ──────────────── */
@@ -512,12 +515,13 @@ struct rac_context_t {
 
 rac_context rac_create_context(rac_backend backend) {
     rac_context ctx = (rac_context)malloc(sizeof(struct rac_context_t));
+    if (!ctx) return NULL;
     ctx->backend = backend;
     return ctx;
 }
 
 void rac_destroy_context(rac_context ctx) {
-    free(ctx);
+    if (ctx) free(ctx);
 }
 
 int rac_query_capability(rac_context ctx, rac_op_type op) {
