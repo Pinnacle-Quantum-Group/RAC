@@ -110,9 +110,13 @@ float rac_project(float2 v, float theta) {
      * = v.x*cos(theta) + v.y*sin(theta)
      * RAC: SFU trig replaces multiply path
      */
-    float c = RAC_COSF(theta);  // RAC: SFU replaces multiply path
-    float s = RAC_SINF(theta);  // RAC: SFU replaces multiply path
-    return v.x * c + v.y * s;  // RAC: rotation replaces multiply (projection)
+    float c, s;
+    #ifdef __HIP_DEVICE_COMPILE__
+    __sincosf(theta, &s, &c);  // RAC: fused SFU — one call replaces two
+    #else
+    c = cosf(theta); s = sinf(theta);
+    #endif
+    return fmaf(v.x, c, v.y * s);  // RAC: fused multiply-add (projection)
 }
 
 /* ── 2. Polar / vectoring ────────────────────────────────────────────────── */
@@ -145,7 +149,13 @@ __device__ __host__
 float2 rac_normalize(float2 v) {
     float mag, angle;
     rac_polar(v, &mag, &angle);
-    return make_float2(RAC_COSF(angle), RAC_SINF(angle));  // RAC: SFU path
+    float c, s;
+    #ifdef __HIP_DEVICE_COMPILE__
+    __sincosf(angle, &s, &c);  // RAC: fused SFU path
+    #else
+    c = cosf(angle); s = sinf(angle);
+    #endif
+    return make_float2(c, s);
 }
 
 /* ── 3. Dot / similarity ─────────────────────────────────────────────────── */
