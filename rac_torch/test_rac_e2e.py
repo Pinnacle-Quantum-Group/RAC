@@ -22,7 +22,8 @@ import torch.nn.functional as F
 
 from rac_torch import (
     RACLinear, rac_matmul, rac_linear,
-    patch_model, unpatch_model, benchmark_model, _rac_available
+    patch_model, unpatch_model, benchmark_model, _rac_available,
+    FusedRACLinear, RACFusedQKV, RACFusedFFN, rac_matmul_adaptive,
 )
 
 passed = 0
@@ -397,6 +398,157 @@ try:
     check(f"  speedup > 0 ({results['speedup']:.2f}x)", results['speedup'] > 0)
 except Exception as e:
     check("benchmark_model runs", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-11: Fused FFN transformer training
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-11: Fused FFN transformer training")
+
+class FusedTransformerBlock(nn.Module):
+    def __init__(self, d_model=128, n_heads=4, ff_dim=512):
+        super().__init__()
+        self.qkv = RACFusedQKV(d_model)
+        self.out = RACLinear(d_model, d_model)
+        self.ffn = RACFusedFFN(d_model, ff_dim, activation='gelu')
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+
+    def forward(self, x):
+        B, T, D = x.shape
+        Q, K, V = self.qkv(x)
+        Q = Q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        K = K.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        attn = torch.softmax(Q @ K.transpose(-2, -1) / (self.d_head ** 0.5), dim=-1)
+        out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
+        x = self.norm1(x + self.out(out))
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+ftb = FusedTransformerBlock(d_model=128).to(device)
+x = torch.randn(4, 16, 128, device=device)
+
+# Forward
+y = ftb(x)
+check("fused transformer forward", tuple(y.shape) == (4, 16, 128))
+check("  output finite", torch.isfinite(y).all().item())
+
+# Training
+opt = torch.optim.Adam(ftb.parameters(), lr=1e-3)
+labels = torch.randn(4, 16, 128, device=device)
+losses = []
+for _ in range(15):
+    opt.zero_grad()
+    loss = F.mse_loss(ftb(x), labels)
+    loss.backward()
+    opt.step()
+    losses.append(loss.item())
+
+check(f"fused transformer training converges ({losses[-1]:.3f} < {losses[0]:.3f})",
+      losses[-1] < losses[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-12: Fused MLP classifier (end-to-end)
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-12: Fused MLP full training")
+
+class FusedClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            FusedRACLinear(784, 512, activation='relu'),
+            FusedRACLinear(512, 256, activation='relu'),
+            FusedRACLinear(256, 128, activation='silu'),
+            RACLinear(128, 10),
+        )
+    def forward(self, x): return self.net(x)
+
+fc = FusedClassifier().to(device)
+X = torch.randn(256, 784, device=device)
+Y = torch.randint(0, 10, (256,), device=device)
+
+opt = torch.optim.Adam(fc.parameters(), lr=1e-3)
+losses = []
+for _ in range(40):
+    opt.zero_grad()
+    loss = nn.CrossEntropyLoss()(fc(X), Y)
+    loss.backward()
+    opt.step()
+    losses.append(loss.item())
+
+acc = (fc(X).argmax(1) == Y).float().mean().item()
+check(f"fused MLP training converges ({losses[-1]:.3f} < {losses[0]:.3f})",
+      losses[-1] < losses[0])
+check(f"fused MLP accuracy > 50% (got {acc*100:.1f}%)", acc > 0.5)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-13: Fused + AMP training
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-13: Fused + AMP mixed precision training")
+
+fused_amp = nn.Sequential(
+    FusedRACLinear(128, 256, activation='gelu'),
+    RACLinear(256, 10),
+).to(device)
+
+scaler = torch.amp.GradScaler()
+opt = torch.optim.Adam(fused_amp.parameters(), lr=1e-3)
+X_amp = torch.randn(64, 128, device=device)
+Y_amp = torch.randint(0, 10, (64,), device=device)
+
+losses = []
+try:
+    for _ in range(20):
+        opt.zero_grad()
+        with torch.autocast('cuda', dtype=torch.float16):
+            loss = nn.CrossEntropyLoss()(fused_amp(X_amp), Y_amp)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        losses.append(loss.item())
+
+    check("fused AMP training runs 20 steps", True)
+    check(f"  loss decreasing ({losses[-1]:.3f} < {losses[0]:.3f})", losses[-1] < losses[0])
+except Exception as e:
+    check("fused AMP training", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-14: RACFusedQKV from existing model
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-14: QKV fusion from existing model")
+
+class VanillaAttn(nn.Module):
+    def __init__(self, d=128):
+        super().__init__()
+        self.q = nn.Linear(d, d)
+        self.k = nn.Linear(d, d)
+        self.v = nn.Linear(d, d)
+    def forward(self, x):
+        return self.q(x), self.k(x), self.v(x)
+
+vanilla = VanillaAttn(128).to(device)
+x = torch.randn(2, 16, 128, device=device)
+
+with torch.no_grad():
+    Q_orig, K_orig, V_orig = vanilla(x)
+
+# Fuse
+fused = RACFusedQKV.from_qkv_linears(vanilla.q, vanilla.k, vanilla.v)
+with torch.no_grad():
+    Q_f, K_f, V_f = fused(x)
+
+err_q = (Q_orig - Q_f).abs().max().item()
+err_k = (K_orig - K_f).abs().max().item()
+err_v = (V_orig - V_f).abs().max().item()
+check(f"QKV fusion preserves Q (err={err_q:.2e})", err_q < 0.01)
+check(f"QKV fusion preserves K (err={err_k:.2e})", err_k < 0.01)
+check(f"QKV fusion preserves V (err={err_v:.2e})", err_v < 0.01)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

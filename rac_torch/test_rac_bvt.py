@@ -60,7 +60,11 @@ try:
         RACLinear, RACMatmulFunction, RACLinearFunction,
         rac_matmul, rac_linear,
         patch_model, unpatch_model,
-        benchmark_model, rac_info, _rac_available
+        benchmark_model, rac_info, _rac_available,
+        FusedRACLinear, RACFusedLinearFunction,
+        RACFusedQKV, RACFusedFFN,
+        rac_matmul_adaptive,
+        ACT_NONE, ACT_RELU, ACT_GELU, ACT_SILU,
     )
     check("import rac_torch (all public symbols)", True)
 except ImportError as e:
@@ -83,7 +87,8 @@ except ImportError:
 header("BVT-2: Extension API surface")
 
 if NATIVE_AVAILABLE:
-    for fn in ['matmul_forward', 'matmul_backward', 'linear_forward', 'linear_backward']:
+    for fn in ['matmul_forward', 'matmul_backward', 'linear_forward', 'linear_backward',
+               'fused_linear_forward', 'fused_linear_backward']:
         check(f"rac_cuda_ext.{fn} exists", hasattr(rac_cuda_ext, fn))
 else:
     skip("Extension API surface checks", "extension not compiled")
@@ -264,6 +269,96 @@ r = repr(layer)
 check("repr contains 'RAC'", 'RAC' in r)
 check("repr contains '512'", '512' in r)
 check("repr contains '256'", '256' in r)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-10: FusedRACLinear instantiation
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-10: FusedRACLinear instantiation")
+
+for act in ['relu', 'gelu', 'silu', None]:
+    try:
+        fl = FusedRACLinear(128, 64, activation=act)
+        check(f"FusedRACLinear(128, 64, act={act}) creates", True)
+    except Exception as e:
+        check(f"FusedRACLinear(128, 64, act={act})", False, str(e)[:60])
+
+fl = FusedRACLinear(256, 128, activation='gelu')
+check("  weight shape", tuple(fl.weight.shape) == (128, 256))
+check("  has bias", fl.bias is not None)
+check("  repr contains 'fused'", 'fused' in repr(fl).lower())
+
+# from_linear_and_act
+linear = nn.Linear(256, 128)
+fl2 = FusedRACLinear.from_linear_and_act(linear, 'relu')
+check("from_linear_and_act preserves weights", torch.equal(fl2.weight, linear.weight))
+
+# CPU fallback
+x_cpu = torch.randn(4, 256)
+try:
+    y = fl(x_cpu)
+    check("FusedRACLinear CPU forward", True)
+    check("  output shape", tuple(y.shape) == (4, 128))
+except Exception as e:
+    check("FusedRACLinear CPU forward", False, str(e)[:60])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-11: Transformer ops instantiation
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-11: Transformer ops")
+
+qkv = RACFusedQKV(d_model=128)
+check("RACFusedQKV(128) creates", True)
+check("  qkv weight shape (3*128, 128)", tuple(qkv.qkv.weight.shape) == (384, 128))
+
+ffn = RACFusedFFN(d_model=128, ff_dim=512, activation='gelu')
+check("RACFusedFFN(128, 512, gelu) creates", True)
+check("  fc1 is FusedRACLinear", isinstance(ffn.fc1, FusedRACLinear))
+check("  fc2 is RACLinear", isinstance(ffn.fc2, RACLinear))
+
+# CPU forward
+x_cpu = torch.randn(2, 8, 128)
+try:
+    Q, K, V = qkv(x_cpu)
+    check("RACFusedQKV CPU forward", True)
+    check("  Q shape", tuple(Q.shape) == (2, 8, 128))
+except Exception as e:
+    check("RACFusedQKV CPU forward", False, str(e)[:60])
+
+try:
+    y = ffn(x_cpu)
+    check("RACFusedFFN CPU forward", True)
+    check("  output shape", tuple(y.shape) == (2, 8, 128))
+except Exception as e:
+    check("RACFusedFFN CPU forward", False, str(e)[:60])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-12: Activation constants
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-12: Activation constants")
+
+check("ACT_NONE == 0", ACT_NONE == 0)
+check("ACT_RELU == 1", ACT_RELU == 1)
+check("ACT_GELU == 2", ACT_GELU == 2)
+check("ACT_SILU == 3", ACT_SILU == 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-13: rac_matmul_adaptive
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-13: rac_matmul_adaptive")
+
+A = torch.randn(8, 16)
+B = torch.randn(16, 4)
+try:
+    C = rac_matmul_adaptive(A, B)
+    check("rac_matmul_adaptive CPU", True)
+    ref = torch.matmul(A, B)
+    check("  matches torch.matmul", torch.allclose(C, ref, atol=1e-5))
+except Exception as e:
+    check("rac_matmul_adaptive CPU", False, str(e)[:60])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -24,7 +24,9 @@ from torch.autograd import gradcheck
 
 from rac_torch import (
     RACLinear, RACMatmulFunction, RACLinearFunction,
-    rac_matmul, rac_linear, patch_model, unpatch_model, _rac_available
+    rac_matmul, rac_linear, patch_model, unpatch_model, _rac_available,
+    FusedRACLinear, RACFusedQKV, RACFusedFFN, rac_matmul_adaptive,
+    ACT_NONE, ACT_RELU, ACT_GELU, ACT_SILU,
 )
 
 passed = 0
@@ -523,6 +525,165 @@ if torch.cuda.is_bf16_supported():
         check("model.bfloat16() forward", True)
     except Exception as e:
         check("model.bfloat16() forward", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-18: FusedRACLinear correctness (all activations)
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-18: FusedRACLinear correctness")
+
+for act_name, act_fn in [('relu', torch.relu), ('gelu', F.gelu), ('silu', F.silu), (None, lambda x: x)]:
+    linear = nn.Linear(256, 128, bias=True).to(device)
+    fused = FusedRACLinear.from_linear_and_act(linear, act_name)
+
+    x = torch.randn(8, 256, device=device)
+    with torch.no_grad():
+        y_ref = act_fn(linear(x))
+        y_fused = fused(x)
+
+    err = (y_ref - y_fused).abs().max().item()
+    tol = 0.05 if act_name else 0.01
+    check(f"FusedRACLinear act={act_name} (err={err:.2e})", err < tol)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-19: FusedRACLinear gradient correctness
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-19: FusedRACLinear gradient flow")
+
+for act_name in ['relu', 'gelu', 'silu']:
+    fused = FusedRACLinear(128, 64, activation=act_name, bias=True).to(device)
+    x = torch.randn(4, 128, device=device, requires_grad=True)
+    y = fused(x)
+    loss = y.sum()
+    loss.backward()
+    check(f"FusedRACLinear({act_name}) grad_input exists", x.grad is not None)
+    check(f"  grad_weight exists", fused.weight.grad is not None)
+    check(f"  grad_bias exists", fused.bias.grad is not None)
+    check(f"  grad_input finite", torch.isfinite(x.grad).all().item())
+    check(f"  grad_weight finite", torch.isfinite(fused.weight.grad).all().item())
+    x.grad = None
+    fused.zero_grad()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-20: FusedRACLinear training convergence
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-20: FusedRACLinear training convergence")
+
+class FusedMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = FusedRACLinear(64, 128, activation='relu')
+        self.fc2 = FusedRACLinear(128, 64, activation='relu')
+        self.head = RACLinear(64, 10)
+    def forward(self, x): return self.head(self.fc2(self.fc1(x)))
+
+fmlp = FusedMLP().to(device)
+opt = torch.optim.Adam(fmlp.parameters(), lr=1e-3)
+X = torch.randn(128, 64, device=device)
+Y = torch.randint(0, 10, (128,), device=device)
+losses = []
+for _ in range(30):
+    opt.zero_grad()
+    loss = nn.CrossEntropyLoss()(fmlp(X), Y)
+    loss.backward()
+    opt.step()
+    losses.append(loss.item())
+check(f"fused MLP loss decreasing ({losses[-1]:.3f} < {losses[0]:.3f})", losses[-1] < losses[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-21: RACFusedQKV correctness
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-21: RACFusedQKV correctness")
+
+d = 128
+q_lin = nn.Linear(d, d, bias=True).to(device)
+k_lin = nn.Linear(d, d, bias=True).to(device)
+v_lin = nn.Linear(d, d, bias=True).to(device)
+
+fqkv = RACFusedQKV.from_qkv_linears(q_lin, k_lin, v_lin)
+
+x = torch.randn(2, 16, d, device=device)
+with torch.no_grad():
+    Q_ref, K_ref, V_ref = q_lin(x), k_lin(x), v_lin(x)
+    Q_fused, K_fused, V_fused = fqkv(x)
+
+for name, ref, fused in [('Q', Q_ref, Q_fused), ('K', K_ref, K_fused), ('V', V_ref, V_fused)]:
+    err = (ref - fused).abs().max().item()
+    check(f"FusedQKV {name} matches separate (err={err:.2e})", err < 0.01)
+
+# Backward
+Q, K, V = fqkv(x)
+loss = (Q.sum() + K.sum() + V.sum())
+loss.backward()
+check("FusedQKV backward: grad exists", fqkv.qkv.weight.grad is not None)
+check("  grad finite", torch.isfinite(fqkv.qkv.weight.grad).all().item())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-22: RACFusedFFN correctness
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-22: RACFusedFFN correctness")
+
+ffn = RACFusedFFN(d_model=128, ff_dim=512, activation='gelu').to(device)
+x = torch.randn(2, 16, 128, device=device)
+y = ffn(x)
+check("RACFusedFFN forward shape", tuple(y.shape) == (2, 16, 128))
+check("  output finite", torch.isfinite(y).all().item())
+
+# Backward
+y.sum().backward()
+check("RACFusedFFN backward: fc1 grad", ffn.fc1.weight.grad is not None)
+check("  fc2 grad", ffn.fc2.weight.grad is not None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-23: rac_matmul_adaptive
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-23: rac_matmul_adaptive")
+
+# Small (should use torch.matmul)
+A_s = torch.randn(4, 4, device=device)
+B_s = torch.randn(4, 4, device=device)
+C_s = rac_matmul_adaptive(A_s, B_s)
+ref_s = torch.matmul(A_s, B_s)
+err = (C_s - ref_s).abs().max().item()
+check(f"adaptive small (4x4) correct (err={err:.2e})", err < 1e-5)
+
+# Large (should use RAC)
+A_l = torch.randn(256, 256, device=device)
+B_l = torch.randn(256, 256, device=device)
+C_l = rac_matmul_adaptive(A_l, B_l)
+ref_l = torch.matmul(A_l, B_l)
+err = (C_l - ref_l).abs().max().item()
+check(f"adaptive large (256x256) correct (err={err:.2e})", err < 0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-24: FusedRACLinear with fp16/bf16
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-24: FusedRACLinear mixed precision")
+
+fused_mp = FusedRACLinear(128, 64, activation='gelu', bias=True).to(device).half()
+x_fp16 = torch.randn(8, 128, device=device, dtype=torch.float16)
+try:
+    y = fused_mp(x_fp16)
+    check("FusedRACLinear fp16 forward", True)
+    check("  output dtype fp16", y.dtype == torch.float16)
+    check("  output finite", torch.isfinite(y).all().item())
+except Exception as e:
+    check("FusedRACLinear fp16 forward", False, str(e)[:80])
+
+# Autocast
+fused_amp = FusedRACLinear(128, 64, activation='relu', bias=True).to(device)
+try:
+    with torch.autocast('cuda', dtype=torch.float16):
+        y = fused_amp(torch.randn(8, 128, device=device))
+    check("FusedRACLinear autocast", True)
+except Exception as e:
+    check("FusedRACLinear autocast", False, str(e)[:80])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
