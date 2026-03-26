@@ -1,0 +1,89 @@
+RAC DUAL LICENSE
+Rotation-Accumulate Primitive Library
+© 2026 Michael A. Doran Jr. / Pinnacle Quantum Group
+All rights reserved.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART I — ACADEMIC & RESEARCH LICENSE (FREE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Permission is hereby granted, free of charge, to any person affiliated with
+an accredited academic institution, non-profit research organization, or
+government research laboratory ("Academic User") to use, copy, modify, and
+distribute this software and its documentation for the following purposes:
+
+  (a) Academic research and publication
+  (b) Teaching and educational coursework
+  (c) Non-commercial scientific experimentation
+  (d) Thesis, dissertation, and academic paper preparation
+
+Subject to the following conditions:
+
+  1. The above copyright notice and this license must be included in all
+     copies or substantial portions of the software.
+
+  2. Publications, papers, or presentations that use or build upon this
+     software must cite:
+
+       Doran, M. A., Jr. (2026). Rotation-Accumulate (RAC): A multiply-free
+       compute primitive for GPU and ASIC architecture [Technical whitepaper].
+       Pinnacle Quantum Group. https://github.com/Pinnacle-Quantum-Group/RAC
+
+  3. Academic Users may NOT sublicense, sell, or transfer this software or
+     any derivative works to commercial entities without a commercial license.
+
+  4. Training a machine learning model using this software, where that model
+     is subsequently used for commercial inference, constitutes commercial use
+     and requires a Commercial License (see Part II).
+
+  5. Any modified versions must be clearly marked as modified and must not
+     be misrepresented as the original software.
+
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY ARISING FROM USE OF THE SOFTWARE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART II — COMMERCIAL LICENSE (PAID)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Any use not covered by Part I requires a Commercial License. This includes
+but is not limited to:
+
+  (a) Use by any for-profit company, startup, or commercial entity
+  (b) Integration into commercial products, services, or APIs
+  (c) Use in production inference pipelines generating revenue
+  (d) Use in cloud computing services offered to third parties
+  (e) Training commercial AI/ML models for deployment
+  (f) Any use at a company with annual revenue exceeding $10,000 USD
+  (g) Redistribution as part of a commercial software package
+  (h) Use by a company to reduce compute costs in commercial operations
+
+To obtain a Commercial License, contact:
+  Michael A. Doran Jr.
+  Pinnacle Quantum Group
+  michael@pqg.info
+
+Unauthorized commercial use is a violation of copyright law and will be
+pursued accordingly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART III — PATENT NOTICE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This software implements the Rotation-Accumulate (RAC) compute primitive,
+for which patent applications are pending. The Academic License in Part I
+includes a royalty-free patent license for the permitted academic uses only.
+
+Commercial use of the RAC primitive — including on hardware not distributed
+by Pinnacle Quantum Group — requires a Commercial License covering both the
+software copyright and the applicable patent rights.
+
+Prior art for the RAC primitive is established as of March 26, 2026.
+See: https://github.com/Pinnacle-Quantum-Group/RAC
+
+CORDIC algorithm: public domain (Volder, 1959).
+All other content: © 2026 Michael A. Doran Jr. / Pinnacle Quantum Group.
+
+For licensing inquiries: michael@pqg.info
+For technical questions: https://github.com/Pinnacle-Quantum-Group/RAC/issues
