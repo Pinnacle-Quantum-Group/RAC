@@ -54,14 +54,14 @@ if(RAC_AVX2)
     check_c_compiler_flag("-mfma" HAS_FMA)
 
     if(HAS_AVX2 AND HAS_FMA)
-        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c)
+        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c c/rac_hal.c)
         target_include_directories(rac_avx2 PUBLIC c/)
         target_compile_options(rac_avx2 PRIVATE -O3 -mavx2 -mfma -march=native -Wall)
         target_link_libraries(rac_avx2 m)
         if(OpenMP_C_FOUND)
             target_link_libraries(rac_avx2 OpenMP::OpenMP_C)
         endif()
-        message(STATUS "RAC: AVX2+FMA enabled → librac_avx2")
+        message(STATUS "RAC: AVX2+FMA+HAL enabled → librac_avx2")
     else()
         message(WARNING "RAC: AVX2/FMA not supported by compiler")
     endif()
@@ -85,12 +85,32 @@ endif()
 
 enable_testing()
 
-# C primitives test
+# C primitives test (from root)
 add_executable(test_rac_primitives ../test_rac_primitives.cu)
 set_source_files_properties(../test_rac_primitives.cu PROPERTIES LANGUAGE CXX)
 target_include_directories(test_rac_primitives PRIVATE ${CMAKE_SOURCE_DIR}/..)
 target_link_libraries(test_rac_primitives rac_static m)
 add_test(NAME rac_primitives COMMAND test_rac_primitives)
+
+# Library BVT
+if(TARGET rac_avx2)
+    add_executable(test_rac_lib_bvt c/test_rac_lib_bvt.c)
+    target_include_directories(test_rac_lib_bvt PRIVATE c/)
+    target_link_libraries(test_rac_lib_bvt rac_avx2 m)
+    add_test(NAME lib_bvt COMMAND test_rac_lib_bvt)
+
+    # Library DVT
+    add_executable(test_rac_lib_dvt c/test_rac_lib_dvt.c)
+    target_include_directories(test_rac_lib_dvt PRIVATE c/)
+    target_link_libraries(test_rac_lib_dvt rac_avx2 m)
+    add_test(NAME lib_dvt COMMAND test_rac_lib_dvt)
+
+    # Library E2E + Benchmarks
+    add_executable(test_rac_lib_e2e c/test_rac_lib_e2e.c)
+    target_include_directories(test_rac_lib_e2e PRIVATE c/)
+    target_link_libraries(test_rac_lib_e2e rac_avx2 m)
+    add_test(NAME lib_e2e COMMAND test_rac_lib_e2e)
+endif()
 
 # ── Install ─────────────────────────────────────────────────────────────
 
