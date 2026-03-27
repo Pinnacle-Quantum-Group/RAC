@@ -2,15 +2,11 @@
  * rac_zen3_kern.S — RAC AVX2/FMA Assembly Micro-Kernel (Zen3-tuned)
  * Pinnacle Quantum Group — Michael A. Doran Jr. — March 2026
  *
- * 6x16 micro-kernel with 4x K-unroll for Zen3's dual FMA pipes.
- * 12 accumulator YMMs, software prefetch tuned for Zen3 L1/L2 latency.
+ * 6x16 micro-kernel with interleaved B-hi load.
+ * Key optimization: B[k] hi loaded BETWEEN row0-lo FMA and row0-hi FMA,
+ * hiding the load latency behind the first FMA's execution.
  *
- * System V AMD64 ABI:
- *   rdi = packed_a  [kc × MR=6], stride 24 bytes per K
- *   rsi = packed_b  [kc × NR=16], stride 64 bytes per K
- *   rdx = C pointer
- *   ecx = ldc (floats)
- *   r8d = kc
+ * System V AMD64: rdi=packed_a, rsi=packed_b, rdx=C, ecx=ldc, r8d=kc
  */
 
 .text
@@ -39,154 +35,56 @@ rac_micro_kernel_6x16_asm:
     testl   %eax, %eax
     jle     .L_store
 
-    /* Split into groups of 4 + remainder */
-    movl    %eax, %r9d
-    shrl    $2, %r9d            /* r9 = kc / 4 */
-    andl    $3, %eax            /* eax = kc % 4 */
-    testl   %r9d, %r9d
-    jle     .L_tail
-
-    prefetcht0  (%rsi)
-    prefetcht0  64(%rsi)
-    prefetcht0  128(%rsi)
-    prefetcht0  192(%rsi)
-
-/*
- * Unrolled 4x K-loop body.
- * Each iteration: 6 broadcasts + 2 loads + 12 FMAs = 20 instructions
- * 4 iterations = 80 instructions before branch.
- * Zen3 OOO window is 256 ops — easily overlaps all 4 iterations.
- */
 .align 32
-.L_kloop4:
-    /* ── K+0 ── */
+.L_kloop:
+    /*
+     * Interleaved load: B-lo first, start row0 FMA on lo half,
+     * load B-hi while row0-lo FMA executes (4-cycle latency on Zen3),
+     * then row0-hi FMA uses the now-ready B-hi.
+     *
+     * This overlaps the B-hi load with the B-lo FMA execution.
+     */
+
+    /* Load B[k] lo half */
     vmovups     (%rsi), %ymm12
-    vmovups     32(%rsi), %ymm13
+
+    /* Row 0: broadcast + FMA on lo half — B-hi loads in shadow */
     vbroadcastss (%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm0
-    vfmadd231ps %ymm14, %ymm13, %ymm1
+    vfmadd231ps %ymm14, %ymm12, %ymm0      /* row0 lo — starts 4-cycle FMA */
+    vmovups     32(%rsi), %ymm13             /* B[k] hi — loads during FMA latency */
+    vfmadd231ps %ymm14, %ymm13, %ymm1      /* row0 hi — ymm13 ready by now */
+
+    /* Row 1 */
     vbroadcastss 4(%rdi), %ymm14
     vfmadd231ps %ymm14, %ymm12, %ymm2
     vfmadd231ps %ymm14, %ymm13, %ymm3
+
+    /* Row 2 + prefetch B ahead */
     vbroadcastss 8(%rdi), %ymm14
     vfmadd231ps %ymm14, %ymm12, %ymm4
+    prefetcht0  256(%rsi)
     vfmadd231ps %ymm14, %ymm13, %ymm5
+
+    /* Row 3 */
     vbroadcastss 12(%rdi), %ymm14
     vfmadd231ps %ymm14, %ymm12, %ymm6
     vfmadd231ps %ymm14, %ymm13, %ymm7
+
+    /* Row 4 + prefetch A ahead */
     vbroadcastss 16(%rdi), %ymm14
     vfmadd231ps %ymm14, %ymm12, %ymm8
+    prefetcht0  96(%rdi)
     vfmadd231ps %ymm14, %ymm13, %ymm9
+
+    /* Row 5 */
     vbroadcastss 20(%rdi), %ymm14
     vfmadd231ps %ymm14, %ymm12, %ymm10
     vfmadd231ps %ymm14, %ymm13, %ymm11
 
-    /* ── K+1 ── */
-    vmovups     64(%rsi), %ymm12
-    vmovups     96(%rsi), %ymm13
-    vbroadcastss 24(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm0
-    vfmadd231ps %ymm14, %ymm13, %ymm1
-    vbroadcastss 28(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm2
-    vfmadd231ps %ymm14, %ymm13, %ymm3
-    vbroadcastss 32(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm4
-    vfmadd231ps %ymm14, %ymm13, %ymm5
-    vbroadcastss 36(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm6
-    vfmadd231ps %ymm14, %ymm13, %ymm7
-    vbroadcastss 40(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm8
-    vfmadd231ps %ymm14, %ymm13, %ymm9
-    vbroadcastss 44(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm10
-    vfmadd231ps %ymm14, %ymm13, %ymm11
-
-    /* ── K+2 ── */
-    vmovups     128(%rsi), %ymm12
-    vmovups     160(%rsi), %ymm13
-    prefetcht0  512(%rsi)           /* prefetch B +8 iterations ahead */
-    vbroadcastss 48(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm0
-    vfmadd231ps %ymm14, %ymm13, %ymm1
-    vbroadcastss 52(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm2
-    vfmadd231ps %ymm14, %ymm13, %ymm3
-    vbroadcastss 56(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm4
-    vfmadd231ps %ymm14, %ymm13, %ymm5
-    vbroadcastss 60(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm6
-    vfmadd231ps %ymm14, %ymm13, %ymm7
-    vbroadcastss 64(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm8
-    vfmadd231ps %ymm14, %ymm13, %ymm9
-    vbroadcastss 68(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm10
-    vfmadd231ps %ymm14, %ymm13, %ymm11
-
-    /* ── K+3 ── */
-    vmovups     192(%rsi), %ymm12
-    vmovups     224(%rsi), %ymm13
-    prefetcht0  96(%rdi)            /* prefetch A +4 iterations ahead */
-    vbroadcastss 72(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm0
-    vfmadd231ps %ymm14, %ymm13, %ymm1
-    vbroadcastss 76(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm2
-    vfmadd231ps %ymm14, %ymm13, %ymm3
-    vbroadcastss 80(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm4
-    vfmadd231ps %ymm14, %ymm13, %ymm5
-    vbroadcastss 84(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm6
-    vfmadd231ps %ymm14, %ymm13, %ymm7
-    vbroadcastss 88(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm8
-    vfmadd231ps %ymm14, %ymm13, %ymm9
-    vbroadcastss 92(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm10
-    vfmadd231ps %ymm14, %ymm13, %ymm11
-
-    /* Advance: A += 4*24=96 bytes, B += 4*64=256 bytes */
-    addq    $96, %rdi
-    addq    $256, %rsi
-
-    decl    %r9d
-    jnz     .L_kloop4
-
-    /* ── Tail: remaining 0-3 K iterations ── */
-.L_tail:
-    testl   %eax, %eax
-    jle     .L_store
-
-.align 16
-.L_kloop1:
-    vmovups     (%rsi), %ymm12
-    vmovups     32(%rsi), %ymm13
-    vbroadcastss (%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm0
-    vfmadd231ps %ymm14, %ymm13, %ymm1
-    vbroadcastss 4(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm2
-    vfmadd231ps %ymm14, %ymm13, %ymm3
-    vbroadcastss 8(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm4
-    vfmadd231ps %ymm14, %ymm13, %ymm5
-    vbroadcastss 12(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm6
-    vfmadd231ps %ymm14, %ymm13, %ymm7
-    vbroadcastss 16(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm8
-    vfmadd231ps %ymm14, %ymm13, %ymm9
-    vbroadcastss 20(%rdi), %ymm14
-    vfmadd231ps %ymm14, %ymm12, %ymm10
-    vfmadd231ps %ymm14, %ymm13, %ymm11
     addq    $24, %rdi
     addq    $64, %rsi
     decl    %eax
-    jnz     .L_kloop1
+    jnz     .L_kloop
 
 .L_store:
     vaddps  (%rdx), %ymm0, %ymm0
