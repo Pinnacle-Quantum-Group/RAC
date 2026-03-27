@@ -94,11 +94,15 @@ static void _probe_x86(rac_hw_profile *p) {
         p->avx512_throttle = 1; /* Skylake throttles frequency on AVX-512 */
     }
 
-    /* Cache detection via CPUID leaf 4 */
+    /* Cache detection: try Intel leaf 4 first, then AMD leaf 0x8000001D */
+    int cache_found = 0;
+
+    /* Intel: CPUID leaf 4 */
     for (int idx = 0; idx < 16; idx++) {
         __cpuid_count(4, idx, eax, ebx, ecx, edx);
         int type = eax & 0x1F;
         if (type == 0) break;
+        cache_found = 1;
 
         int level = (eax >> 5) & 0x7;
         int line_size = (ebx & 0xFFF) + 1;
@@ -107,7 +111,7 @@ static void _probe_x86(rac_hw_profile *p) {
         int sets = ecx + 1;
         int size_kb = (ways * partitions * line_size * sets) / 1024;
 
-        if (level == 1 && (type == 1)) { /* L1 data */
+        if (level == 1 && (type == 1)) {
             p->cache.l1d_size_kb = size_kb;
             p->cache.l1d_line_size = line_size;
         } else if (level == 2) {
@@ -116,6 +120,41 @@ static void _probe_x86(rac_hw_profile *p) {
             p->cache.l3_size_kb = size_kb;
             p->cache.l3_shared_cores = ((eax >> 14) & 0xFFF) + 1;
         }
+    }
+
+    /* AMD: CPUID leaf 0x8000001D (same format as leaf 4) */
+    if (p->cache.l1d_size_kb == 0) {
+        for (int idx = 0; idx < 16; idx++) {
+            __cpuid_count(0x8000001D, idx, eax, ebx, ecx, edx);
+            int type = eax & 0x1F;
+            if (type == 0) break;
+            cache_found = 1;
+
+            int level = (eax >> 5) & 0x7;
+            int line_size = (ebx & 0xFFF) + 1;
+            int partitions = ((ebx >> 12) & 0x3FF) + 1;
+            int ways = ((ebx >> 22) & 0x3FF) + 1;
+            int sets = ecx + 1;
+            int size_kb = (ways * partitions * line_size * sets) / 1024;
+
+            if (level == 1 && (type == 1)) {
+                p->cache.l1d_size_kb = size_kb;
+                p->cache.l1d_line_size = line_size;
+            } else if (level == 2) {
+                p->cache.l2_size_kb = size_kb;
+            } else if (level == 3) {
+                p->cache.l3_size_kb = size_kb;
+                p->cache.l3_shared_cores = ((eax >> 14) & 0xFFF) + 1;
+            }
+        }
+    }
+
+    /* Fallback: sane defaults if CPUID didn't work */
+    if (p->cache.l1d_size_kb == 0) {
+        p->cache.l1d_size_kb = 32;
+        p->cache.l1d_line_size = 64;
+        p->cache.l2_size_kb = 256;
+        p->cache.l3_size_kb = 8192;
     }
 }
 #endif /* RAC_X86 */
