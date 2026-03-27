@@ -331,6 +331,19 @@ rac_status rac_sgemm_avx2(
         if (beta == 0.0f) memset(C, 0, (size_t)M * N * sizeof(float));
         else if (beta != 1.0f) for (int i = 0; i < M * N; i++) C[i] *= beta;
 
+        /* Very small N: pure scalar to avoid SIMD edge overhead */
+        if (N < 8) {
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++) {
+                    float sum = 0;
+                    for (int k = 0; k < K; k++)
+                        sum = fmaf(A[i*K+k], B[k*N+j], sum);
+                    C[i*N+j] += alpha * sum;
+                }
+            return RAC_OK;
+        }
+
         #pragma omp parallel for schedule(dynamic, 2)
         for (int i0 = 0; i0 < M; i0 += MR) {
             int mr = ((i0 + MR) <= M) ? MR : (M - i0);
@@ -342,7 +355,8 @@ rac_status rac_sgemm_avx2(
                     acc[r][1] = _mm256_setzero_ps();
                 }
                 for (int k = 0; k < K; k++) {
-                    __m256 b0 = (nr >= 8)  ? _mm256_loadu_ps(&B[k*N+j0])     : _mm256_setzero_ps();
+                    /* N >= 8 guaranteed (scalar path handles N < 8 above) */
+                    __m256 b0 = _mm256_loadu_ps(&B[k*N+j0]);
                     __m256 b1 = (nr >= 16) ? _mm256_loadu_ps(&B[k*N+j0+8]) : _mm256_setzero_ps();
                     for (int r = 0; r < mr; r++) {
                         __m256 a_bc = _mm256_set1_ps(A[(i0+r)*K+k]);
