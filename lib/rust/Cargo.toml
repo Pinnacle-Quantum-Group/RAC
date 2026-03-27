@@ -1,0 +1,27 @@
+[package]
+name = "rac"
+version = "0.2.0"
+edition = "2021"
+authors = ["Michael A. Doran Jr. <mike@pinnacle-quantum.com>"]
+description = "RAC: Rotation-Accumulate compute primitives — multiply-free CORDIC-based linear algebra"
+license = "Proprietary"
+repository = "https://github.com/Pinnacle-Quantum-Group/RAC"
+categories = ["mathematics", "science", "algorithms"]
+keywords = ["cordic", "matmul", "linear-algebra", "neural-network"]
+
+[features]
+default = ["std", "rayon"]
+std = []
+rayon = ["dep:rayon"]
+ffi = []       # Enable C FFI bindings
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = "0.5"
+
+[[bench]]
+name = "matmul"
+harness = false
