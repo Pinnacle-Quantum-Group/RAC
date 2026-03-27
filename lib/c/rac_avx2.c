@@ -48,6 +48,26 @@ int rac_has_avx2(void) {
  * This is the "broadcast A, stream B" pattern — optimal for row-major layout.
  */
 
+/*
+ * AVX2 SGEMM with register micro-tiling.
+ *
+ * Strategy: each thread computes a MR x NR micro-tile of C.
+ *   MR = 6 rows (6 broadcasts of A per K step)
+ *   NR = 16 columns (2 x __m256 = 16 floats)
+ *   Per K step: 6 broadcasts × 2 loads = 12 FMAs from 8 memory ops
+ *   Arithmetic intensity: 12/8 = 1.5 FMAs/load (vs 1/1 = 1.0 before)
+ *
+ * Outer loop tiles over M in blocks of MR, N in blocks of NR.
+ * K-loop tiles for L1 cache (TILE_K elements at a time).
+ * OpenMP parallelizes over M-tiles.
+ *
+ * This is the same register-blocking strategy that OpenBLAS and
+ * the GPU micro-8x8 kernel use — adapted for AVX2's 256-bit width.
+ */
+
+#define MR 6    /* rows of C per micro-tile */
+#define NR 16   /* columns of C per micro-tile (2 x AVX2 = 16 floats) */
+
 rac_status rac_sgemm_avx2(
     const float *A, const float *B, float *C,
     int M, int N, int K,
@@ -58,51 +78,90 @@ rac_status rac_sgemm_avx2(
     if (M <= 0 || N <= 0 || K <= 0) return RAC_ERR_INVALID_DIM;
 
     int TILE_K = (cfg && cfg->tile_size > 0) ? cfg->tile_size : 64;
-    int N8 = N & ~7;  /* N rounded down to multiple of 8 */
 
-    __m256 valpha = _mm256_set1_ps(alpha);
-    __m256 vbeta  = _mm256_set1_ps(beta);
+    /* Apply beta to C */
+    if (beta == 0.0f) {
+        memset(C, 0, (size_t)M * N * sizeof(float));
+    } else if (beta != 1.0f) {
+        for (int i = 0; i < M * N; i++) C[i] *= beta;
+    }
 
-    #pragma omp parallel for schedule(dynamic, 4)
-    for (int i = 0; i < M; i++) {
-        /* Process 8 columns at a time */
-        for (int j = 0; j < N8; j += 8) {
-            __m256 acc = _mm256_setzero_ps();
+    /* Main tiled loop */
+    #pragma omp parallel for schedule(dynamic, 2)
+    for (int i0 = 0; i0 < M; i0 += MR) {
+        int imax = (i0 + MR <= M) ? i0 + MR : M;
+        int mr = imax - i0;  /* actual rows in this micro-tile (may be < MR at edge) */
 
-            if (beta != 0.0f) {
-                acc = _mm256_mul_ps(vbeta, _mm256_loadu_ps(&C[i * N + j]));
+        for (int j0 = 0; j0 < N; j0 += NR) {
+            int jmax = (j0 + NR <= N) ? j0 + NR : N;
+            int nr = jmax - j0;
+
+            /* Accumulator registers: MR rows × 2 AVX2 vectors (16 cols) */
+            __m256 acc[MR][2];
+            for (int r = 0; r < MR; r++) {
+                acc[r][0] = _mm256_setzero_ps();
+                acc[r][1] = _mm256_setzero_ps();
             }
 
-            /* K-loop tiled for L1 cache */
+            /* K-loop tiled for L1 */
             for (int k0 = 0; k0 < K; k0 += TILE_K) {
                 int kmax = (k0 + TILE_K < K) ? k0 + TILE_K : K;
+
                 for (int k = k0; k < kmax; k++) {
-                    /* Broadcast A[i,k] to all 8 lanes */
-                    __m256 a_val = _mm256_set1_ps(A[i * K + k]);
-                    /* Load 8 values of B[k, j..j+7] */
-                    __m256 b_vec = _mm256_loadu_ps(&B[k * N + j]);
-                    /* FMA: acc += a_val * b_vec */
-                    acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+                    /* Load 2 vectors (16 floats) from B[k, j0..j0+15] */
+                    __m256 b0, b1;
+                    if (nr >= 16) {
+                        b0 = _mm256_loadu_ps(&B[k * N + j0]);
+                        b1 = _mm256_loadu_ps(&B[k * N + j0 + 8]);
+                    } else if (nr >= 8) {
+                        b0 = _mm256_loadu_ps(&B[k * N + j0]);
+                        b1 = _mm256_setzero_ps();
+                        /* Load remaining scalars into b1 */
+                        float tmp[8] = {0};
+                        for (int jj = 8; jj < nr; jj++)
+                            tmp[jj - 8] = B[k * N + j0 + jj];
+                        b1 = _mm256_loadu_ps(tmp);
+                    } else {
+                        float tmp0[8] = {0};
+                        for (int jj = 0; jj < nr; jj++)
+                            tmp0[jj] = B[k * N + j0 + jj];
+                        b0 = _mm256_loadu_ps(tmp0);
+                        b1 = _mm256_setzero_ps();
+                    }
+
+                    /* Broadcast A[i0+r, k] and FMA for each row */
+                    for (int r = 0; r < mr; r++) {
+                        __m256 a_bc = _mm256_set1_ps(A[(i0 + r) * K + k]);
+                        acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
+                        acc[r][1] = _mm256_fmadd_ps(a_bc, b1, acc[r][1]);
+                    }
                 }
             }
 
-            /* Scale by alpha and store */
-            acc = _mm256_mul_ps(valpha, acc);
-            if (beta != 0.0f) {
-                /* alpha was already applied, beta was applied at init */
-                _mm256_storeu_ps(&C[i * N + j], acc);
-            } else {
-                _mm256_storeu_ps(&C[i * N + j], acc);
-            }
-        }
+            /* Write back with alpha scaling */
+            __m256 valpha = _mm256_set1_ps(alpha);
+            for (int r = 0; r < mr; r++) {
+                int row = i0 + r;
+                __m256 res0 = _mm256_mul_ps(valpha, acc[r][0]);
+                __m256 res1 = _mm256_mul_ps(valpha, acc[r][1]);
 
-        /* Handle remainder columns (N % 8) */
-        for (int j = N8; j < N; j++) {
-            float acc = (beta != 0.0f) ? beta * C[i * N + j] : 0.0f;
-            for (int k = 0; k < K; k++) {
-                acc += A[i * K + k] * B[k * N + j];
+                if (nr >= 16) {
+                    /* Full micro-tile: load existing C, add, store */
+                    __m256 c0 = _mm256_loadu_ps(&C[row * N + j0]);
+                    __m256 c1 = _mm256_loadu_ps(&C[row * N + j0 + 8]);
+                    _mm256_storeu_ps(&C[row * N + j0],     _mm256_add_ps(c0, res0));
+                    _mm256_storeu_ps(&C[row * N + j0 + 8], _mm256_add_ps(c1, res1));
+                } else {
+                    /* Edge: scalar fallback for remaining columns */
+                    float tmp0[8], tmp1[8];
+                    _mm256_storeu_ps(tmp0, res0);
+                    _mm256_storeu_ps(tmp1, res1);
+                    for (int jj = 0; jj < nr && jj < 8; jj++)
+                        C[row * N + j0 + jj] += tmp0[jj];
+                    for (int jj = 8; jj < nr; jj++)
+                        C[row * N + j0 + jj] += tmp1[jj - 8];
+                }
             }
-            C[i * N + j] = alpha * acc;
         }
     }
 
@@ -153,6 +212,21 @@ static inline __m256 _avx2_silu(__m256 x) {
     return _mm256_loadu_ps(results);
 }
 
+/*
+ * Fused linear with register micro-tiling.
+ * weight is [N, K] row-major: weight[j, k] is contiguous along K.
+ * output[i,j] = act(sum_k input[i,k] * weight[j,k] + bias[j])
+ *
+ * Micro-tile: MR=4 rows of output × NR=16 columns (2 x __m256).
+ * Per K step: 4 broadcasts of input × 2 contiguous loads of weight = 8 FMAs.
+ * weight[j, k..k+7] IS contiguous (row-major with stride K).
+ * But we need weight[j..j+7, k] for the broadcast pattern — that's strided.
+ *
+ * Solution: transpose weight into [K, N] layout for contiguous N-access,
+ * then use the same broadcast-A pattern as SGEMM. We do this once in a
+ * scratch buffer (amortized over MR*K FMAs).
+ */
+
 rac_status rac_fused_linear_avx2(
     const float *input, const float *weight, const float *bias,
     float *output, int M, int N, int K,
@@ -163,60 +237,87 @@ rac_status rac_fused_linear_avx2(
 
     int TILE_K = (cfg && cfg->tile_size > 0) ? cfg->tile_size : 64;
 
-    #pragma omp parallel for schedule(dynamic, 4)
-    for (int i = 0; i < M; i++) {
-        int N8 = N & ~7;
+    /* Transpose weight [N, K] → wt[K, N] for contiguous N-access */
+    float *wt = (float *)malloc((size_t)K * N * sizeof(float));
+    if (!wt) return RAC_ERR_ALLOC;
+    for (int j = 0; j < N; j++)
+        for (int k = 0; k < K; k++)
+            wt[k * N + j] = weight[j * K + k];
 
-        for (int j = 0; j < N8; j += 8) {
-            __m256 acc = _mm256_setzero_ps();
+    /* Micro-tiled matmul: input[M,K] @ wt[K,N] → output[M,N] */
+    #pragma omp parallel for schedule(dynamic, 2)
+    for (int i0 = 0; i0 < M; i0 += MR) {
+        int imax = (i0 + MR <= M) ? i0 + MR : M;
+        int mr = imax - i0;
 
-            /* Accumulate: input[i,:] @ weight[j:j+8, :]^T */
+        for (int j0 = 0; j0 < N; j0 += NR) {
+            int jmax = (j0 + NR <= N) ? j0 + NR : N;
+            int nr = jmax - j0;
+
+            __m256 acc[MR][2];
+            for (int r = 0; r < MR; r++) {
+                acc[r][0] = _mm256_setzero_ps();
+                acc[r][1] = _mm256_setzero_ps();
+            }
+
             for (int k0 = 0; k0 < K; k0 += TILE_K) {
                 int kmax = (k0 + TILE_K < K) ? k0 + TILE_K : K;
                 for (int k = k0; k < kmax; k++) {
-                    __m256 a_val = _mm256_set1_ps(input[i * K + k]);
-                    /* weight[j+0..7, k] — stride is K between rows */
-                    float b_vals[8];
-                    for (int jj = 0; jj < 8; jj++)
-                        b_vals[jj] = weight[(j + jj) * K + k];
-                    __m256 b_vec = _mm256_loadu_ps(b_vals);
-                    acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+                    __m256 b0 = (nr >= 8)  ? _mm256_loadu_ps(&wt[k * N + j0])     : _mm256_setzero_ps();
+                    __m256 b1 = (nr >= 16) ? _mm256_loadu_ps(&wt[k * N + j0 + 8]) : _mm256_setzero_ps();
+
+                    for (int r = 0; r < mr; r++) {
+                        __m256 a_bc = _mm256_set1_ps(input[(i0 + r) * K + k]);
+                        acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
+                        acc[r][1] = _mm256_fmadd_ps(a_bc, b1, acc[r][1]);
+                    }
                 }
             }
 
-            /* Fused bias */
-            if (bias) {
-                __m256 b_vec = _mm256_loadu_ps(&bias[j]);
-                acc = _mm256_add_ps(acc, b_vec);
-            }
+            /* Fused bias + activation + store */
+            for (int r = 0; r < mr; r++) {
+                __m256 res0 = acc[r][0];
+                __m256 res1 = acc[r][1];
 
-            /* Fused activation */
-            switch (act) {
-                case RAC_ACT_RELU: acc = _avx2_relu(acc); break;
-                case RAC_ACT_GELU: acc = _avx2_gelu_approx(acc); break;
-                case RAC_ACT_SILU: acc = _avx2_silu(acc); break;
-                default: break;
-            }
+                /* Fused bias */
+                if (bias && nr >= 8)  res0 = _mm256_add_ps(res0, _mm256_loadu_ps(&bias[j0]));
+                if (bias && nr >= 16) res1 = _mm256_add_ps(res1, _mm256_loadu_ps(&bias[j0 + 8]));
 
-            _mm256_storeu_ps(&output[i * N + j], acc);
-        }
+                /* Fused activation */
+                switch (act) {
+                    case RAC_ACT_RELU:
+                        res0 = _avx2_relu(res0);
+                        res1 = _avx2_relu(res1);
+                        break;
+                    case RAC_ACT_GELU:
+                        res0 = _avx2_gelu_approx(res0);
+                        res1 = _avx2_gelu_approx(res1);
+                        break;
+                    case RAC_ACT_SILU:
+                        res0 = _avx2_silu(res0);
+                        res1 = _avx2_silu(res1);
+                        break;
+                    default: break;
+                }
 
-        /* Scalar remainder */
-        for (int j = N8; j < N; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++)
-                sum += input[i * K + k] * weight[j * K + k];
-            if (bias) sum += bias[j];
-            switch (act) {
-                case RAC_ACT_RELU: sum = (sum > 0) ? sum : 0; break;
-                case RAC_ACT_GELU: sum = sum * 0.5f * (1.0f + erff(sum * 0.7071067811865f)); break;
-                case RAC_ACT_SILU: sum = sum / (1.0f + expf(-sum)); break;
-                default: break;
+                int row = i0 + r;
+                if (nr >= 16) {
+                    _mm256_storeu_ps(&output[row * N + j0],     res0);
+                    _mm256_storeu_ps(&output[row * N + j0 + 8], res1);
+                } else {
+                    float tmp0[8], tmp1[8];
+                    _mm256_storeu_ps(tmp0, res0);
+                    _mm256_storeu_ps(tmp1, res1);
+                    for (int jj = 0; jj < nr && jj < 8; jj++)
+                        output[row * N + j0 + jj] = tmp0[jj];
+                    for (int jj = 8; jj < nr; jj++)
+                        output[row * N + j0 + jj] = tmp1[jj - 8];
+                }
             }
-            output[i * N + j] = sum;
         }
     }
 
+    free(wt);
     return RAC_OK;
 }
 
