@@ -66,51 +66,56 @@ rac_micro_kernel_6x16_asm:
     prefetcht0  (%rsi)
     prefetcht0  64(%rsi)
 
-.align 16
+.align 32
 .L_kloop:
-    /* ── Load B[k, 0..15]: 16 floats = 2 YMM ── */
-    vmovups (%rsi), %ymm12          /* B[k, 0..7]  */
-    vmovups 32(%rsi), %ymm13        /* B[k, 8..15] */
+    /*
+     * Zen3 dual 256-bit FMA: 2 FMAs/cycle on ports 0+1.
+     * Schedule: interleave broadcast with FMA to keep both ports fed.
+     * Prefetch: +4 cache lines ahead for B (256B = 4 K steps),
+     *           +2 cache lines for A (48B = 2 K steps).
+     */
 
-    /* Prefetch next B row (64 bytes ahead = next k+1 row) */
-    prefetcht0  128(%rsi)
+    /* Load B[k, 0..15]: 2 YMM from contiguous packed_b */
+    vmovups (%rsi), %ymm12
+    vmovups 32(%rsi), %ymm13
 
-    /* ── Row 0: broadcast A[k,0], FMA ── */
+    /* Prefetch: B +4 iterations ahead, A +2 iterations ahead */
+    prefetcht0  256(%rsi)           /* B: 4 * 64B = 256B ahead */
+    prefetcht0  48(%rdi)            /* A: 2 * 24B ≈ 48B ahead */
+
+    /* Row 0: broadcast + 2 FMAs (ports 0+1 in parallel on Zen3) */
     vbroadcastss (%rdi), %ymm14
-    vfmadd231ps  %ymm14, %ymm12, %ymm0     /* acc[0][lo] += A[k,0] * B[k,0..7] */
-    vfmadd231ps  %ymm14, %ymm13, %ymm1     /* acc[0][hi] += A[k,0] * B[k,8..15] */
+    vfmadd231ps  %ymm14, %ymm12, %ymm0
+    vfmadd231ps  %ymm14, %ymm13, %ymm1
 
-    /* ── Row 1 ── */
+    /* Row 1 */
     vbroadcastss 4(%rdi), %ymm14
     vfmadd231ps  %ymm14, %ymm12, %ymm2
     vfmadd231ps  %ymm14, %ymm13, %ymm3
 
-    /* ── Row 2 ── */
+    /* Row 2 */
     vbroadcastss 8(%rdi), %ymm14
     vfmadd231ps  %ymm14, %ymm12, %ymm4
     vfmadd231ps  %ymm14, %ymm13, %ymm5
 
-    /* ── Row 3 ── */
+    /* Row 3 */
     vbroadcastss 12(%rdi), %ymm14
     vfmadd231ps  %ymm14, %ymm12, %ymm6
     vfmadd231ps  %ymm14, %ymm13, %ymm7
 
-    /* ── Row 4 ── */
+    /* Row 4 */
     vbroadcastss 16(%rdi), %ymm14
     vfmadd231ps  %ymm14, %ymm12, %ymm8
     vfmadd231ps  %ymm14, %ymm13, %ymm9
 
-    /* ── Row 5 ── */
+    /* Row 5 */
     vbroadcastss 20(%rdi), %ymm14
     vfmadd231ps  %ymm14, %ymm12, %ymm10
     vfmadd231ps  %ymm14, %ymm13, %ymm11
 
-    /* Advance pointers: A += MR*4 = 24 bytes, B += NR*4 = 64 bytes */
-    addq    $24, %rdi           /* packed_a += 6 floats */
-    addq    $64, %rsi           /* packed_b += 16 floats */
-
-    /* Prefetch next A */
-    prefetcht0  (%rdi)
+    /* Advance: A += 6 floats (24B), B += 16 floats (64B) */
+    addq    $24, %rdi
+    addq    $64, %rsi
 
     decl    %eax
     jnz     .L_kloop

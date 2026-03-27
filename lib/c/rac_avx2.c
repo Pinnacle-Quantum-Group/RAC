@@ -6,6 +6,7 @@
  */
 
 #include "rac_avx2.h"
+#include "rac_hal.h"
 #include <math.h>
 #include <string.h>
 
@@ -80,35 +81,113 @@ int rac_has_avx2(void) {
 #define MR 6     /* rows of C per micro-kernel */
 #define NR 16    /* columns of C per micro-kernel (2 x __m256) */
 
-/* Default cache tile sizes — overridden by HAL if available */
-#define DEFAULT_KC 256
-#define DEFAULT_MC 256
+/*
+ * Default cache tile sizes.
+ * KC: B micro-panel [KC × NR] must fit in L1d alongside A reads.
+ *     L1d=32KB (Zen3): KC*NR*4 + MR*KC*4 ≤ 32K
+ *     KC*(16+6)*4 ≤ 32768 → KC ≤ 372. Use 128 for safety + prefetch room.
+ * MC: packed_A [MC × KC] fits in L2.
+ *     L2=512KB (Zen3): MC*KC*4 ≤ 512K → MC ≤ 1024. Use 384.
+ * NC: packed_B [KC × NC] fits in L3 per-core share.
+ *     L3=2MB/core (Zen3): KC*NC*4 ≤ 2M → NC ≤ 4096. Use 2048.
+ */
+#define DEFAULT_KC 128
+#define DEFAULT_MC 384
 #define DEFAULT_NC 2048
 
-/* ── Pack A[mc×kc] → column-panel layout ── */
-/* packed_A stores MR-wide column panels: [MR, kc, mc/MR] contiguous */
+/* ── Pack A[mc×kc] → column-panel layout (SIMD-accelerated) ── */
+/*
+ * packed_A layout: for each MR-panel, stores [kc][MR] contiguous.
+ * A is row-major: A[i,k] = A[i*lda + k]. We need to gather MR rows
+ * for each k column. MR=6 doesn't align to AVX2, so we gather scalars
+ * but prefetch aggressively.
+ *
+ * The key optimization: prefetch the next K column's rows while
+ * packing the current one, hiding the gather latency.
+ */
 static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int K_start) {
     for (int i = 0; i < mc; i += MR) {
         int mr = ((i + MR) <= mc) ? MR : (mc - i);
-        for (int k = 0; k < kc; k++) {
-            for (int r = 0; r < mr; r++)
-                *packed++ = A[(i + r) * lda + K_start + k];
-            for (int r = mr; r < MR; r++)
-                *packed++ = 0.0f;  /* zero-pad edge */
+        const float *a_ptrs[MR];
+        for (int r = 0; r < mr; r++)
+            a_ptrs[r] = &A[(i + r) * lda + K_start];
+
+        if (mr == MR) {
+            /* Full MR=6 panel: unrolled gather with prefetch */
+            for (int k = 0; k < kc; k++) {
+                /* Prefetch next column (64 bytes ahead ≈ next cache line) */
+                if (k + 8 < kc) {
+                    _mm_prefetch((const char*)(a_ptrs[0] + k + 8), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(a_ptrs[3] + k + 8), _MM_HINT_T0);
+                }
+                packed[0] = a_ptrs[0][k];
+                packed[1] = a_ptrs[1][k];
+                packed[2] = a_ptrs[2][k];
+                packed[3] = a_ptrs[3][k];
+                packed[4] = a_ptrs[4][k];
+                packed[5] = a_ptrs[5][k];
+                packed += MR;
+            }
+        } else {
+            /* Edge panel: scalar with zero-pad */
+            for (int k = 0; k < kc; k++) {
+                for (int r = 0; r < mr; r++)
+                    *packed++ = a_ptrs[r][k];
+                for (int r = mr; r < MR; r++)
+                    *packed++ = 0.0f;
+            }
         }
     }
 }
 
-/* ── Pack B[kc×nc] → row-panel layout ── */
-/* packed_B stores panel_nr-wide row panels contiguous */
+/* ── Pack B[kc×nc] → row-panel layout (SIMD-accelerated) ── */
+/*
+ * packed_B layout: for each NR-panel, stores [kc][NR] contiguous.
+ * B is row-major: B[k,j] = B[k*ldb + j]. For a given k, B[k, j..j+NR-1]
+ * is already contiguous! So we can memcpy/vmovups entire rows.
+ *
+ * This is where the big win is — B packing is a contiguous copy.
+ */
 static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int K_start, int N_start, int panel_nr) {
     for (int j = 0; j < nc; j += panel_nr) {
         int nr = ((j + panel_nr) <= nc) ? panel_nr : (nc - j);
-        for (int k = 0; k < kc; k++) {
-            for (int c = 0; c < nr; c++)
-                *packed++ = B[(K_start + k) * ldb + N_start + j + c];
-            for (int c = nr; c < panel_nr; c++)
-                *packed++ = 0.0f;
+
+        if (nr == panel_nr && panel_nr == NR) {
+            /* Full NR=16 panel: 2 × vmovups per K row (contiguous in B) */
+            for (int k = 0; k < kc; k++) {
+                const float *src = &B[(K_start + k) * ldb + N_start + j];
+                /* Prefetch next row */
+                if (k + 1 < kc)
+                    _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
+                __m256 v0 = _mm256_loadu_ps(src);
+                __m256 v1 = _mm256_loadu_ps(src + 8);
+                _mm256_storeu_ps(packed, v0);
+                _mm256_storeu_ps(packed + 8, v1);
+                packed += NR;
+            }
+        } else if (nr == panel_nr) {
+            /* Full panel but NR != 16 (e.g. NR=32 for AVX-512): use memcpy */
+            for (int k = 0; k < kc; k++) {
+                const float *src = &B[(K_start + k) * ldb + N_start + j];
+                memcpy(packed, src, panel_nr * sizeof(float));
+                packed += panel_nr;
+            }
+        } else {
+            /* Edge panel: copy what we have, zero-pad the rest */
+            for (int k = 0; k < kc; k++) {
+                const float *src = &B[(K_start + k) * ldb + N_start + j];
+                /* Copy available columns with SIMD where possible */
+                int c = 0;
+                for (; c + 8 <= nr; c += 8) {
+                    __m256 v = _mm256_loadu_ps(src + c);
+                    _mm256_storeu_ps(packed + c, v);
+                }
+                for (; c < nr; c++)
+                    packed[c] = src[c];
+                for (; c < panel_nr; c++)
+                    packed[c] = 0.0f;
+                packed += panel_nr;
+            }
         }
     }
 }
@@ -206,10 +285,41 @@ rac_status rac_sgemm_avx2(
     _detect_best_kernel();
     int active_nr = _active_NR;
 
-    /* Cache tile sizes — auto-tune from L1/L2 if possible */
-    int KC = (cfg && cfg->tile_size > 0) ? cfg->tile_size : DEFAULT_KC;
-    int MC = DEFAULT_MC;
+    /*
+     * Auto-tune KC/MC/NC from actual cache sizes.
+     * KC: B micro-panel [KC × NR] + A stream [MR × KC] fits in L1d
+     *     KC = L1d / ((NR + MR) * sizeof(float) * 2)  [50% utilization]
+     * MC: packed_A [MC × KC] fits in L2
+     *     MC = L2 / (KC * sizeof(float) * 2)  [50% utilization]
+     * NC: packed_B [KC × NC] fits in L3 per-core
+     */
+    int l1d_kb = 32, l2_kb = 256;  /* conservative defaults */
+
+    /* Try to get actual cache sizes from HAL */
+    extern const rac_hw_profile* rac_hal_profile(void);
+    const rac_hw_profile *hw = rac_hal_profile();
+    if (hw && hw->cache.l1d_size_kb > 0) l1d_kb = hw->cache.l1d_size_kb;
+    if (hw && hw->cache.l2_size_kb > 0)  l2_kb  = hw->cache.l2_size_kb;
+
+    int l1d_bytes = l1d_kb * 1024;
+    int l2_bytes  = l2_kb * 1024;
+
+    /* KC: B micro-panel [KC*NR*4] fits in ~40% of L1 */
+    int KC = (l1d_bytes * 2 / 5) / (active_nr * (int)sizeof(float));
+    KC = (KC / 8) * 8;
+    if (KC < 128) KC = 128;
+    if (KC > 512) KC = 512;
+
+    /* MC: packed_A [MC*KC*4] fits in ~50% of L2 */
+    int MC = (l2_bytes / 2) / (KC * (int)sizeof(float));
+    MC = (MC / MR) * MR;
+    if (MC < MR * 8) MC = MR * 8;
+    if (MC > 768) MC = 768;
+
     int NC = DEFAULT_NC;
+
+    /* Allow user override */
+    if (cfg && cfg->tile_size > 0) KC = cfg->tile_size;
 
     /* Apply beta to C */
     if (beta == 0.0f) {
