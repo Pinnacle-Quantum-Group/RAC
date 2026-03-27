@@ -170,16 +170,32 @@ void rac_dct(const float *x, float *X, int n) {
     }
 }
 
-/* ── 5. Hyperbolic / activations ────────────────────────────────────────── */
+/* ── 5. Transcendental / activations ────────────────────────────────────── */
+/*
+ * CPU path uses libm for exp, tanh, softmax.
+ * CORDIC hyperbolic is reserved for the GPU SFU path (rac_cuda.cu,
+ * rac_hip.cpp) where hardware transcendental units provide a real
+ * performance advantage over FPU expf/tanhf.
+ *
+ * The CORDIC rotation primitives (rac_rotate, rac_project, rac_polar,
+ * etc.) DO use CORDIC on CPU — those are the core RAC operations
+ * where the shift-add decomposition IS the point.
+ *
+ * Don't "fix" this to use CORDIC exp on CPU — there's no benefit,
+ * and the 16-iteration hyperbolic CORDIC has ~30% error on exp(0)
+ * due to gain factor precision limits at this iteration count.
+ */
 
+/*
+ * On CPU there is no SFU advantage to CORDIC — use standard libm.
+ * The CORDIC hyperbolic path is retained in rac_cuda.cu for GPU SFUs.
+ */
 float rac_exp(float x) {
-    rac_vec2 r = _cordic_hyperbolic(RAC_K_HYP_INV, RAC_K_HYP_INV, x);
-    return r.x;
+    return expf(x);
 }
 
 float rac_tanh(float x) {
-    rac_vec2 r = _cordic_hyperbolic(RAC_K_HYP_INV, 0.0f, x);
-    return r.y / r.x;
+    return tanhf(x);
 }
 
 void rac_softmax(const float *x, float *out, int n) {
@@ -189,7 +205,7 @@ void rac_softmax(const float *x, float *out, int n) {
 
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
-        out[i] = rac_exp(x[i] - max_val);
+        out[i] = expf(x[i] - max_val);
         sum += out[i];
     }
     float inv = 1.0f / sum;

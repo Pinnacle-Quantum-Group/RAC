@@ -6,6 +6,7 @@
  */
 
 #include "rac_avx2.h"
+#include <math.h>
 #include <string.h>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
@@ -121,7 +122,6 @@ static inline __m256 _avx2_relu(__m256 x) {
 static inline __m256 _avx2_gelu_approx(__m256 x) {
     __m256 half = _mm256_set1_ps(0.5f);
     __m256 one  = _mm256_set1_ps(1.0f);
-    __m256 coeff = _mm256_set1_ps(0.7071067811865f);
 
     /* Fast tanh-based GELU approximation */
     __m256 sqrt2pi = _mm256_set1_ps(0.7978845608f); /* sqrt(2/pi) */
@@ -146,12 +146,6 @@ static inline __m256 _avx2_gelu_approx(__m256 x) {
 static inline __m256 _avx2_silu(__m256 x) {
     /* SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
      * Approximate exp(-x) with fast polynomial */
-    __m256 one = _mm256_set1_ps(1.0f);
-    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
-
-    /* Fast exp approximation: exp(x) ≈ (1 + x/256)^256 via repeated squaring */
-    /* Simpler: use the IEEE float trick */
-    /* For production, use a proper exp approximation. Here we use scalar fallback */
     float vals[8], results[8];
     _mm256_storeu_ps(vals, x);
     for (int i = 0; i < 8; i++)

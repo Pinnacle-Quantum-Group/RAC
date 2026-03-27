@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -268,13 +269,19 @@ static void _compute_dispatch(rac_hw_profile *p) {
     if (g_override.force_avx2 >= 0) p->use_avx2 = g_override.force_avx2;
     if (g_override.force_avx512 >= 0) p->use_avx512 = g_override.force_avx512;
     if (g_override.force_neon >= 0) p->use_neon = g_override.force_neon;
-    if (g_override.force_tile_size > 0) p->optimal_tile_sgemm = g_override.force_tile_size;
     if (g_override.force_threads > 0) p->omp_num_threads = g_override.force_threads;
+    /* Tile override applied after dispatch so it persists */
+    if (g_override.force_tile_size > 0) {
+        p->optimal_tile_sgemm = g_override.force_tile_size;
+        p->optimal_tile_sgemm_l2 = g_override.force_tile_size;
+    }
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
 rac_status rac_hal_init(void) {
+    /* Preserve overrides across re-init */
+    rac_hal_override saved_ovr = g_override;
     memset(&g_profile, 0, sizeof(g_profile));
 
     #if RAC_X86
@@ -287,7 +294,8 @@ rac_status rac_hal_init(void) {
 
     _probe_cores(&g_profile);
     _compute_optimal_tiles(&g_profile);
-    _compute_dispatch(&g_profile);
+    g_override = saved_ovr;  /* restore overrides */
+    _compute_dispatch(&g_profile);  /* applies overrides last */
 
     #ifdef _OPENMP
     omp_set_num_threads(g_profile.omp_num_threads);
@@ -309,8 +317,8 @@ void rac_hal_set_override(const rac_hal_override *ovr) {
     if (ovr) {
         g_override = *ovr;
         if (g_initialized) {
-            _compute_dispatch(&g_profile);
             _compute_optimal_tiles(&g_profile);
+            _compute_dispatch(&g_profile);  /* overrides applied last */
         }
     }
 }

@@ -1,0 +1,2 @@
+/usr/bin/ar qc librac_static.a CMakeFiles/rac_static.dir/c/rac_cpu.c.o
+/usr/bin/ranlib librac_static.a
