@@ -211,21 +211,23 @@ rac_micro_kernel_8x4_asm:
 
 
 /* ═══════════════════════════════════════════════════════════════════════
- * KERNEL 2: 8×8 — broadcast A (8 floats), stream B (8 floats)
+ * KERNEL 2: 8×8 — software-pipelined, prefetched, Zen3-tuned
  *
- * Simpler approach: vmovups for both A and B, vbroadcastss per row.
- * 8 accumulators, 1 B load, 8 broadcasts + 8 FMAs per K step.
+ * Key optimizations:
+ *   1. Prefetch at TOP of loop (B[k+2], A[k+2]) — hides memory latency
+ *   2. Pre-load B[k+1] into ymm10 while FMAing with B[k] in ymm8
+ *   3. 2x K-unroll: process 2 K steps per loop iteration
+ *   4. Accumulators ymm0-7 stay in registers across entire KC — no spills
+ *   5. B alternates between ymm8 and ymm10 (zero-cost swap)
  *
- * This avoids the deinterleave complexity of vmovsldup/vmovshdup
- * while still getting 8 rows of throughput.
+ * Register map (12 of 16 YMM used):
+ *   ymm0-ymm7:   8 accumulators (persistent across KC — NEVER spilled)
+ *   ymm8:        B[k] current (or B[k+2] pre-loaded)
+ *   ymm9:        A broadcast scratch
+ *   ymm10:       B[k+1] pre-loaded
+ *   ymm11-15:    free
  *
- * Register map:
- *   ymm0-ymm7:   8 accumulators (1 per row)
- *   ymm8:        B load (8 floats)
- *   ymm9:        A broadcast
- *
- * Packed A: [kc × 8] — 8 floats per K
- * Packed B: [kc × 8] — 8 floats per K
+ * System V AMD64: rdi=packed_a, rsi=packed_b, rdx=C, ecx=ldc, r8d=kc
  * ═══════════════════════════════════════════════════════════════════════ */
 .globl rac_micro_kernel_8x8_asm
 .type  rac_micro_kernel_8x8_asm, @function
@@ -248,12 +250,26 @@ rac_micro_kernel_8x8_asm:
     testl   %eax, %eax
     jle     .L8x8_store
 
-.align 32
-.L8x8_kloop:
-    /* Load B[k, 0..7] */
+    /* Need at least 2 for pipelined loop */
+    cmpl    $2, %eax
+    jl      .L8x8_tail1
+
+    /* Pre-load B[0] for pipeline */
     vmovups (%rsi), %ymm8
 
-    /* 8 rows: broadcast A[k,r] and FMA */
+    shrl    $1, %eax            /* eax = kc / 2 */
+
+.align 32
+.L8x8_kloop2:
+    /* ── K step 0: FMA with B[k] in ymm8 ── */
+
+    /* Prefetch next panels: B[k+2] and A[k+2] */
+    prefetcht0  64(%rsi)
+    prefetcht0  64(%rdi)
+
+    /* Pre-load B[k+1] — overlaps with FMA execution below */
+    vmovups     32(%rsi), %ymm10
+
     vbroadcastss    (%rdi), %ymm9
     vfmadd231ps %ymm9, %ymm8, %ymm0
     vbroadcastss   4(%rdi), %ymm9
@@ -271,48 +287,86 @@ rac_micro_kernel_8x8_asm:
     vbroadcastss  28(%rdi), %ymm9
     vfmadd231ps %ymm9, %ymm8, %ymm7
 
-    prefetcht0  256(%rsi)
+    /* ── K step 1: FMA with B[k+1] in ymm10 ── */
+
+    prefetcht0  128(%rsi)
     prefetcht0  128(%rdi)
 
-    addq    $32, %rdi           /* A += 8 floats */
-    addq    $32, %rsi           /* B += 8 floats */
+    /* Pre-load B[k+2] into ymm8 (ready for next iteration) */
+    vmovups     64(%rsi), %ymm8
+
+    vbroadcastss  32(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm0
+    vbroadcastss  36(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm1
+    vbroadcastss  40(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm2
+    vbroadcastss  44(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm3
+    vbroadcastss  48(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm4
+    vbroadcastss  52(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm5
+    vbroadcastss  56(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm6
+    vbroadcastss  60(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm10, %ymm7
+
+    addq    $64, %rdi           /* A += 2 × 8 floats */
+    addq    $64, %rsi           /* B += 2 × 8 floats */
     decl    %eax
-    jnz     .L8x8_kloop
+    jnz     .L8x8_kloop2
+
+    /* Handle odd K remainder */
+    testl   $1, %r8d
+    jz      .L8x8_store
+    jmp     .L8x8_do_tail
+
+.L8x8_tail1:
+.L8x8_do_tail:
+    vmovups (%rsi), %ymm8
+    vbroadcastss    (%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm0
+    vbroadcastss   4(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm1
+    vbroadcastss   8(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm2
+    vbroadcastss  12(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm3
+    vbroadcastss  16(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm4
+    vbroadcastss  20(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm5
+    vbroadcastss  24(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm6
+    vbroadcastss  28(%rdi), %ymm9
+    vfmadd231ps %ymm9, %ymm8, %ymm7
 
 .L8x8_store:
-    /* Each ymm holds one complete row of C: 8 columns */
-    /* Just add to C and store — no deinterleave needed! */
-
-    vaddps  (%rdx), %ymm0, %ymm0
-    vmovups %ymm0, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm1, %ymm1
-    vmovups %ymm1, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm2, %ymm2
-    vmovups %ymm2, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm3, %ymm3
-    vmovups %ymm3, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm4, %ymm4
-    vmovups %ymm4, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm5, %ymm5
-    vmovups %ymm5, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm6, %ymm6
-    vmovups %ymm6, (%rdx)
-    leaq    (%rdx, %rcx), %rdx
-
-    vaddps  (%rdx), %ymm7, %ymm7
-    vmovups %ymm7, (%rdx)
+    movq    %rdx, %r10
+    vaddps  (%r10), %ymm0, %ymm0
+    vmovups %ymm0, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm1, %ymm1
+    vmovups %ymm1, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm2, %ymm2
+    vmovups %ymm2, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm3, %ymm3
+    vmovups %ymm3, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm4, %ymm4
+    vmovups %ymm4, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm5, %ymm5
+    vmovups %ymm5, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm6, %ymm6
+    vmovups %ymm6, (%r10)
+    leaq    (%r10, %rcx), %r10
+    vaddps  (%r10), %ymm7, %ymm7
+    vmovups %ymm7, (%r10)
 
     vzeroupper
     ret
