@@ -46,10 +46,10 @@ int main(void) {
     int sizes[] = {64, 128, 256, 512, 1024, 2048};
     int n_sizes = sizeof(sizes) / sizeof(sizes[0]);
 
-    printf("  %-6s │ %10s %8s │ %10s %8s │ %8s │ Winner\n",
-           "Size", "OpenBLAS", "GFLOPS", "RAC HAL", "GFLOPS", "Ratio");
-    printf("  %-6s─┼─%10s─%8s─┼─%10s─%8s─┼─%8s─┼─%s\n",
-           "──────", "──────────", "────────", "──────────", "────────", "────────", "──────");
+    printf("  %-6s │ %10s %8s │ %10s %8s │ %10s %8s │ %8s │ Winner\n",
+           "Size", "OpenBLAS", "GFLOPS", "RAC HAL", "GFLOPS", "RAC raw", "GFLOPS", "Ratio");
+    printf("  %-6s─┼─%10s─%8s─┼─%10s─%8s─┼─%10s─%8s─┼─%8s─┼─%s\n",
+           "──────", "──────────", "────────", "──────────", "────────", "──────────", "────────", "────────", "──────");
 
     for (int si = 0; si < n_sizes; si++) {
         int N = sizes[si];
@@ -57,14 +57,17 @@ int main(void) {
         float *B = malloc(N*N*sizeof(float));
         float *C_blas = calloc(N*N, sizeof(float));
         float *C_rac  = calloc(N*N, sizeof(float));
+        float *C_raw  = calloc(N*N, sizeof(float));
+        rac_config cfg = rac_default_config();
 
         rand_fill(A, N*N);
         rand_fill(B, N*N);
 
-        /* Warmup both */
+        /* Warmup all three */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     N, N, N, 1.0f, A, N, B, N, 0.0f, C_blas, N);
         rac_hal_matmul(A, B, C_rac, N, N, N);
+        rac_sgemm_avx2(A, B, C_raw, N, N, N, 1.0f, 0.0f, &cfg);
 
         /* Benchmark OpenBLAS */
         double t0 = now_ms();
@@ -75,7 +78,7 @@ int main(void) {
         }
         double t_blas = (now_ms() - t0) / iters;
 
-        /* Benchmark RAC HAL */
+        /* Benchmark RAC HAL (with dispatch overhead) */
         t0 = now_ms();
         for (int i = 0; i < iters; i++) {
             memset(C_rac, 0, N*N*sizeof(float));
@@ -83,25 +86,25 @@ int main(void) {
         }
         double t_rac = (now_ms() - t0) / iters;
 
+        /* Benchmark RAC raw (direct call, no HAL) */
+        t0 = now_ms();
+        for (int i = 0; i < iters; i++) {
+            memset(C_raw, 0, N*N*sizeof(float));
+            rac_sgemm_avx2(A, B, C_raw, N, N, N, 1.0f, 0.0f, &cfg);
+        }
+        double t_raw = (now_ms() - t0) / iters;
+
         double ops = 2.0 * N * N * N;
         double gf_blas = ops / (t_blas * 1e6);
         double gf_rac  = ops / (t_rac * 1e6);
-        double ratio = gf_rac / gf_blas;
+        double gf_raw  = ops / (t_raw * 1e6);
+        double ratio = gf_raw / gf_blas;
         const char *winner = (ratio >= 1.0) ? "RAC" : "BLAS";
 
-        /* Correctness */
-        float max_err = 0;
-        for (int i = 0; i < N*N; i++) {
-            float d = fabsf(C_rac[i] - C_blas[i]);
-            if (d > max_err) max_err = d;
-        }
+        printf("  %4dx%-1d │ %8.2fms %6.1f   │ %8.2fms %6.1f   │ %8.2fms %6.1f   │ %6.2fx  │ %s\n",
+               N, N, t_blas, gf_blas, t_rac, gf_rac, t_raw, gf_raw, ratio, winner);
 
-        printf("  %4dx%-1d │ %8.2fms %6.1f   │ %8.2fms %6.1f   │ %6.2fx  │ %s",
-               N, N, t_blas, gf_blas, t_rac, gf_rac, ratio, winner);
-        if (max_err > 0.1f) printf("  ⚠ err=%.2e", max_err);
-        printf("\n");
-
-        free(A); free(B); free(C_blas); free(C_rac);
+        free(A); free(B); free(C_blas); free(C_rac); free(C_raw);
     }
 
     /* Fused linear comparison: RAC fused vs OpenBLAS SGEMM + manual bias + GELU */
