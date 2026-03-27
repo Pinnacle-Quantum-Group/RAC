@@ -109,10 +109,19 @@ static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int 
     }
 }
 
-/* ── MR×NR micro-kernel: packed_A[MR×kc] × packed_B[kc×NR] → C[MR×NR] ── */
-static void _micro_kernel_6x16(
-    const float *packed_a,  /* [MR × kc] packed column-panel */
-    const float *packed_b,  /* [kc × NR] packed row-panel */
+/* ── Assembly micro-kernel (Zen3-tuned) ── */
+/* Defined in rac_zen3_kern.S */
+extern void rac_micro_kernel_6x16_asm(
+    const float *packed_a,
+    const float *packed_b,
+    float *C,
+    int ldc,
+    int kc);
+
+/* ── C fallback micro-kernel (for edge tiles with mr < MR or nr < NR) ── */
+static void _micro_kernel_6x16_c(
+    const float *packed_a,
+    const float *packed_b,
     float *C, int ldc,
     int mr, int nr, int kc,
     float alpha)
@@ -123,13 +132,10 @@ static void _micro_kernel_6x16(
         acc[r][1] = _mm256_setzero_ps();
     }
 
-    /* Main K-loop over packed data — fully contiguous, prefetch-friendly */
     for (int k = 0; k < kc; k++) {
-        /* Load NR=16 floats from packed B (contiguous) */
         __m256 b0 = _mm256_loadu_ps(&packed_b[k * NR]);
         __m256 b1 = _mm256_loadu_ps(&packed_b[k * NR + 8]);
 
-        /* Broadcast MR=6 values from packed A (contiguous) */
         for (int r = 0; r < MR; r++) {
             __m256 a_bc = _mm256_set1_ps(packed_a[k * MR + r]);
             acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
@@ -137,7 +143,6 @@ static void _micro_kernel_6x16(
         }
     }
 
-    /* Write back: C += alpha * acc */
     __m256 valpha = _mm256_set1_ps(alpha);
     for (int r = 0; r < mr; r++) {
         __m256 res0 = _mm256_mul_ps(valpha, acc[r][0]);
@@ -230,18 +235,20 @@ rac_status rac_sgemm_avx2(
                     /* Micro-kernel loop */
                     for (int jr = 0; jr < nc; jr += NR) {
                         int nr = ((jr + NR) <= nc) ? NR : (nc - jr);
-                        /* packed_b layout: panel (jr/NR) has kc*NR floats */
                         float *pb = &packed_b[(jr / NR) * kc * NR];
 
                         for (int ir = 0; ir < mc; ir += MR) {
                             int mr = ((ir + MR) <= mc) ? MR : (mc - ir);
-                            /* packed_a layout: panel (ir/MR) has kc*MR floats */
                             float *pa = &packed_a[(ir / MR) * kc * MR];
+                            float *c_ptr = &C[(ic + ir) * N + (jc + jr)];
 
-                            _micro_kernel_6x16(
-                                pa, pb,
-                                &C[(ic + ir) * N + (jc + jr)],
-                                N, mr, nr, kc, alpha);
+                            if (mr == MR && nr == NR && alpha == 1.0f) {
+                                /* Full tile: assembly micro-kernel */
+                                rac_micro_kernel_6x16_asm(pa, pb, c_ptr, N, kc);
+                            } else {
+                                /* Edge tile: C intrinsics fallback */
+                                _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
+                            }
                         }
                     }
                 }
