@@ -101,7 +101,7 @@ int rac_has_avx2(void) {
  *
  * These are tuned for Zen's 32KB L1d, 512KB L2, 4MB+ L3/CCX.
  */
-#define DEFAULT_KC 320
+#define DEFAULT_KC 256
 #define DEFAULT_MC 320
 #define DEFAULT_NC 2048
 
@@ -150,9 +150,9 @@ static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int 
 
 /* ── Pack B[kc×nc] → row-panel layout (SIMD-accelerated) ── */
 /*
- * packed_B layout: for each NR-panel, stores [kc][NR] contiguous.
+ * packed_B layout: for each NR-panel, stores [kc][NR=4] contiguous.
  * B is row-major: B[k,j] = B[k*ldb + j]. For a given k, B[k, j..j+NR-1]
- * is already contiguous! So we can memcpy/vmovups entire rows.
+ * is already contiguous! So we can memcpy/movups entire rows.
  *
  * This is where the big win is — B packing is a contiguous copy.
  */
@@ -161,12 +161,12 @@ static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int 
         int nr = ((j + panel_nr) <= nc) ? panel_nr : (nc - j);
 
         if (nr == panel_nr && panel_nr == NR) {
-            /* Full NR=8 panel: 1 × vmovups per K row (contiguous in B) */
+            /* Full NR=4 panel: 1 × movups (128-bit) per K row (contiguous in B) */
             for (int k = 0; k < kc; k++) {
                 const float *src = &B[(K_start + k) * ldb + N_start + j];
                 if (k + 1 < kc)
                     _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
-                _mm256_storeu_ps(packed, _mm256_loadu_ps(src));
+                _mm_storeu_ps(packed, _mm_loadu_ps(src));
                 packed += NR;
             }
         } else if (nr == panel_nr) {
@@ -231,7 +231,7 @@ extern void rac_micro_kernel_8x4_asm(
 
 /* Runtime detection: which assembly kernel to use */
 static int _use_avx512_kern = -1;  /* -1=unset, 0=avx2, 1=avx512 */
-static int _active_NR = NR;        /* 16 for AVX2, 32 for AVX-512 */
+static int _active_NR = NR;        /* 4 for AVX2 (OpenBLAS Zen shape) */
 
 static void _detect_best_kernel(void) {
     if (_use_avx512_kern >= 0) return;
@@ -242,7 +242,7 @@ static void _detect_best_kernel(void) {
      * TODO: validate AVX-512 on Icelake, Sapphire Rapids, Zen4+
      */
     _use_avx512_kern = 0;
-    _active_NR = NR;  /* 16 */
+    _active_NR = NR;  /* 4 (OpenBLAS Zen shape) */
 }
 
 /* ── C fallback micro-kernel (for edge tiles with mr < MR or nr < NR) ── */
@@ -285,40 +285,16 @@ rac_status rac_sgemm_avx2(
     int active_nr = _active_NR;
 
     /*
-     * Auto-tune KC/MC/NC from actual cache sizes.
-     * KC: B micro-panel [KC × NR] + A stream [MR × KC] fits in L1d
-     *     KC = L1d / ((NR + MR) * sizeof(float) * 2)  [50% utilization]
-     * MC: packed_A [MC × KC] fits in L2
-     *     MC = L2 / (KC * sizeof(float) * 2)  [50% utilization]
-     * NC: packed_B [KC × NC] fits in L3 per-core
+     * Fixed blocking parameters from OpenBLAS param.h ZEN section (x86_64):
+     *   SGEMM_DEFAULT_P = 320 (MC)   -- packed_A [MC x KC] fits in L2
+     *   SGEMM_DEFAULT_Q = 256 (KC)   -- micro-panels stream through L1
+     *   NC = 2048                     -- packed_B [KC x NC] fits in L3/CCX
+     *   SGEMM_DEFAULT_UNROLL_M = 8    -- MR (rows per micro-kernel)
+     *   SGEMM_DEFAULT_UNROLL_N = 4    -- NR (cols per micro-kernel)
      */
-    int l1d_kb = 32, l2_kb = 256;  /* conservative defaults */
-
-    /* Try to get actual cache sizes from HAL */
-    extern const rac_hw_profile* rac_hal_profile(void);
-    const rac_hw_profile *hw = rac_hal_profile();
-    if (hw && hw->cache.l1d_size_kb > 0) l1d_kb = hw->cache.l1d_size_kb;
-    if (hw && hw->cache.l2_size_kb > 0)  l2_kb  = hw->cache.l2_size_kb;
-
-    int l1d_bytes = l1d_kb * 1024;
-    int l2_bytes  = l2_kb * 1024;
-
-    /* KC: B micro-panel [KC*NR*4] fits in ~40% of L1 */
-    int KC = (l1d_bytes * 2 / 5) / (active_nr * (int)sizeof(float));
-    KC = (KC / 8) * 8;
-    if (KC < 128) KC = 128;
-    if (KC > 512) KC = 512;
-
-    /* MC: packed_A [MC*KC*4] fits in ~50% of L2 */
-    int MC = (l2_bytes / 2) / (KC * (int)sizeof(float));
-    MC = (MC / MR) * MR;
-    if (MC < MR * 8) MC = MR * 8;
-    if (MC > 768) MC = 768;
-
-    int NC = DEFAULT_NC;
-
-    /* cfg->tile_size is for the simple tiled kernel, NOT for GotoBLAS KC.
-     * Only override KC if the user explicitly sets a large value (>= 64). */
+    int KC = DEFAULT_KC;  /* 256 */
+    int MC = DEFAULT_MC;  /* 320 */
+    int NC = DEFAULT_NC;  /* 2048 */
 
     /*
      * Small matrix fast path: skip packing overhead.
@@ -342,12 +318,13 @@ rac_status rac_sgemm_avx2(
             return RAC_OK;
         }
 
-        /* Direct 8×8 micro-tiled fast path: no packing, straight FMA loop */
+        /* Direct 8×8 micro-tiled fast path: no packing, straight FMA loop.
+         * Uses FAST_NR=8 (not NR=4) so each tile fills a full YMM. */
         #pragma omp parallel for schedule(dynamic, 2)
         for (int i0 = 0; i0 < M; i0 += MR) {
             int mr = ((i0 + MR) <= M) ? MR : (M - i0);
-            for (int j0 = 0; j0 < N; j0 += NR) {
-                int nr = ((j0 + NR) <= N) ? NR : (N - j0);
+            for (int j0 = 0; j0 < N; j0 += FAST_NR) {
+                int nr = ((j0 + FAST_NR) <= N) ? FAST_NR : (N - j0);
                 /* 8 accumulators: one YMM per row, 8 columns */
                 __m256 acc[MR];
                 for (int r = 0; r < MR; r++)
@@ -446,8 +423,8 @@ rac_status rac_sgemm_avx2(
                             float *c_ptr = &C[(ic + ir) * N + (jc + jr)];
 
                             if (mr == MR && nr == NR && alpha == 1.0f) {
-                                /* Full 8x8 tile: assembly micro-kernel */
-                                rac_micro_kernel_8x8_asm(pa, pb, c_ptr, N, kc);
+                                /* Full 8x4 tile: OpenBLAS Zen assembly micro-kernel */
+                                rac_micro_kernel_8x4_asm(pa, pb, c_ptr, N, kc);
                                 _asm_calls++;
                             } else {
                                 /* Edge or non-unit alpha: C fallback */
@@ -556,8 +533,8 @@ rac_status rac_fused_linear_avx2(
         int imax = (i0 + MR <= M) ? i0 + MR : M;
         int mr = imax - i0;
 
-        for (int j0 = 0; j0 < N; j0 += NR) {
-            int jmax = (j0 + NR <= N) ? j0 + NR : N;
+        for (int j0 = 0; j0 < N; j0 += 16) {
+            int jmax = (j0 + 16 <= N) ? j0 + 16 : N;
             int nr = jmax - j0;
 
             __m256 acc[MR][2];
