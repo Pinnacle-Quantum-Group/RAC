@@ -79,8 +79,14 @@ int rac_has_avx2(void) {
  * Packing eliminates TLB misses and enables hardware prefetch.
  */
 
-#define MR 6     /* rows of C per micro-kernel */
-#define NR 16    /* columns of C per micro-kernel (2 x __m256) */
+/* Micro-kernel shape: 8×8 (OpenBLAS-informed)
+ * MR=8: one vmovups loads all 8 A values
+ * NR=8: one vmovups loads all 8 B values
+ * 8 accumulators, 1 B load, 8 broadcasts per K step
+ * Clean store: each accumulator IS one row of C (no deinterleave)
+ */
+#define MR 8     /* rows of C per micro-kernel */
+#define NR 8     /* columns of C per micro-kernel (1 x __m256) */
 
 /*
  * Default cache tile sizes.
@@ -98,13 +104,10 @@ int rac_has_avx2(void) {
 
 /* ── Pack A[mc×kc] → column-panel layout (SIMD-accelerated) ── */
 /*
- * packed_A layout: for each MR-panel, stores [kc][MR] contiguous.
- * A is row-major: A[i,k] = A[i*lda + k]. We need to gather MR rows
- * for each k column. MR=6 doesn't align to AVX2, so we gather scalars
- * but prefetch aggressively.
- *
- * The key optimization: prefetch the next K column's rows while
- * packing the current one, hiding the gather latency.
+ * packed_A layout: for each MR-panel, stores [kc][MR=8] contiguous.
+ * A is row-major: A[i,k] = A[i*lda + k]. We gather 8 rows per K column.
+ * MR=8 = 1 YMM, so the store is a single vmovups.
+ * The gather is still scalar (8 different row pointers) but prefetched.
  */
 static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int K_start) {
     for (int i = 0; i < mc; i += MR) {
@@ -114,12 +117,11 @@ static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int 
             a_ptrs[r] = &A[(i + r) * lda + K_start];
 
         if (mr == MR) {
-            /* Full MR=6 panel: unrolled gather with prefetch */
+            /* Full MR=8 panel: gather 8 row values, store as 1 YMM */
             for (int k = 0; k < kc; k++) {
-                /* Prefetch next column (64 bytes ahead ≈ next cache line) */
                 if (k + 8 < kc) {
                     _mm_prefetch((const char*)(a_ptrs[0] + k + 8), _MM_HINT_T0);
-                    _mm_prefetch((const char*)(a_ptrs[3] + k + 8), _MM_HINT_T0);
+                    _mm_prefetch((const char*)(a_ptrs[4] + k + 8), _MM_HINT_T0);
                 }
                 packed[0] = a_ptrs[0][k];
                 packed[1] = a_ptrs[1][k];
@@ -127,6 +129,8 @@ static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int 
                 packed[3] = a_ptrs[3][k];
                 packed[4] = a_ptrs[4][k];
                 packed[5] = a_ptrs[5][k];
+                packed[6] = a_ptrs[6][k];
+                packed[7] = a_ptrs[7][k];
                 packed += MR;
             }
         } else {
@@ -154,16 +158,12 @@ static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int 
         int nr = ((j + panel_nr) <= nc) ? panel_nr : (nc - j);
 
         if (nr == panel_nr && panel_nr == NR) {
-            /* Full NR=16 panel: 2 × vmovups per K row (contiguous in B) */
+            /* Full NR=8 panel: 1 × vmovups per K row (contiguous in B) */
             for (int k = 0; k < kc; k++) {
                 const float *src = &B[(K_start + k) * ldb + N_start + j];
-                /* Prefetch next row */
                 if (k + 1 < kc)
                     _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
-                __m256 v0 = _mm256_loadu_ps(src);
-                __m256 v1 = _mm256_loadu_ps(src + 8);
-                _mm256_storeu_ps(packed, v0);
-                _mm256_storeu_ps(packed + 8, v1);
+                _mm256_storeu_ps(packed, _mm256_loadu_ps(src));
                 packed += NR;
             }
         } else if (nr == panel_nr) {
@@ -210,6 +210,22 @@ extern void rac_micro_kernel_6x32_avx512(
     int ldc,
     int kc);
 
+/* 8x8 broadcast-A stream-B: defined in rac_zen3_kern.S */
+extern void rac_micro_kernel_8x8_asm(
+    const float *packed_a,
+    const float *packed_b,
+    float *C,
+    int ldc,
+    int kc);
+
+/* 8x4 with vmovsldup/vmovshdup trick: defined in rac_zen3_kern.S */
+extern void rac_micro_kernel_8x4_asm(
+    const float *packed_a,
+    const float *packed_b,
+    float *C,
+    int ldc,
+    int kc);
+
 /* Runtime detection: which assembly kernel to use */
 static int _use_avx512_kern = -1;  /* -1=unset, 0=avx2, 1=avx512 */
 static int _active_NR = NR;        /* 16 for AVX2, 32 for AVX-512 */
@@ -227,50 +243,29 @@ static void _detect_best_kernel(void) {
 }
 
 /* ── C fallback micro-kernel (for edge tiles with mr < MR or nr < NR) ── */
-static void _micro_kernel_6x16_c(
+static void _micro_kernel_c(
     const float *packed_a,
     const float *packed_b,
     float *C, int ldc,
     int mr, int nr, int kc,
     float alpha)
 {
-    __m256 acc[MR][2];
-    for (int r = 0; r < MR; r++) {
-        acc[r][0] = _mm256_setzero_ps();
-        acc[r][1] = _mm256_setzero_ps();
-    }
+    /* Generic scalar fallback for edge tiles */
+    float acc[MR * NR];
+    memset(acc, 0, sizeof(acc));
 
     for (int k = 0; k < kc; k++) {
-        __m256 b0 = _mm256_loadu_ps(&packed_b[k * NR]);
-        __m256 b1 = _mm256_loadu_ps(&packed_b[k * NR + 8]);
-
-        for (int r = 0; r < MR; r++) {
-            __m256 a_bc = _mm256_set1_ps(packed_a[k * MR + r]);
-            acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
-            acc[r][1] = _mm256_fmadd_ps(a_bc, b1, acc[r][1]);
+        for (int r = 0; r < mr; r++) {
+            float a_val = packed_a[k * MR + r];
+            for (int c = 0; c < nr; c++) {
+                acc[r * NR + c] = fmaf(a_val, packed_b[k * NR + c], acc[r * NR + c]);
+            }
         }
     }
 
-    __m256 valpha = _mm256_set1_ps(alpha);
-    for (int r = 0; r < mr; r++) {
-        __m256 res0 = _mm256_mul_ps(valpha, acc[r][0]);
-        __m256 res1 = _mm256_mul_ps(valpha, acc[r][1]);
-
-        if (nr >= 16) {
-            __m256 c0 = _mm256_loadu_ps(&C[r * ldc]);
-            __m256 c1 = _mm256_loadu_ps(&C[r * ldc + 8]);
-            _mm256_storeu_ps(&C[r * ldc],     _mm256_add_ps(c0, res0));
-            _mm256_storeu_ps(&C[r * ldc + 8], _mm256_add_ps(c1, res1));
-        } else {
-            float tmp0[8], tmp1[8];
-            _mm256_storeu_ps(tmp0, res0);
-            _mm256_storeu_ps(tmp1, res1);
-            for (int c = 0; c < nr && c < 8; c++)
-                C[r * ldc + c] += tmp0[c];
-            for (int c = 8; c < nr; c++)
-                C[r * ldc + c] += tmp1[c - 8];
-        }
-    }
+    for (int r = 0; r < mr; r++)
+        for (int c = 0; c < nr; c++)
+            C[r * ldc + c] += alpha * acc[r * NR + c];
 }
 
 rac_status rac_sgemm_avx2(
@@ -344,40 +339,34 @@ rac_status rac_sgemm_avx2(
             return RAC_OK;
         }
 
-        /* Direct micro-tiled fast path: no packing, straight FMA loop */
+        /* Direct 8×8 micro-tiled fast path: no packing, straight FMA loop */
         #pragma omp parallel for schedule(dynamic, 2)
         for (int i0 = 0; i0 < M; i0 += MR) {
             int mr = ((i0 + MR) <= M) ? MR : (M - i0);
             for (int j0 = 0; j0 < N; j0 += NR) {
                 int nr = ((j0 + NR) <= N) ? NR : (N - j0);
-                __m256 acc[MR][2];
-                for (int r = 0; r < MR; r++) {
-                    acc[r][0] = _mm256_setzero_ps();
-                    acc[r][1] = _mm256_setzero_ps();
-                }
+                /* 8 accumulators: one YMM per row, 8 columns */
+                __m256 acc[MR];
+                for (int r = 0; r < MR; r++)
+                    acc[r] = _mm256_setzero_ps();
+
                 for (int k = 0; k < K; k++) {
                     __m256 b0 = _mm256_loadu_ps(&B[k*N+j0]);
-                    __m256 b1 = (nr >= 16) ? _mm256_loadu_ps(&B[k*N+j0+8]) : _mm256_setzero_ps();
                     for (int r = 0; r < mr; r++) {
                         __m256 a_bc = _mm256_set1_ps(A[(i0+r)*K+k]);
-                        acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
-                        acc[r][1] = _mm256_fmadd_ps(a_bc, b1, acc[r][1]);
+                        acc[r] = _mm256_fmadd_ps(a_bc, b0, acc[r]);
                     }
                 }
                 __m256 valpha = _mm256_set1_ps(alpha);
                 for (int r = 0; r < mr; r++) {
-                    __m256 r0 = _mm256_mul_ps(valpha, acc[r][0]);
-                    __m256 r1 = _mm256_mul_ps(valpha, acc[r][1]);
-                    if (nr >= 16) {
+                    __m256 res = _mm256_mul_ps(valpha, acc[r]);
+                    if (nr >= 8) {
                         __m256 c0 = _mm256_loadu_ps(&C[(i0+r)*N+j0]);
-                        __m256 c1 = _mm256_loadu_ps(&C[(i0+r)*N+j0+8]);
-                        _mm256_storeu_ps(&C[(i0+r)*N+j0],   _mm256_add_ps(c0, r0));
-                        _mm256_storeu_ps(&C[(i0+r)*N+j0+8], _mm256_add_ps(c1, r1));
+                        _mm256_storeu_ps(&C[(i0+r)*N+j0], _mm256_add_ps(c0, res));
                     } else {
-                        float t0[8], t1[8];
-                        _mm256_storeu_ps(t0, r0); _mm256_storeu_ps(t1, r1);
-                        for (int c = 0; c < nr && c < 8; c++) C[(i0+r)*N+j0+c] += t0[c];
-                        for (int c = 8; c < nr; c++) C[(i0+r)*N+j0+c] += t1[c-8];
+                        float tmp[8];
+                        _mm256_storeu_ps(tmp, res);
+                        for (int c = 0; c < nr; c++) C[(i0+r)*N+j0+c] += tmp[c];
                     }
                 }
             }
@@ -453,19 +442,13 @@ rac_status rac_sgemm_avx2(
                             float *pa = &packed_a[(ir / MR) * kc * MR];
                             float *c_ptr = &C[(ic + ir) * N + (jc + jr)];
 
-                            if (mr == MR && alpha == 1.0f) {
-                                if (_use_avx512_kern && nr == 32) {
-                                    rac_micro_kernel_6x32_avx512(pa, pb, c_ptr, N, kc);
-                                    _asm_calls++;
-                                } else if (nr >= NR) {
-                                    rac_micro_kernel_6x16_asm(pa, pb, c_ptr, N, kc);
-                                    _asm_calls++;
-                                } else {
-                                    _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
-                                    _c_calls++;
-                                }
+                            if (mr == MR && nr == NR && alpha == 1.0f) {
+                                /* Full 8x8 tile: assembly micro-kernel */
+                                rac_micro_kernel_8x8_asm(pa, pb, c_ptr, N, kc);
+                                _asm_calls++;
                             } else {
-                                _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
+                                /* Edge or non-unit alpha: C fallback */
+                                _micro_kernel_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
                                 _c_calls++;
                             }
                         }
