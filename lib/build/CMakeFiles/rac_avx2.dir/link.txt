@@ -1,1 +1,0 @@
-/usr/bin/cc -fPIC -O3 -DNDEBUG -shared -Wl,-soname,librac_avx2.so -o librac_avx2.so CMakeFiles/rac_avx2.dir/c/rac_cpu.c.o CMakeFiles/rac_avx2.dir/c/rac_avx2.c.o CMakeFiles/rac_avx2.dir/c/rac_hal.c.o  -lm /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

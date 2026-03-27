@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG CMakeFiles/test_rac_lib_dvt.dir/c/test_rac_lib_dvt.c.o -o test_rac_lib_dvt  -Wl,-rpath,/home/user/RAC/lib/build librac_avx2.so -lm /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 
