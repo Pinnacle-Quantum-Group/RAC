@@ -9,6 +9,7 @@
 #include "rac_hal.h"
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <cpuid.h>
@@ -318,8 +319,59 @@ rac_status rac_sgemm_avx2(
 
     int NC = DEFAULT_NC;
 
-    /* Allow user override */
-    if (cfg && cfg->tile_size > 0) KC = cfg->tile_size;
+    /* cfg->tile_size is for the simple tiled kernel, NOT for GotoBLAS KC.
+     * Only override KC if the user explicitly sets a large value (>= 64). */
+
+    /*
+     * Small matrix fast path: skip packing overhead.
+     * For M*N < 256*256, the packing cost dominates.
+     * Use direct MR×NR micro-tiled loop (no packing, no GotoBLAS).
+     */
+    if ((long long)M * N <= 65536) {
+        if (beta == 0.0f) memset(C, 0, (size_t)M * N * sizeof(float));
+        else if (beta != 1.0f) for (int i = 0; i < M * N; i++) C[i] *= beta;
+
+        #pragma omp parallel for schedule(dynamic, 2)
+        for (int i0 = 0; i0 < M; i0 += MR) {
+            int mr = ((i0 + MR) <= M) ? MR : (M - i0);
+            for (int j0 = 0; j0 < N; j0 += NR) {
+                int nr = ((j0 + NR) <= N) ? NR : (N - j0);
+                __m256 acc[MR][2];
+                for (int r = 0; r < MR; r++) {
+                    acc[r][0] = _mm256_setzero_ps();
+                    acc[r][1] = _mm256_setzero_ps();
+                }
+                for (int k = 0; k < K; k++) {
+                    __m256 b0 = (nr >= 8)  ? _mm256_loadu_ps(&B[k*N+j0])     : _mm256_setzero_ps();
+                    __m256 b1 = (nr >= 16) ? _mm256_loadu_ps(&B[k*N+j0+8]) : _mm256_setzero_ps();
+                    for (int r = 0; r < mr; r++) {
+                        __m256 a_bc = _mm256_set1_ps(A[(i0+r)*K+k]);
+                        acc[r][0] = _mm256_fmadd_ps(a_bc, b0, acc[r][0]);
+                        acc[r][1] = _mm256_fmadd_ps(a_bc, b1, acc[r][1]);
+                    }
+                }
+                __m256 valpha = _mm256_set1_ps(alpha);
+                for (int r = 0; r < mr; r++) {
+                    __m256 r0 = _mm256_mul_ps(valpha, acc[r][0]);
+                    __m256 r1 = _mm256_mul_ps(valpha, acc[r][1]);
+                    if (nr >= 16) {
+                        __m256 c0 = _mm256_loadu_ps(&C[(i0+r)*N+j0]);
+                        __m256 c1 = _mm256_loadu_ps(&C[(i0+r)*N+j0+8]);
+                        _mm256_storeu_ps(&C[(i0+r)*N+j0],   _mm256_add_ps(c0, r0));
+                        _mm256_storeu_ps(&C[(i0+r)*N+j0+8], _mm256_add_ps(c1, r1));
+                    } else {
+                        float t0[8], t1[8];
+                        _mm256_storeu_ps(t0, r0); _mm256_storeu_ps(t1, r1);
+                        for (int c = 0; c < nr && c < 8; c++) C[(i0+r)*N+j0+c] += t0[c];
+                        for (int c = 8; c < nr; c++) C[(i0+r)*N+j0+c] += t1[c-8];
+                    }
+                }
+            }
+        }
+        return RAC_OK;
+    }
+
+    /* ── Large matrix: GotoBLAS 3-level blocked with packing ── */
 
     /* Apply beta to C */
     if (beta == 0.0f) {
@@ -347,6 +399,9 @@ rac_status rac_sgemm_avx2(
         free(packed_b); free(packed_a_all);
         return RAC_ERR_ALLOC;
     }
+
+    /* Debug counters */
+    long long _asm_calls = 0, _c_calls = 0;
 
     /* 3-level blocked loop: jc (L3) → ic (L2) → micro-kernel (L1) */
     for (int jc = 0; jc < N; jc += NC) {
@@ -386,22 +441,32 @@ rac_status rac_sgemm_avx2(
 
                             if (mr == MR && alpha == 1.0f) {
                                 if (_use_avx512_kern && nr == 32) {
-                                    /* AVX-512: 6x32 assembly */
                                     rac_micro_kernel_6x32_avx512(pa, pb, c_ptr, N, kc);
+                                    _asm_calls++;
                                 } else if (nr >= NR) {
-                                    /* AVX2: 6x16 assembly */
                                     rac_micro_kernel_6x16_asm(pa, pb, c_ptr, N, kc);
+                                    _asm_calls++;
                                 } else {
                                     _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
+                                    _c_calls++;
                                 }
                             } else {
                                 _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
+                                _c_calls++;
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    static int _print_once = 1;
+    if (_print_once) {
+        fprintf(stderr, "RAC SGEMM: KC=%d MC=%d NC=%d active_nr=%d asm=%lld c=%lld (%.0f%% asm)\n",
+                KC, MC, NC, active_nr, _asm_calls, _c_calls,
+                _asm_calls * 100.0 / (_asm_calls + _c_calls + 1));
+        _print_once = 0;
     }
 
     free(packed_b);
