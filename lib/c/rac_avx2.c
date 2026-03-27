@@ -64,9 +64,9 @@ int rac_has_avx2(void) {
  *   4. Pack B panel into contiguous row-panel layout
  *   5. Run MR×NR micro-kernel on packed data
  *
- * Micro-kernel: MR=6 rows × NR=16 cols (2 __m256 registers)
- *   12 accumulator YMM registers + 2 B loads + 1 A broadcast = 15/16 YMM used
- *   Per K step: 6 broadcasts × 2 loads = 12 FMAs from 8 memory ops
+ * Micro-kernel: MR=8 rows × NR=4 cols (OpenBLAS Zen shape)
+ *   4 accumulator YMM registers, vmovsldup/vmovshdup + 2 vbroadcastsd
+ *   Per K step: 1 vmovsldup + 1 vmovshdup + 2 vbroadcastsd + 4 vfmadd = 8 insns
  *
  * Cache sizing (auto-tuned from HAL profile):
  *   KC: sized so packed_A micro-panel [MR × KC] streams through L1
