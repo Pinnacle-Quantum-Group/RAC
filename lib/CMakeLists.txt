@@ -103,6 +103,12 @@ if(TARGET rac_avx2)
     target_include_directories(test_rac_lib_e2e PRIVATE c/)
     target_link_libraries(test_rac_lib_e2e rac_avx2 m)
     add_test(NAME lib_e2e COMMAND test_rac_lib_e2e)
+
+    # Long-run stress test
+    add_executable(test_rac_longrun c/test_rac_longrun.c)
+    target_include_directories(test_rac_longrun PRIVATE c/)
+    target_link_libraries(test_rac_longrun rac_avx2 m)
+    # Not in CTest by default (too long). Run manually.
 endif()
 
 # ── Install ─────────────────────────────────────────────────────────────
