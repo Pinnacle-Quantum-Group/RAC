@@ -19,7 +19,14 @@ ROCm/HIP:
 import os
 import torch
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
+
+# Check if HIPExtension is available (PyTorch with ROCm support)
+try:
+    from torch.utils.cpp_extension import HIPExtension
+    HAS_HIP_EXT = True
+except ImportError:
+    HAS_HIP_EXT = False
 
 # ── Backend detection ────────────────────────────────────────────────────────
 
@@ -64,15 +71,32 @@ HIP_FLAGS += [
 
 # ── Extension definition ────────────────────────────────────────────────────
 
-ext = CUDAExtension(
-    name='rac_cuda_ext',
-    sources=['rac_torch.cu'],
-    extra_compile_args={
-        'cxx': ['-O3', '-std=c++17'],
-        'nvcc': HIP_FLAGS if IS_ROCM else CUDA_FLAGS,
-    },
-    define_macros=[('__HIP__', '1')] if IS_ROCM else [],
-)
+if IS_ROCM:
+    # ROCm/HIP path
+    if HAS_HIP_EXT:
+        ExtClass = HIPExtension
+    else:
+        ExtClass = CppExtension  # fallback: CppExtension works with hipcc
+
+    ext = ExtClass(
+        name='rac_cuda_ext',
+        sources=['rac_torch.cu'],
+        extra_compile_args={
+            'cxx': ['-O3', '-std=c++17'] + HIP_FLAGS,
+            'nvcc': HIP_FLAGS,  # ignored for HIP but required by schema
+        },
+        define_macros=[('__HIP__', '1')],
+    )
+else:
+    # NVIDIA CUDA path
+    ext = CUDAExtension(
+        name='rac_cuda_ext',
+        sources=['rac_torch.cu'],
+        extra_compile_args={
+            'cxx': ['-O3', '-std=c++17'],
+            'nvcc': CUDA_FLAGS,
+        },
+    )
 
 # ── Package setup ───────────────────────────────────────────────────────────
 
