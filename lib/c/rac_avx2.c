@@ -87,11 +87,14 @@ int rac_has_avx2(void) {
  * The fast path for small matrices uses a separate 8x8 kernel
  * (broadcast-A stream-B, no packing).
  */
+/*
+ * 8×8 broadcast-A stream-B micro-kernel.
+ * Tested 8×4 with vmovsldup/vmovshdup (OpenBLAS Zen shape) but the
+ * scalar deinterleave store cost 2.5x vs 8×8's clean vaddps+vmovups.
+ * Zen3: 8×8 = 576 GFLOPS, 8×4 = 227 GFLOPS. 8×8 wins decisively.
+ */
 #define MR 8     /* rows of C per micro-kernel */
-#define NR 4     /* columns of C per micro-kernel (OpenBLAS Zen) */
-
-/* For the small-matrix fast path (no packing), use 8x8 tiles */
-#define FAST_NR 8
+#define NR 8     /* columns of C per micro-kernel (1 × __m256) */
 
 /*
  * Cache tile sizes from OpenBLAS param.h ZEN section (x86_64):
@@ -166,7 +169,7 @@ static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int 
                 const float *src = &B[(K_start + k) * ldb + N_start + j];
                 if (k + 1 < kc)
                     _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
-                _mm_storeu_ps(packed, _mm_loadu_ps(src));
+                _mm256_storeu_ps(packed, _mm256_loadu_ps(src));
                 packed += NR;
             }
         } else if (nr == panel_nr) {
@@ -292,7 +295,15 @@ rac_status rac_sgemm_avx2(
      *   SGEMM_DEFAULT_UNROLL_M = 8    -- MR (rows per micro-kernel)
      *   SGEMM_DEFAULT_UNROLL_N = 4    -- NR (cols per micro-kernel)
      */
-    int KC = DEFAULT_KC;  /* 256 */
+    /* KC: B micro-panel [KC*NR*4] fits in ~40% of L1d */
+    int l1d_kb = 32;
+    extern const rac_hw_profile* rac_hal_profile(void);
+    const rac_hw_profile *hw = rac_hal_profile();
+    if (hw && hw->cache.l1d_size_kb > 0) l1d_kb = hw->cache.l1d_size_kb;
+    int KC = (l1d_kb * 1024 * 2 / 5) / (active_nr * (int)sizeof(float));
+    KC = (KC / 8) * 8;
+    if (KC < 128) KC = 128;
+    if (KC > 512) KC = 512;
     int MC = DEFAULT_MC;  /* 320 */
     int NC = DEFAULT_NC;  /* 2048 */
 
@@ -319,12 +330,12 @@ rac_status rac_sgemm_avx2(
         }
 
         /* Direct 8×8 micro-tiled fast path: no packing, straight FMA loop.
-         * Uses FAST_NR=8 (not NR=4) so each tile fills a full YMM. */
+         * Uses NR=8 (not NR=4) so each tile fills a full YMM. */
         #pragma omp parallel for schedule(dynamic, 2)
         for (int i0 = 0; i0 < M; i0 += MR) {
             int mr = ((i0 + MR) <= M) ? MR : (M - i0);
-            for (int j0 = 0; j0 < N; j0 += FAST_NR) {
-                int nr = ((j0 + FAST_NR) <= N) ? FAST_NR : (N - j0);
+            for (int j0 = 0; j0 < N; j0 += NR) {
+                int nr = ((j0 + NR) <= N) ? NR : (N - j0);
                 /* 8 accumulators: one YMM per row, 8 columns */
                 __m256 acc[MR];
                 for (int r = 0; r < MR; r++)
@@ -424,7 +435,7 @@ rac_status rac_sgemm_avx2(
 
                             if (mr == MR && nr == NR && alpha == 1.0f) {
                                 /* Full 8x4 tile: OpenBLAS Zen assembly micro-kernel */
-                                rac_micro_kernel_8x4_asm(pa, pb, c_ptr, N, kc);
+                                rac_micro_kernel_8x8_asm(pa, pb, c_ptr, N, kc);
                                 _asm_calls++;
                             } else {
                                 /* Edge or non-unit alpha: C fallback */
