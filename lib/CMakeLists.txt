@@ -108,7 +108,11 @@ if(TARGET rac_avx2)
     add_executable(test_rac_longrun c/test_rac_longrun.c)
     target_include_directories(test_rac_longrun PRIVATE c/)
     target_link_libraries(test_rac_longrun rac_avx2 m)
-    # Not in CTest by default (too long). Run manually.
+
+    # Thread scaling benchmark
+    add_executable(test_rac_threads c/test_rac_thread_scaling.c)
+    target_include_directories(test_rac_threads PRIVATE c/)
+    target_link_libraries(test_rac_threads rac_avx2 m)
 endif()
 
 # ── Install ─────────────────────────────────────────────────────────────
