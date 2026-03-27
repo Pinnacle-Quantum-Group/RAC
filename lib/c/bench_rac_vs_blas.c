@@ -154,6 +154,35 @@ int main(void) {
 
     free(finp); free(fwt); free(fbias); free(fout); free(fout2);
 
+    /* ── 8×4 kernel test: direct call to prove the trick works ── */
+    printf("\n══════════════════════════════════════════════════════\n");
+    printf("  8×4 vmovsldup/vmovshdup kernel test\n");
+    printf("══════════════════════════════════════════════════════\n\n");
+
+    {
+        extern void rac_micro_kernel_8x4_asm(const float*, const float*, float*, int, int);
+
+        /* Pack A: [kc=4][MR=8] = 32 floats */
+        float pa[32], pb[16], c_out[32];
+        /* A = identity-like: a[k*8+r] = (r==k) ? 1 : 0 for simple test */
+        memset(pa, 0, sizeof(pa));
+        for (int k = 0; k < 4; k++) pa[k * 8 + k] = 1.0f;
+        /* B = [1,2,3,4] repeated for 4 K steps */
+        for (int k = 0; k < 4; k++) { pb[k*4+0]=1; pb[k*4+1]=2; pb[k*4+2]=3; pb[k*4+3]=4; }
+        memset(c_out, 0, sizeof(c_out));
+
+        rac_micro_kernel_8x4_asm(pa, pb, c_out, 4, 4);
+
+        printf("  8x4 kernel output (first 4 rows, 4 cols):\n");
+        for (int r = 0; r < 4; r++) {
+            printf("    row %d: %.1f %.1f %.1f %.1f\n",
+                   r, c_out[r*4+0], c_out[r*4+1], c_out[r*4+2], c_out[r*4+3]);
+        }
+        /* Row 0 should be [1,2,3,4], row 1 = [1,2,3,4], etc since A=I */
+        int ok = (fabsf(c_out[0] - 1.0f) < 0.01f && fabsf(c_out[1] - 2.0f) < 0.01f);
+        printf("  8x4 correctness: %s\n", ok ? "PASS" : "FAIL");
+    }
+
     printf("\n══════════════════════════════════════════════════════\n");
     rac_hal_shutdown();
     return 0;

@@ -132,7 +132,152 @@ rac_micro_kernel_8x4_asm:
     jnz     .L8x4_kloop
 
 .L8x4_store:
-    /* TODO: 8x4 store needs proper deinterleave — disabled for now */
+    /*
+     * Deinterleave the vmovsldup/vmovshdup accumulators to row-major C.
+     *
+     * ymm4 = {r0c0, r0c1, r2c0, r2c1, r4c0, r4c1, r6c0, r6c1}  (even × B[0:1])
+     * ymm5 = {r1c0, r1c1, r3c0, r3c1, r5c0, r5c1, r7c0, r7c1}  (odd  × B[0:1])
+     * ymm6 = {r0c2, r0c3, r2c2, r2c3, r4c2, r4c3, r6c2, r6c3}  (even × B[2:3])
+     * ymm7 = {r1c2, r1c3, r3c2, r3c3, r5c2, r5c3, r7c2, r7c3}  (odd  × B[2:3])
+     *
+     * Step 1: interleave even/odd to get row pairs with all 4 cols:
+     *   vunpcklps ymm4, ymm6 → {r0c0, r0c2, r0c1, r0c3, r4c0, r4c2, r4c1, r4c3}
+     *   Actually that's wrong order. Let me use vshufps.
+     *
+     * Simpler approach: store to stack, rearrange with scalar moves.
+     * The store runs ONCE per KC iterations — not performance critical.
+     */
+    subq    $128, %rsp
+
+    vmovups %ymm4, (%rsp)       /* even×B01: {r0c0,r0c1, r2c0,r2c1, r4c0,r4c1, r6c0,r6c1} */
+    vmovups %ymm5, 32(%rsp)     /* odd×B01:  {r1c0,r1c1, r3c0,r3c1, r5c0,r5c1, r7c0,r7c1} */
+    vmovups %ymm6, 64(%rsp)     /* even×B23: {r0c2,r0c3, r2c2,r2c3, r4c2,r4c3, r6c2,r6c3} */
+    vmovups %ymm7, 96(%rsp)     /* odd×B23:  {r1c2,r1c3, r3c2,r3c3, r5c2,r5c3, r7c2,r7c3} */
+
+    /* Row 0 (even, pair 0): stack[0..1] = c0,c1; stack[64..65] = c2,c3 */
+    movq    %rdx, %r10
+
+    /* Use SSE movss to do float-granularity adds to C */
+    /* Row 0: even row, pair index 0 → offset 0 in ymm4, offset 0 in ymm6 */
+    vmovss  (%rsp), %xmm0               /* r0c0 */
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  4(%rsp), %xmm0              /* r0c1 */
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  64(%rsp), %xmm0             /* r0c2 */
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  68(%rsp), %xmm0             /* r0c3 */
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 1: odd row, pair index 0 → offset 0 in ymm5, offset 0 in ymm7 */
+    addq    %rcx, %r10
+    vmovss  32(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  36(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  96(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  100(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 2: even, pair index 1 → offset 8 bytes in ymm4/ymm6 */
+    addq    %rcx, %r10
+    vmovss  8(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  12(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  72(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  76(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 3: odd, pair index 1 → offset 8 in ymm5/ymm7 */
+    addq    %rcx, %r10
+    vmovss  40(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  44(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  104(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  108(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 4: even, pair index 2 → offset 16 in ymm4/ymm6 */
+    addq    %rcx, %r10
+    vmovss  16(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  20(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  80(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  84(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 5: odd, pair index 2 */
+    addq    %rcx, %r10
+    vmovss  48(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  52(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  112(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  116(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 6: even, pair index 3 → offset 24 in ymm4/ymm6 */
+    addq    %rcx, %r10
+    vmovss  24(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  28(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  88(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  92(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    /* Row 7: odd, pair index 3 */
+    addq    %rcx, %r10
+    vmovss  56(%rsp), %xmm0
+    vaddss  (%r10), %xmm0, %xmm0
+    vmovss  %xmm0, (%r10)
+    vmovss  60(%rsp), %xmm0
+    vaddss  4(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 4(%r10)
+    vmovss  120(%rsp), %xmm0
+    vaddss  8(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 8(%r10)
+    vmovss  124(%rsp), %xmm0
+    vaddss  12(%r10), %xmm0, %xmm0
+    vmovss  %xmm0, 12(%r10)
+
+    addq    $128, %rsp
     vzeroupper
     ret
 
