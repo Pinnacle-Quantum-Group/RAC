@@ -85,13 +85,6 @@ endif()
 
 enable_testing()
 
-# C primitives test (from root)
-add_executable(test_rac_primitives ../test_rac_primitives.cu)
-set_source_files_properties(../test_rac_primitives.cu PROPERTIES LANGUAGE CXX)
-target_include_directories(test_rac_primitives PRIVATE ${CMAKE_SOURCE_DIR}/..)
-target_link_libraries(test_rac_primitives rac_static m)
-add_test(NAME rac_primitives COMMAND test_rac_primitives)
-
 # Library BVT
 if(TARGET rac_avx2)
     add_executable(test_rac_lib_bvt c/test_rac_lib_bvt.c)

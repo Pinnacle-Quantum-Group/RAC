@@ -56,7 +56,7 @@ int main(void) {
     rac_polar((rac_vec2){3.0f, 4.0f}, &mag, &angle);
     CHECK("polar (3,4) mag ~5", fabsf(mag - 5.0f) < 0.1f);
 
-    CHECK("exp(0) = 1", fabsf(rac_exp(0.0f) - 1.0f) < 0.02f);
+    CHECK("exp(0) = 1", fabsf(rac_exp(0.0f) - 1.0f) < 1e-6f);  /* CPU uses libm expf */
     CHECK("tanh(0) = 0", fabsf(rac_tanh(0.0f)) < 0.02f);
 
     /* ── BVT-4: SGEMM runs ───────────────────────────────────────── */
