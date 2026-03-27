@@ -105,7 +105,7 @@ int rac_has_avx2(void) {
  * These are tuned for Zen's 32KB L1d, 512KB L2, 4MB+ L3/CCX.
  */
 #define DEFAULT_KC 256
-#define DEFAULT_MC 320
+#define DEFAULT_MC 160
 #define DEFAULT_NC 2048
 
 /* ── Pack A[mc×kc] → column-panel layout (SIMD-accelerated) ── */
