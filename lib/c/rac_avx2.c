@@ -79,27 +79,30 @@ int rac_has_avx2(void) {
  * Packing eliminates TLB misses and enables hardware prefetch.
  */
 
-/* Micro-kernel shape: 8×8 (OpenBLAS-informed)
- * MR=8: one vmovups loads all 8 A values
- * NR=8: one vmovups loads all 8 B values
- * 8 accumulators, 1 B load, 8 broadcasts per K step
- * Clean store: each accumulator IS one row of C (no deinterleave)
+/* Micro-kernel shape: 8x4 — matches OpenBLAS Zen SGEMM exactly.
+ * MR=8: vmovsldup/vmovshdup loads 8 A values, split even/odd
+ * NR=4: 2 x vbroadcastsd loads 4 B values as paired broadcasts
+ * 4 accumulators (ymm4-ymm7), 4 FMAs per K step
+ *
+ * The fast path for small matrices uses a separate 8x8 kernel
+ * (broadcast-A stream-B, no packing).
  */
 #define MR 8     /* rows of C per micro-kernel */
-#define NR 8     /* columns of C per micro-kernel (1 x __m256) */
+#define NR 4     /* columns of C per micro-kernel (OpenBLAS Zen) */
+
+/* For the small-matrix fast path (no packing), use 8x8 tiles */
+#define FAST_NR 8
 
 /*
- * Default cache tile sizes.
- * KC: B micro-panel [KC × NR] must fit in L1d alongside A reads.
- *     L1d=32KB (Zen3): KC*NR*4 + MR*KC*4 ≤ 32K
- *     KC*(16+6)*4 ≤ 32768 → KC ≤ 372. Use 128 for safety + prefetch room.
- * MC: packed_A [MC × KC] fits in L2.
- *     L2=512KB (Zen3): MC*KC*4 ≤ 512K → MC ≤ 1024. Use 384.
- * NC: packed_B [KC × NC] fits in L3 per-core share.
- *     L3=2MB/core (Zen3): KC*NC*4 ≤ 2M → NC ≤ 4096. Use 2048.
+ * Cache tile sizes from OpenBLAS param.h ZEN section (x86_64):
+ *   SGEMM_DEFAULT_P = 320 (MC)
+ *   SGEMM_DEFAULT_Q = 320 (KC)
+ *   SGEMM_DEFAULT_R = sgemm_r (NC, runtime — we use 2048)
+ *
+ * These are tuned for Zen's 32KB L1d, 512KB L2, 4MB+ L3/CCX.
  */
-#define DEFAULT_KC 128
-#define DEFAULT_MC 384
+#define DEFAULT_KC 320
+#define DEFAULT_MC 320
 #define DEFAULT_NC 2048
 
 /* ── Pack A[mc×kc] → column-panel layout (SIMD-accelerated) ── */
