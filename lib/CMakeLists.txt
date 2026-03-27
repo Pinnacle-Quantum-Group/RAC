@@ -55,7 +55,7 @@ if(RAC_AVX2)
 
     if(HAS_AVX2 AND HAS_FMA)
         enable_language(ASM)
-        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c c/rac_hal.c c/rac_zen3_kern.S)
+        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c c/rac_hal.c c/rac_zen3_kern.S c/rac_avx512_kern.S)
         target_include_directories(rac_avx2 PUBLIC c/)
         target_compile_options(rac_avx2 PRIVATE -O3 -mavx2 -mfma -march=native -Wall)
         target_link_libraries(rac_avx2 m)
