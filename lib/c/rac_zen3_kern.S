@@ -133,151 +133,77 @@ rac_micro_kernel_8x4_asm:
 
 .L8x4_store:
     /*
-     * Deinterleave the vmovsldup/vmovshdup accumulators to row-major C.
+     * SIMD shuffle store — OpenBLAS-style deinterleave.
+     * Zero stack spills, 8 extracts + 8 shuffles + 16 load/store = 32 insns
+     * (replaces 32 scalar vaddss + 4 ymm spills to stack).
      *
-     * ymm4 = {r0c0, r0c1, r2c0, r2c1, r4c0, r4c1, r6c0, r6c1}  (even × B[0:1])
-     * ymm5 = {r1c0, r1c1, r3c0, r3c1, r5c0, r5c1, r7c0, r7c1}  (odd  × B[0:1])
-     * ymm6 = {r0c2, r0c3, r2c2, r2c3, r4c2, r4c3, r6c2, r6c3}  (even × B[2:3])
-     * ymm7 = {r1c2, r1c3, r3c2, r3c3, r5c2, r5c3, r7c2, r7c3}  (odd  × B[2:3])
-     *
-     * Step 1: interleave even/odd to get row pairs with all 4 cols:
-     *   vunpcklps ymm4, ymm6 → {r0c0, r0c2, r0c1, r0c3, r4c0, r4c2, r4c1, r4c3}
-     *   Actually that's wrong order. Let me use vshufps.
-     *
-     * Simpler approach: store to stack, rearrange with scalar moves.
-     * The store runs ONCE per KC iterations — not performance critical.
+     * Step 1: Extract 128-bit lanes from the 4 YMM accumulators.
+     *   Each xmm holds two rows interleaved as 64-bit pairs.
      */
-    subq    $128, %rsp
+    vextractf128 $0, %ymm4, %xmm8      /* {r0c0, r0c1, r2c0, r2c1} */
+    vextractf128 $1, %ymm4, %xmm9      /* {r4c0, r4c1, r6c0, r6c1} */
+    vextractf128 $0, %ymm5, %xmm10     /* {r1c0, r1c1, r3c0, r3c1} */
+    vextractf128 $1, %ymm5, %xmm11     /* {r5c0, r5c1, r7c0, r7c1} */
+    vextractf128 $0, %ymm6, %xmm12     /* {r0c2, r0c3, r2c2, r2c3} */
+    vextractf128 $1, %ymm6, %xmm13     /* {r4c2, r4c3, r6c2, r6c3} */
+    vextractf128 $0, %ymm7, %xmm14     /* {r1c2, r1c3, r3c2, r3c3} */
+    vextractf128 $1, %ymm7, %xmm15     /* {r5c2, r5c3, r7c2, r7c3} */
 
-    vmovups %ymm4, (%rsp)       /* even×B01: {r0c0,r0c1, r2c0,r2c1, r4c0,r4c1, r6c0,r6c1} */
-    vmovups %ymm5, 32(%rsp)     /* odd×B01:  {r1c0,r1c1, r3c0,r3c1, r5c0,r5c1, r7c0,r7c1} */
-    vmovups %ymm6, 64(%rsp)     /* even×B23: {r0c2,r0c3, r2c2,r2c3, r4c2,r4c3, r6c2,r6c3} */
-    vmovups %ymm7, 96(%rsp)     /* odd×B23:  {r1c2,r1c3, r3c2,r3c3, r5c2,r5c3, r7c2,r7c3} */
-
-    /* Row 0 (even, pair 0): stack[0..1] = c0,c1; stack[64..65] = c2,c3 */
+    /*
+     * Step 2+3: Combine col pairs into row vectors, add to C, store.
+     *   vmovlhps grabs low 64 bits of both sources  → row with even pair index
+     *   vshufpd $3 grabs high 64 bits of both sources → row with odd pair index
+     *   (vshufpd $3 = select bit1 from src2 high, bit0 from src1 high)
+     */
     movq    %rdx, %r10
 
-    /* Use SSE movss to do float-granularity adds to C */
-    /* Row 0: even row, pair index 0 → offset 0 in ymm4, offset 0 in ymm6 */
-    vmovss  (%rsp), %xmm0               /* r0c0 */
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  4(%rsp), %xmm0              /* r0c1 */
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  64(%rsp), %xmm0             /* r0c2 */
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  68(%rsp), %xmm0             /* r0c3 */
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    /* Row 0: low(xmm8){r0c0,r0c1} + low(xmm12){r0c2,r0c3} */
+    vmovlhps  %xmm12, %xmm8, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 1: odd row, pair index 0 → offset 0 in ymm5, offset 0 in ymm7 */
+    /* Row 1: low(xmm10){r1c0,r1c1} + low(xmm14){r1c2,r1c3} */
     addq    %rcx, %r10
-    vmovss  32(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  36(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  96(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  100(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vmovlhps  %xmm14, %xmm10, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 2: even, pair index 1 → offset 8 bytes in ymm4/ymm6 */
+    /* Row 2: high(xmm8){r2c0,r2c1} + high(xmm12){r2c2,r2c3} */
     addq    %rcx, %r10
-    vmovss  8(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  12(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  72(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  76(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vshufpd $3, %xmm12, %xmm8, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 3: odd, pair index 1 → offset 8 in ymm5/ymm7 */
+    /* Row 3: high(xmm10){r3c0,r3c1} + high(xmm14){r3c2,r3c3} */
     addq    %rcx, %r10
-    vmovss  40(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  44(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  104(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  108(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vshufpd $3, %xmm14, %xmm10, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 4: even, pair index 2 → offset 16 in ymm4/ymm6 */
+    /* Row 4: low(xmm9){r4c0,r4c1} + low(xmm13){r4c2,r4c3} */
     addq    %rcx, %r10
-    vmovss  16(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  20(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  80(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  84(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vmovlhps  %xmm13, %xmm9, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 5: odd, pair index 2 */
+    /* Row 5: low(xmm11){r5c0,r5c1} + low(xmm15){r5c2,r5c3} */
     addq    %rcx, %r10
-    vmovss  48(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  52(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  112(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  116(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vmovlhps  %xmm15, %xmm11, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 6: even, pair index 3 → offset 24 in ymm4/ymm6 */
+    /* Row 6: high(xmm9){r6c0,r6c1} + high(xmm13){r6c2,r6c3} */
     addq    %rcx, %r10
-    vmovss  24(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  28(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  88(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  92(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vshufpd $3, %xmm13, %xmm9, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    /* Row 7: odd, pair index 3 */
+    /* Row 7: high(xmm11){r7c0,r7c1} + high(xmm15){r7c2,r7c3} */
     addq    %rcx, %r10
-    vmovss  56(%rsp), %xmm0
-    vaddss  (%r10), %xmm0, %xmm0
-    vmovss  %xmm0, (%r10)
-    vmovss  60(%rsp), %xmm0
-    vaddss  4(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 4(%r10)
-    vmovss  120(%rsp), %xmm0
-    vaddss  8(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 8(%r10)
-    vmovss  124(%rsp), %xmm0
-    vaddss  12(%r10), %xmm0, %xmm0
-    vmovss  %xmm0, 12(%r10)
+    vshufpd $3, %xmm15, %xmm11, %xmm0
+    vaddps  (%r10), %xmm0, %xmm0
+    vmovups %xmm0, (%r10)
 
-    addq    $128, %rsp
     vzeroupper
     ret
 
