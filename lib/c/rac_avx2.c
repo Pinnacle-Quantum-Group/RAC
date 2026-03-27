@@ -163,14 +163,23 @@ static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int 
     for (int j = 0; j < nc; j += panel_nr) {
         int nr = ((j + panel_nr) <= nc) ? panel_nr : (nc - j);
 
-        if (nr == panel_nr && panel_nr == NR) {
-            /* Full NR=4 panel: 1 × movups (128-bit) per K row (contiguous in B) */
+        if (nr == panel_nr && panel_nr == 8) {
+            /* Full NR=8 panel: 256-bit load/store */
             for (int k = 0; k < kc; k++) {
                 const float *src = &B[(K_start + k) * ldb + N_start + j];
                 if (k + 1 < kc)
                     _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
                 _mm256_storeu_ps(packed, _mm256_loadu_ps(src));
-                packed += NR;
+                packed += 8;
+            }
+        } else if (nr == panel_nr && panel_nr == 4) {
+            /* Full NR=4 panel: 128-bit load/store */
+            for (int k = 0; k < kc; k++) {
+                const float *src = &B[(K_start + k) * ldb + N_start + j];
+                if (k + 1 < kc)
+                    _mm_prefetch((const char*)&B[(K_start + k + 1) * ldb + N_start + j], _MM_HINT_T0);
+                _mm_storeu_ps(packed, _mm_loadu_ps(src));
+                packed += 4;
             }
         } else if (nr == panel_nr) {
             /* Full panel but NR != 16 (e.g. NR=32 for AVX-512): use memcpy */
@@ -234,18 +243,22 @@ extern void rac_micro_kernel_8x4_asm(
 
 /* Runtime detection: which assembly kernel to use */
 static int _use_avx512_kern = -1;  /* -1=unset, 0=avx2, 1=avx512 */
-static int _active_NR = NR;        /* 4 for AVX2 (OpenBLAS Zen shape) */
+static int _use_8x4 = 0;          /* 0=8x8 (default), 1=8x4 (OpenBLAS shape) */
+static int _active_NR = NR;       /* 8 default, 4 when _use_8x4 */
 
 static void _detect_best_kernel(void) {
     if (_use_avx512_kern >= 0) return;
-    /*
-     * AVX-512 kernel disabled pending further validation.
-     * The 6x32 assembly kernel has correctness issues on some Intel SKUs.
-     * AVX2 6x16 assembly is the production path for now.
-     * TODO: validate AVX-512 on Icelake, Sapphire Rapids, Zen4+
-     */
     _use_avx512_kern = 0;
-    _active_NR = NR;  /* 4 (OpenBLAS Zen shape) */
+
+    /* RAC_KERNEL=8x4 to select OpenBLAS-matched vmovsldup kernel */
+    const char *env = getenv("RAC_KERNEL");
+    if (env && (strcmp(env, "8x4") == 0 || strcmp(env, "4") == 0)) {
+        _use_8x4 = 1;
+        _active_NR = 4;
+    } else {
+        _use_8x4 = 0;
+        _active_NR = NR;  /* 8 */
+    }
 }
 
 /* ── C fallback micro-kernel (for edge tiles with mr < MR or nr < NR) ── */
@@ -433,9 +446,12 @@ rac_status rac_sgemm_avx2(
                             float *pa = &packed_a[(ir / MR) * kc * MR];
                             float *c_ptr = &C[(ic + ir) * N + (jc + jr)];
 
-                            if (mr == MR && nr == NR && alpha == 1.0f) {
-                                /* Full 8x4 tile: OpenBLAS Zen assembly micro-kernel */
-                                rac_micro_kernel_8x8_asm(pa, pb, c_ptr, N, kc);
+                            if (mr == MR && nr >= active_nr && alpha == 1.0f) {
+                                if (_use_8x4) {
+                                    rac_micro_kernel_8x4_asm(pa, pb, c_ptr, N, kc);
+                                } else {
+                                    rac_micro_kernel_8x8_asm(pa, pb, c_ptr, N, kc);
+                                }
                                 _asm_calls++;
                             } else {
                                 /* Edge or non-unit alpha: C fallback */
