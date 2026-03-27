@@ -327,7 +327,7 @@ rac_status rac_sgemm_avx2(
      * For M*N < 256*256, the packing cost dominates.
      * Use direct MR×NR micro-tiled loop (no packing, no GotoBLAS).
      */
-    if ((long long)M * N <= 65536) {
+    if ((long long)M * N <= 262144) {  /* up to 512x512: fast path beats packing */
         if (beta == 0.0f) memset(C, 0, (size_t)M * N * sizeof(float));
         else if (beta != 1.0f) for (int i = 0; i < M * N; i++) C[i] *= beta;
 
