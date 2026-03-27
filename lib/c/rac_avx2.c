@@ -327,7 +327,7 @@ rac_status rac_sgemm_avx2(
      * For M*N < 256*256, the packing cost dominates.
      * Use direct MR×NR micro-tiled loop (no packing, no GotoBLAS).
      */
-    if ((long long)M * N <= 262144) {  /* up to 512x512: fast path beats packing */
+    if ((long long)M * N <= 262144) {  /* up to 512x512: fast path (no packing) */
         if (beta == 0.0f) memset(C, 0, (size_t)M * N * sizeof(float));
         else if (beta != 1.0f) for (int i = 0; i < M * N; i++) C[i] *= beta;
 
@@ -344,6 +344,7 @@ rac_status rac_sgemm_avx2(
             return RAC_OK;
         }
 
+        /* Direct micro-tiled fast path: no packing, straight FMA loop */
         #pragma omp parallel for schedule(dynamic, 2)
         for (int i0 = 0; i0 < M; i0 += MR) {
             int mr = ((i0 + MR) <= M) ? MR : (M - i0);
@@ -355,7 +356,6 @@ rac_status rac_sgemm_avx2(
                     acc[r][1] = _mm256_setzero_ps();
                 }
                 for (int k = 0; k < K; k++) {
-                    /* N >= 8 guaranteed (scalar path handles N < 8 above) */
                     __m256 b0 = _mm256_loadu_ps(&B[k*N+j0]);
                     __m256 b1 = (nr >= 16) ? _mm256_loadu_ps(&B[k*N+j0+8]) : _mm256_setzero_ps();
                     for (int r = 0; r < mr; r++) {
