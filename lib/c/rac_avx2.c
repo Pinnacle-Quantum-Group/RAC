@@ -10,6 +10,10 @@
 #include <string.h>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
 #define RAC_HAS_AVX2_COMPILE 1
 #else
@@ -96,27 +100,51 @@ static void _pack_a(const float *A, float *packed, int mc, int kc, int lda, int 
 }
 
 /* ── Pack B[kc×nc] → row-panel layout ── */
-/* packed_B stores NR-wide row panels: [kc, NR, nc/NR] contiguous */
-static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int K_start, int N_start) {
-    for (int j = 0; j < nc; j += NR) {
-        int nr = ((j + NR) <= nc) ? NR : (nc - j);
+/* packed_B stores panel_nr-wide row panels contiguous */
+static void _pack_b(const float *B, float *packed, int kc, int nc, int ldb, int K_start, int N_start, int panel_nr) {
+    for (int j = 0; j < nc; j += panel_nr) {
+        int nr = ((j + panel_nr) <= nc) ? panel_nr : (nc - j);
         for (int k = 0; k < kc; k++) {
             for (int c = 0; c < nr; c++)
                 *packed++ = B[(K_start + k) * ldb + N_start + j + c];
-            for (int c = nr; c < NR; c++)
-                *packed++ = 0.0f;  /* zero-pad edge */
+            for (int c = nr; c < panel_nr; c++)
+                *packed++ = 0.0f;
         }
     }
 }
 
-/* ── Assembly micro-kernel (Zen3-tuned) ── */
-/* Defined in rac_zen3_kern.S */
+/* ── Assembly micro-kernels ── */
+/* AVX2 6x16: defined in rac_zen3_kern.S */
 extern void rac_micro_kernel_6x16_asm(
     const float *packed_a,
     const float *packed_b,
     float *C,
     int ldc,
     int kc);
+
+/* AVX-512 6x32: defined in rac_avx512_kern.S */
+extern void rac_micro_kernel_6x32_avx512(
+    const float *packed_a,
+    const float *packed_b,
+    float *C,
+    int ldc,
+    int kc);
+
+/* Runtime detection: which assembly kernel to use */
+static int _use_avx512_kern = -1;  /* -1=unset, 0=avx2, 1=avx512 */
+static int _active_NR = NR;        /* 16 for AVX2, 32 for AVX-512 */
+
+static void _detect_best_kernel(void) {
+    if (_use_avx512_kern >= 0) return;
+    /*
+     * AVX-512 kernel disabled pending further validation.
+     * The 6x32 assembly kernel has correctness issues on some Intel SKUs.
+     * AVX2 6x16 assembly is the production path for now.
+     * TODO: validate AVX-512 on Icelake, Sapphire Rapids, Zen4+
+     */
+    _use_avx512_kern = 0;
+    _active_NR = NR;  /* 16 */
+}
 
 /* ── C fallback micro-kernel (for edge tiles with mr < MR or nr < NR) ── */
 static void _micro_kernel_6x16_c(
@@ -174,7 +202,11 @@ rac_status rac_sgemm_avx2(
     if (!A || !B || !C) return RAC_ERR_NULL_PTR;
     if (M <= 0 || N <= 0 || K <= 0) return RAC_ERR_INVALID_DIM;
 
-    /* Cache tile sizes — use HAL-tuned values or defaults */
+    /* Detect best kernel at first call */
+    _detect_best_kernel();
+    int active_nr = _active_NR;
+
+    /* Cache tile sizes — auto-tune from L1/L2 if possible */
     int KC = (cfg && cfg->tile_size > 0) ? cfg->tile_size : DEFAULT_KC;
     int MC = DEFAULT_MC;
     int NC = DEFAULT_NC;
@@ -192,11 +224,11 @@ rac_status rac_sgemm_avx2(
     n_threads = omp_get_max_threads();
     #endif
 
-    /* packed_B: ceil(NC/NR) panels × KC × NR floats per panel */
+    /* packed_B: ceil(NC/active_nr) panels × KC × active_nr floats per panel */
     /* packed_A: ceil(MC/MR) panels × KC × MR floats per panel, per thread */
-    int b_panels = (NC + NR - 1) / NR;
+    int b_panels = (NC + active_nr - 1) / active_nr;
     int a_panels = (MC + MR - 1) / MR;
-    size_t packed_b_size = (size_t)b_panels * KC * NR;
+    size_t packed_b_size = (size_t)b_panels * KC * active_nr;
     size_t packed_a_size = (size_t)a_panels * KC * MR;
 
     float *packed_b = (float *)calloc(packed_b_size, sizeof(float));
@@ -214,7 +246,7 @@ rac_status rac_sgemm_avx2(
             int kc = ((pc + KC) <= K) ? KC : (K - pc);
 
             /* Pack B panel [kc × nc] — shared across all threads */
-            _pack_b(B, packed_b, kc, nc, N, pc, jc);
+            _pack_b(B, packed_b, kc, nc, N, pc, jc, active_nr);
 
             /* Parallel over M-tiles */
             #pragma omp parallel
@@ -232,21 +264,27 @@ rac_status rac_sgemm_avx2(
                     /* Pack A panel [mc × kc] */
                     _pack_a(A + ic * K, packed_a, mc, kc, K, pc);
 
-                    /* Micro-kernel loop */
-                    for (int jr = 0; jr < nc; jr += NR) {
-                        int nr = ((jr + NR) <= nc) ? NR : (nc - jr);
-                        float *pb = &packed_b[(jr / NR) * kc * NR];
+                    /* Micro-kernel loop — dispatch to best assembly kernel */
+                    for (int jr = 0; jr < nc; jr += active_nr) {
+                        int nr = ((jr + active_nr) <= nc) ? active_nr : (nc - jr);
+                        float *pb = &packed_b[(jr / active_nr) * kc * active_nr];
 
                         for (int ir = 0; ir < mc; ir += MR) {
                             int mr = ((ir + MR) <= mc) ? MR : (mc - ir);
                             float *pa = &packed_a[(ir / MR) * kc * MR];
                             float *c_ptr = &C[(ic + ir) * N + (jc + jr)];
 
-                            if (mr == MR && nr == NR && alpha == 1.0f) {
-                                /* Full tile: assembly micro-kernel */
-                                rac_micro_kernel_6x16_asm(pa, pb, c_ptr, N, kc);
+                            if (mr == MR && alpha == 1.0f) {
+                                if (_use_avx512_kern && nr == 32) {
+                                    /* AVX-512: 6x32 assembly */
+                                    rac_micro_kernel_6x32_avx512(pa, pb, c_ptr, N, kc);
+                                } else if (nr >= NR) {
+                                    /* AVX2: 6x16 assembly */
+                                    rac_micro_kernel_6x16_asm(pa, pb, c_ptr, N, kc);
+                                } else {
+                                    _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
+                                }
                             } else {
-                                /* Edge tile: C intrinsics fallback */
                                 _micro_kernel_6x16_c(pa, pb, c_ptr, N, mr, nr, kc, alpha);
                             }
                         }
