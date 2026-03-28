@@ -42,12 +42,15 @@ torch::Tensor rac_matmul_forward(torch::Tensor A, torch::Tensor B) {
     B = B.contiguous();
 
     int M = A.size(0), K = A.size(1), N = B.size(1);
-    auto C = torch::empty({M, N}, A.options());
+
+    torch::cuda::synchronize();
+    auto C = torch::zeros({M, N}, A.options());
 
     rac_launch_nn(
         A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(),
         M, N, K, 1.0f, 0.0f, _get_stream());
 
+    torch::cuda::synchronize();
     return C;
 }
 
@@ -71,12 +74,18 @@ torch::Tensor rac_linear_forward(
     auto weight_t = weight.t().contiguous();
     int M = input_2d.size(0);
 
-    auto output = torch::empty({M, out_features}, input_2d.options());
+    /* Sync to ensure weight transpose is complete before kernel reads it */
+    torch::cuda::synchronize();
+
+    auto output = torch::zeros({M, out_features}, input_2d.options());
 
     rac_launch_nn(
         input_2d.data_ptr<float>(), weight_t.data_ptr<float>(),
         output.data_ptr<float>(),
         M, out_features, in_features, 1.0f, 0.0f, _get_stream());
+
+    /* Sync after kernel to ensure output is ready */
+    torch::cuda::synchronize();
 
     if (bias.defined() && bias.numel() > 0)
         output.add_(bias);
