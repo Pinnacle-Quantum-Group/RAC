@@ -96,6 +96,82 @@ void rac_matmul_small(
     }
 }
 
+/* ── Small tiled NT kernel (B transposed) ──────────────────────────── */
+
+__global__
+void rac_matmul_small_nt(
+    const float* __restrict__ A,
+    const float* __restrict__ B,   /* [N, K] row-major, used transposed */
+    float*       __restrict__ C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    __shared__ float sA[TILE_S][TILE_S];
+    __shared__ float sB[TILE_S][TILE_S];
+
+    int row = blockIdx.y * TILE_S + threadIdx.y;
+    int col = blockIdx.x * TILE_S + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE_S) {
+        int aCol = t + threadIdx.x;
+        int bRow = t + threadIdx.y;
+        sA[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;
+        sB[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[col * K + bRow] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_S; i++)
+            acc = fmaf(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        if (beta != 0.0f)
+            C[row * N + col] = fmaf(alpha, acc, beta * C[row * N + col]);
+        else
+            C[row * N + col] = alpha * acc;
+    }
+}
+
+/* ── Small tiled TN kernel (A transposed) ──────────────────────────── */
+
+__global__
+void rac_matmul_small_tn(
+    const float* __restrict__ A,   /* [K, M] row-major, used transposed */
+    const float* __restrict__ B,   /* [K, N] */
+    float*       __restrict__ C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    __shared__ float sA[TILE_S][TILE_S];
+    __shared__ float sB[TILE_S][TILE_S];
+
+    int row = blockIdx.y * TILE_S + threadIdx.y;
+    int col = blockIdx.x * TILE_S + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE_S) {
+        int aCol = t + threadIdx.x;
+        int bRow = t + threadIdx.y;
+        sA[threadIdx.y][threadIdx.x] = (row < M && aCol < K) ? A[aCol * M + row] : 0.0f;
+        sB[threadIdx.y][threadIdx.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_S; i++)
+            acc = fmaf(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        if (beta != 0.0f)
+            C[row * N + col] = fmaf(alpha, acc, beta * C[row * N + col]);
+        else
+            C[row * N + col] = alpha * acc;
+    }
+}
+
 /* ── Register micro-tiled kernel (NN: A normal, B normal) ─────────── */
 
 __global__
@@ -579,10 +655,9 @@ static void _launch_nt(
     cudaStream_t stream)
 {
     if ((long long)M * N < 4096) {
-        /* For small sizes, fall back to simple kernel with explicit transpose */
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
-        rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        rac_matmul_small_nt<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
         RAC_KERNEL_CHECK();
     } else {
         dim3 block(BN/TN, BM/TM);
@@ -600,7 +675,7 @@ static void _launch_tn(
     if ((long long)M * N < 4096) {
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
-        rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        rac_matmul_small_tn<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
         RAC_KERNEL_CHECK();
     } else {
         dim3 block(BN/TN, BM/TM);
