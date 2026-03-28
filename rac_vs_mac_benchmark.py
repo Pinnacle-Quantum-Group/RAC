@@ -25,8 +25,9 @@ from collections import defaultdict
 
 # ── Energy measurement backend ──────────────────────────────────────────────
 
-ENERGY_BACKEND = None  # 'nvml', 'hwmon', 'rocm', or None
+ENERGY_BACKEND = None  # 'nvml', 'hwmon', 'amdsmi', 'rocm', or None
 _hwmon_energy_path = None  # sysfs path for AMD GPU energy counter
+_amdsmi_handle = None
 
 try:
     import pynvml
@@ -51,7 +52,19 @@ if ENERGY_BACKEND is None:
             except Exception:
                 pass
 
-# Fallback: rocm-smi for power sampling
+# AMD GPU: try amdsmi Python library (ships with ROCm 6+)
+if ENERGY_BACKEND is None:
+    try:
+        import amdsmi
+        amdsmi.amdsmi_init()
+        handles = amdsmi.amdsmi_get_processor_handles()
+        if handles:
+            _amdsmi_handle = handles[0]
+            ENERGY_BACKEND = 'amdsmi'
+    except Exception:
+        pass
+
+# Fallback: rocm-smi CLI for power sampling
 if ENERGY_BACKEND is None:
     try:
         import subprocess
@@ -66,7 +79,6 @@ def gpu_energy_uj():
     """Return cumulative GPU energy in microjoules, or 0 if unavailable."""
     if ENERGY_BACKEND == 'nvml':
         try:
-            # nvml returns millijoules
             return pynvml.nvmlDeviceGetTotalEnergyConsumption(_nvml_handle) * 1000
         except Exception:
             return 0
@@ -74,6 +86,15 @@ def gpu_energy_uj():
         try:
             with open(_hwmon_energy_path) as f:
                 return int(f.read().strip())
+        except Exception:
+            return 0
+    if ENERGY_BACKEND == 'amdsmi':
+        try:
+            info = amdsmi.amdsmi_get_energy_count(_amdsmi_handle)
+            # Returns dict with 'energy_accumulator' (counter) and 'counter_resolution' (uJ per tick)
+            if isinstance(info, dict):
+                return info.get('energy_accumulator', 0) * info.get('counter_resolution', 1)
+            return 0
         except Exception:
             return 0
     return 0
@@ -93,15 +114,30 @@ def gpu_power_w():
                 return int(f.read().strip()) / 1e6  # microwatts → watts
         except Exception:
             return 0
+    if ENERGY_BACKEND == 'amdsmi':
+        try:
+            info = amdsmi.amdsmi_get_power_info(_amdsmi_handle)
+            if isinstance(info, dict):
+                # Try current_socket_power or average_socket_power (watts)
+                for key in ('current_socket_power', 'average_socket_power'):
+                    if key in info and info[key] > 0:
+                        return float(info[key])
+            return 0
+        except Exception:
+            return 0
     if ENERGY_BACKEND == 'rocm':
         try:
-            import subprocess, json
-            r = subprocess.run(['rocm-smi', '--showpower', '--json'],
+            import subprocess
+            # Try plain text parsing first (more reliable across versions)
+            r = subprocess.run(['rocm-smi', '--showpower'],
                                capture_output=True, text=True)
-            data = json.loads(r.stdout)
-            for card in data.values():
-                if isinstance(card, dict) and 'Average Graphics Package Power' in card:
-                    return float(card['Average Graphics Package Power'].replace(' W', ''))
+            if r.returncode == 0:
+                import re
+                # Match patterns like "123.456 W" or "Average Graphics Package Power (W): 123.456"
+                for line in r.stdout.splitlines():
+                    m = re.search(r'(\d+\.?\d*)\s*W', line)
+                    if m:
+                        return float(m.group(1))
         except Exception:
             return 0
     return 0
@@ -209,14 +245,12 @@ def benchmark_layer(layer, x, n_warmup=10, n_iters=100):
     total_time_s = start_event.elapsed_time(end_event) / 1000.0
 
     if (e1 - e0) > 0:
-        # Hardware energy counter available (hwmon or nvml)
+        # Hardware energy counter available (hwmon, nvml, or amdsmi)
         energy_mj = (e1 - e0) / 1000.0 / n_iters  # microjoules → millijoules per iter
-    elif ENERGY_BACKEND == 'rocm':
+    else:
         # Fallback: estimate from average power × time
         power = gpu_power_w()
         energy_mj = (power * total_time_s * 1000.0) / n_iters if power > 0 else 0
-    else:
-        energy_mj = 0
 
     return latency_ms, energy_mj, out
 
@@ -247,7 +281,11 @@ def main():
     print(f"  Compute:         {props.major}.{props.minor}")
     print(f"  SMs:             {props.multi_processor_count}")
     print(f"  Memory:          {props.total_memory // (1024**2)} MB")
-    print(f"  Energy backend:  {ENERGY_BACKEND or 'none'}")
+    _init_power = gpu_power_w()
+    _init_energy = gpu_energy_uj()
+    _energy_mode = 'counter' if _init_energy > 0 else ('power sampling' if _init_power > 0 else 'unavailable')
+    print(f"  Energy backend:  {ENERGY_BACKEND or 'none'} ({_energy_mode}"
+          f"{f', {_init_power:.1f}W' if _init_power > 0 else ''})")
     _has_rac_ext = False
     try:
         import rac_cuda_ext
