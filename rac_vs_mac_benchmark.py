@@ -103,11 +103,11 @@ class RACLinearPure(nn.Module):
         w = torch.empty(out_features, in_features)
         nn.init.kaiming_uniform_(w, a=math.sqrt(5))
 
-        # Decompose into magnitude + angle
+        # Decompose into magnitude + angle (FIXED, not learnable for benchmark)
+        # angle = 0 for positive weights, pi for negative
         self.magnitude = nn.Parameter(w.abs())
-        self.angle = nn.Parameter(torch.atan2(torch.zeros_like(w),
-                                               torch.where(w >= 0, torch.ones_like(w),
-                                                           -torch.ones_like(w))))
+        angle = torch.where(w >= 0, torch.zeros_like(w), torch.full_like(w, math.pi))
+        self.register_buffer('angle', angle)  # buffer, not parameter
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
@@ -146,9 +146,8 @@ class RACLinearFused(nn.Module):
         w = torch.empty(out_features, in_features)
         nn.init.kaiming_uniform_(w, a=math.sqrt(5))
         self.magnitude = nn.Parameter(w.abs())
-        self.angle = nn.Parameter(torch.atan2(torch.zeros_like(w),
-                                               torch.where(w >= 0, torch.ones_like(w),
-                                                           -torch.ones_like(w))))
+        angle = torch.where(w >= 0, torch.zeros_like(w), torch.full_like(w, math.pi))
+        self.register_buffer('angle', angle)
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
         self._act_fn = {'relu': F.relu, 'gelu': F.gelu, 'silu': F.silu}.get(activation, lambda x: x)
@@ -248,10 +247,23 @@ def main():
             if mem_needed > props.total_memory * 0.3:
                 continue
 
-            # ── MAC baseline ──
+            # ── Build layers with SAME weights ──
             mac_layer = nn.Linear(in_f, out_f, bias=True).to(device).eval()
             x = torch.randn(batch, in_f, device=device)
 
+            # RAC uses same weights as MAC for fair comparison
+            rac_layer = RACLinearPure(in_f, out_f, bias=True).to(device)
+            with torch.no_grad():
+                # Reconstruct: magnitude * cos(angle) should == mac weight
+                rac_layer.magnitude.copy_(mac_layer.weight.abs())
+                rac_layer.angle.copy_(torch.where(mac_layer.weight >= 0,
+                                                   torch.zeros_like(mac_layer.weight),
+                                                   torch.full_like(mac_layer.weight, math.pi)))
+                if rac_layer.bias is not None:
+                    rac_layer.bias.copy_(mac_layer.bias)
+            rac_layer.eval()
+
+            # ── MAC baseline ──
             lat_mac, energy_mac, out_mac = benchmark_layer(mac_layer, x, n_warmup, n_iters)
 
             ops = 2.0 * batch * in_f * out_f  # FLOPs per matmul
@@ -259,7 +271,6 @@ def main():
             energy_per_op_mac = (energy_mac * 1e6 / ops) if energy_mac > 0 else 0  # nJ
 
             # ── RAC (pure SFU path) ──
-            rac_layer = RACLinearPure(in_f, out_f, bias=True).to(device).eval()
             lat_rac, energy_rac, out_rac = benchmark_layer(rac_layer, x, n_warmup, n_iters)
 
             gflops_rac = ops / (lat_rac * 1e6)
