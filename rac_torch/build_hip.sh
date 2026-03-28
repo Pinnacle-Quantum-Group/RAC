@@ -31,10 +31,11 @@ echo "   rac_kernels.o OK"
 
 # Step 2: Compile pybind11 bindings → .o (g++, no hipcc needed)
 echo "── Compiling PyTorch bindings..."
-g++ -O3 -std=c++17 -fPIC -DUSE_ROCM -c \
+g++ -O3 -std=c++17 -fPIC -DUSE_ROCM -D__HIP_PLATFORM_AMD__ -c \
     -I${TORCH_DIR}/include \
     -I${TORCH_DIR}/include/torch/csrc/api/include \
     -I$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))") \
+    -I/usr/include \
     -D_GLIBCXX_USE_CXX11_ABI=0 \
     rac_torch_bind.cpp \
     -o rac_torch_bind.o
