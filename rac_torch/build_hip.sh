@@ -23,7 +23,6 @@ echo "── Compiling HIP kernels..."
 ${HIPCC} -O3 \
     --offload-arch=${GFX} \
     -fPIC -c \
-    -fgpu-rdc \
     rac_kernels.hip \
     -o rac_kernels.o
 
@@ -45,7 +44,6 @@ echo "   rac_torch_bind.o OK"
 # Step 3: Link everything with hipcc (handles device code + host code)
 echo "── Linking (hipcc handles device + host)..."
 ${HIPCC} --offload-arch=${GFX} \
-    -fgpu-rdc --hip-link \
     -shared \
     rac_kernels.o rac_torch_bind.o \
     -L${TORCH_DIR}/lib \

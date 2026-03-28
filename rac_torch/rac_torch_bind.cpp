@@ -28,11 +28,10 @@ void rac_launch_tn(
     void* stream);
 }
 
-/* Get the raw HIP stream from PyTorch */
+/* Get the raw HIP/CUDA stream from PyTorch */
 static void* _get_stream() {
-    /* PyTorch's current stream, cast to raw pointer */
 #ifdef USE_ROCM
-    return nullptr;  /* default stream — synchronous on HIP */
+    return (void*)c10::hip::getCurrentHIPStream().stream();
 #else
     return (void*)c10::cuda::getCurrentCUDAStream().stream();
 #endif
