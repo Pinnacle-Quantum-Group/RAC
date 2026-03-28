@@ -6,6 +6,12 @@
 #include <torch/extension.h>
 #include <vector>
 
+#ifdef USE_ROCM
+#include <c10/hip/HIPStream.h>
+#else
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 /* Kernel functions from rac_kernels.hip (compiled separately) */
 extern "C" {
 void rac_launch_nn(
@@ -17,7 +23,11 @@ void rac_launch_nn(
 /* Get the raw HIP stream from PyTorch */
 static void* _get_stream() {
     /* PyTorch's current stream, cast to raw pointer */
+#ifdef USE_ROCM
+    return (void*)c10::hip::getCurrentHIPStream().stream();
+#else
     return (void*)c10::cuda::getCurrentCUDAStream().stream();
+#endif
 }
 
 /* ── ATen dispatch ───────────────────────────────────────────────────── */
