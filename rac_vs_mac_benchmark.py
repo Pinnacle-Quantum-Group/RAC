@@ -218,7 +218,7 @@ def main():
     print(f"  Device:          {props.name}")
     print(f"  Compute:         {props.major}.{props.minor}")
     print(f"  SMs:             {props.multi_processor_count}")
-    print(f"  Memory:          {props.total_mem // (1024**2)} MB")
+    print(f"  Memory:          {props.total_memory // (1024**2)} MB")
     print(f"  Energy backend:  {ENERGY_BACKEND or 'none'}")
     print(f"  PyTorch:         {torch.__version__}")
     print("=" * 90)
@@ -245,7 +245,7 @@ def main():
 
             # Skip huge sizes on small GPUs
             mem_needed = batch * in_f * 4 + out_f * in_f * 4 * 2 + batch * out_f * 4
-            if mem_needed > props.total_mem * 0.3:
+            if mem_needed > props.total_memory * 0.3:
                 continue
 
             # ── MAC baseline ──
