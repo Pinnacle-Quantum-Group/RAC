@@ -470,26 +470,36 @@ def main():
             print(f"    Worst RAC+GELU ratio:  {worst_f['speedup_fused']:.2f}x at "
                   f"{worst_f['size']}x{worst_f['size']} batch={worst_f['batch']}")
 
-        # Energy summary
+        # Energy summary — wins/losses like speedup section
         e_results = [r for r in results if r['e_mac'] > 0 and r['e_rac'] > 0]
         if e_results:
-            avg_energy_ratio = np.mean([r['energy_ratio'] for r in e_results])
-            print(f"\n  Energy (RAC vs MAC):")
-            print(f"    Average energy ratio (MAC/RAC): {avg_energy_ratio:.2f}x")
-            if avg_energy_ratio > 1.0:
-                print(f"    RAC uses {(1 - 1/avg_energy_ratio)*100:.1f}% less energy on average")
-            else:
-                print(f"    MAC uses {(1 - avg_energy_ratio)*100:.1f}% less energy on average")
+            e_rac_wins = [r for r in e_results if r['energy_ratio'] > 1.0]
+            print(f"\n  Energy — RAC vs MAC:")
+            print(f"    RAC more efficient at {len(e_rac_wins)}/{len(e_results)} configurations")
+            if e_rac_wins:
+                best_e = max(e_rac_wins, key=lambda r: r['energy_ratio'])
+                print(f"    Best RAC efficiency: {best_e['energy_ratio']:.2f}x at "
+                      f"{best_e['size']}x{best_e['size']} batch={best_e['batch']}")
+            e_rac_losses = [r for r in e_results if r['energy_ratio'] <= 1.0]
+            if e_rac_losses:
+                worst_e = min(e_rac_losses, key=lambda r: r['energy_ratio'])
+                print(f"    Worst RAC efficiency: {worst_e['energy_ratio']:.2f}x at "
+                      f"{worst_e['size']}x{worst_e['size']} batch={worst_e['batch']}")
 
             e_fused = [r for r in results if r['e_mac'] > 0 and r['e_fused'] > 0]
             if e_fused:
-                avg_fused = np.mean([r['energy_ratio_fused'] for r in e_fused])
-                print(f"\n  Energy (RAC+GELU vs MAC):")
-                print(f"    Average energy ratio (MAC/RAC+GELU): {avg_fused:.2f}x")
-                if avg_fused > 1.0:
-                    print(f"    RAC+GELU uses {(1 - 1/avg_fused)*100:.1f}% less energy on average")
-                else:
-                    print(f"    MAC uses {(1 - avg_fused)*100:.1f}% less energy on average")
+                e_fused_wins = [r for r in e_fused if r['energy_ratio_fused'] > 1.0]
+                print(f"\n  Energy — RAC+GELU vs MAC:")
+                print(f"    RAC+GELU more efficient at {len(e_fused_wins)}/{len(e_fused)} configurations")
+                if e_fused_wins:
+                    best_ef = max(e_fused_wins, key=lambda r: r['energy_ratio_fused'])
+                    print(f"    Best RAC+GELU efficiency: {best_ef['energy_ratio_fused']:.2f}x at "
+                          f"{best_ef['size']}x{best_ef['size']} batch={best_ef['batch']}")
+                e_fused_losses = [r for r in e_fused if r['energy_ratio_fused'] <= 1.0]
+                if e_fused_losses:
+                    worst_ef = min(e_fused_losses, key=lambda r: r['energy_ratio_fused'])
+                    print(f"    Worst RAC+GELU efficiency: {worst_ef['energy_ratio_fused']:.2f}x at "
+                          f"{worst_ef['size']}x{worst_ef['size']} batch={worst_ef['batch']}")
         else:
             print(f"\n  Energy measurement: not available (need hwmon sysfs or pynvml)")
 
