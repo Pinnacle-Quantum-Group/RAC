@@ -500,6 +500,10 @@ def main():
                     worst_ef = min(e_fused_losses, key=lambda r: r['energy_ratio_fused'])
                     print(f"    Worst RAC+GELU efficiency: {worst_ef['energy_ratio_fused']:.2f}x at "
                           f"{worst_ef['size']}x{worst_ef['size']} batch={worst_ef['batch']}")
+            print(f"\n  Note: MAC energy does not account for temporary buffer allocations")
+            print(f"  and deallocations (transpose, contiguous copy, GC) that hipBLAS")
+            print(f"  requires. RAC's NT kernel operates on weight memory in-place with")
+            print(f"  no temporaries — its real energy advantage is understated here.")
         else:
             print(f"\n  Energy measurement: not available (need hwmon sysfs or pynvml)")
 
