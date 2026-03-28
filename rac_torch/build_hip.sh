@@ -52,10 +52,11 @@ ${HIPCC} --offload-arch=${GFX} \
 
 echo "   rac_kernels_linked.o OK"
 
-# Step 4: Final link — combine device-linked kernels + PyTorch bindings
+# Step 4: Final link — need BOTH the original .o (host code + symbols)
+#         AND the device-linked .o (GPU fatbin)
 echo "── Final linking..."
 g++ -shared \
-    rac_kernels_linked.o rac_torch_bind.o \
+    rac_kernels.o rac_kernels_linked.o rac_torch_bind.o \
     -L${TORCH_DIR}/lib \
     -L/opt/rocm-7.1.1/lib \
     -ltorch -ltorch_hip -lc10 -lc10_hip -ltorch_python -lamdhip64 \
