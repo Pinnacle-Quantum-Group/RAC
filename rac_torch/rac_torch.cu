@@ -15,6 +15,9 @@
 #ifdef __HIP__
   #include <hip/hip_runtime.h>
   #define RAC_SINCOS(t,s,c) __sincosf(t,s,c)
+  #define cudaStream_t hipStream_t
+  #define cudaSuccess hipSuccess
+  #define cudaGetErrorString hipGetErrorString
 #else
   #include <cuda_runtime.h>
   #define RAC_SINCOS(t,s,c) __sincosf(t,s,c)
@@ -24,10 +27,14 @@
 
 #ifdef __HIP__
   #include <ATen/hip/HIPContext.h>
-  #define at_cuda_getCurrentCUDAStream at::hip::getCurrentHIPStream
+  static inline hipStream_t _rac_get_stream() {
+      return at::hip::getCurrentHIPStream().stream();
+  }
 #else
   #include <ATen/cuda/CUDAContext.h>
-  #define at_cuda_getCurrentCUDAStream at::cuda::getCurrentCUDAStream
+  static inline cudaStream_t _rac_get_stream() {
+      return at::cuda::getCurrentCUDAStream();
+  }
 #endif
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
@@ -532,7 +539,11 @@ void rac_fused_linear_kernel(
 
 /* ── Launch helpers ──────────────────────────────────────────────────── */
 
-#define RAC_KERNEL_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+#ifdef __HIP__
+  #define RAC_KERNEL_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()
+#else
+  #define RAC_KERNEL_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+#endif
 
 static void _launch_nn(
     const float* A, const float* B, float* C,
@@ -626,7 +637,7 @@ torch::Tensor rac_matmul_forward_cuda(
     int M = A.size(0), K = A.size(1), N = B.size(1);
     auto C = torch::empty({M, N}, A.options());
 
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
     _launch_nn(
         A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(),
         M, N, K, 1.0f, 0.0f, stream);
@@ -659,7 +670,7 @@ std::vector<torch::Tensor> rac_matmul_backward_cuda(
     B = B.contiguous();
 
     int M = A.size(0), K = A.size(1), N = B.size(1);
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
 
     /* dA = grad_C[M,N] @ B[K,N]^T → [M,K]  (skip if not needed) */
     torch::Tensor grad_A;
@@ -708,7 +719,7 @@ torch::Tensor rac_linear_forward_cuda(
 
     auto input_2d = input.reshape({-1, in_features}).contiguous();
     int M = input_2d.size(0);
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
 
     /* output = input @ weight^T — use NT kernel (weight is [out, in]) */
     auto output = torch::empty({M, out_features}, input_2d.options());
@@ -749,7 +760,7 @@ std::vector<torch::Tensor> rac_linear_backward_cuda(
     auto go  = grad_output.reshape({-1, out_features}).contiguous();
     auto inp = input.reshape({-1, in_features}).contiguous();
     int M    = inp.size(0);
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
 
     /* grad_input = grad_output @ weight  [M, in_features] */
     auto grad_input = torch::empty({M, in_features}, inp.options());
@@ -808,7 +819,7 @@ torch::Tensor rac_fused_linear_forward_cuda(
     int M = input_2d.size(0);
     int N = out_features;
     int K = in_features;
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
 
     auto output = torch::empty({M, N}, input_2d.options());
 
@@ -865,7 +876,7 @@ std::vector<torch::Tensor> rac_fused_linear_backward_cuda(
     auto inp_flat = input.reshape({-1, in_features}).contiguous();
     auto pre_flat = pre_act.reshape({-1, out_features}).contiguous();
     int M = inp_flat.size(0);
-    auto stream = at_cuda_getCurrentCUDAStream();
+    auto stream = _rac_get_stream();
 
     /* Apply activation gradient element-wise to grad_output */
     /* d_act = grad_output * act'(pre_act) */
