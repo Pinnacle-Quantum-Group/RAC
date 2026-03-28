@@ -287,11 +287,15 @@ def main():
             print(f"{'':>6} {'':>5} {'RAC+GELU':>10} {lat_fused:10.3f} {gflops_fused:12.2f} "
                   f"{energy_fused:10.2f} {energy_per_op_fused:10.4f} {'─':>10}")
 
-            # Speedup
-            speedup = lat_mac / lat_rac if lat_rac > 0 else 0
+            # Speedup ratios (>1 means RAC wins)
+            speedup_rac = lat_mac / lat_rac if lat_rac > 0 else 0
+            speedup_fused = lat_mac / lat_fused if lat_fused > 0 else 0
             energy_ratio = energy_mac / energy_rac if energy_rac > 0 else 0
-            print(f"{'':>6} {'':>5} {'RATIO':>10} {'':>10} {speedup:11.2f}x "
+            energy_ratio_fused = energy_mac / energy_fused if energy_fused > 0 else 0
+            print(f"{'':>6} {'':>5} {'RAC/MAC':>10} {'':>10} {speedup_rac:11.2f}x "
                   f"{'':>10} {energy_ratio:9.2f}x {'':>10}")
+            print(f"{'':>6} {'':>5} {'FUSED/MAC':>10} {'':>10} {speedup_fused:11.2f}x "
+                  f"{'':>10} {energy_ratio_fused:9.2f}x {'':>10}")
             print("─" * 90)
 
             results.append({
@@ -301,8 +305,9 @@ def main():
                 'e_mac': energy_mac, 'e_rac': energy_rac, 'e_fused': energy_fused,
                 'epo_mac': energy_per_op_mac, 'epo_rac': energy_per_op_rac,
                 'epo_fused': energy_per_op_fused,
-                'max_err': max_err, 'mse': mse, 'speedup': speedup,
-                'energy_ratio': energy_ratio,
+                'max_err': max_err, 'mse': mse,
+                'speedup_rac': speedup_rac, 'speedup_fused': speedup_fused,
+                'energy_ratio': energy_ratio, 'energy_ratio_fused': energy_ratio_fused,
             })
 
     # ── Summary ──
@@ -311,19 +316,33 @@ def main():
     print("=" * 90)
 
     if results:
-        # Find crossover points
-        wins_rac = [r for r in results if r['speedup'] > 1.0]
-        wins_mac = [r for r in results if r['speedup'] <= 1.0]
-
-        print(f"\n  RAC wins at {len(wins_rac)}/{len(results)} configurations")
+        # RAC (matmul only) vs MAC
+        wins_rac = [r for r in results if r['speedup_rac'] > 1.0]
+        print(f"\n  RAC vs MAC (Rotate-Accumulate vs Multiply-Accumulate):")
+        print(f"    RAC wins at {len(wins_rac)}/{len(results)} configurations")
         if wins_rac:
-            best = max(wins_rac, key=lambda r: r['speedup'])
-            print(f"  Best RAC speedup: {best['speedup']:.2f}x at "
+            best = max(wins_rac, key=lambda r: r['speedup_rac'])
+            print(f"    Best RAC speedup: {best['speedup_rac']:.2f}x at "
                   f"{best['size']}x{best['size']} batch={best['batch']}")
-        if wins_mac:
-            worst = min(wins_mac, key=lambda r: r['speedup'])
-            print(f"  Worst RAC ratio:  {worst['speedup']:.2f}x at "
+        losses_rac = [r for r in results if r['speedup_rac'] <= 1.0]
+        if losses_rac:
+            worst = min(losses_rac, key=lambda r: r['speedup_rac'])
+            print(f"    Worst RAC ratio:  {worst['speedup_rac']:.2f}x at "
                   f"{worst['size']}x{worst['size']} batch={worst['batch']}")
+
+        # RAC+GELU (fused matmul+activation) vs MAC (matmul only)
+        wins_fused = [r for r in results if r['speedup_fused'] > 1.0]
+        print(f"\n  RAC+GELU vs MAC (fused linear+activation vs matmul-only):")
+        print(f"    RAC+GELU wins at {len(wins_fused)}/{len(results)} configurations")
+        if wins_fused:
+            best_f = max(wins_fused, key=lambda r: r['speedup_fused'])
+            print(f"    Best RAC+GELU speedup: {best_f['speedup_fused']:.2f}x at "
+                  f"{best_f['size']}x{best_f['size']} batch={best_f['batch']}")
+        losses_fused = [r for r in results if r['speedup_fused'] <= 1.0]
+        if losses_fused:
+            worst_f = min(losses_fused, key=lambda r: r['speedup_fused'])
+            print(f"    Worst RAC+GELU ratio:  {worst_f['speedup_fused']:.2f}x at "
+                  f"{worst_f['size']}x{worst_f['size']} batch={worst_f['batch']}")
 
         # Energy summary
         e_results = [r for r in results if r['e_mac'] > 0 and r['e_rac'] > 0]
@@ -348,7 +367,7 @@ def main():
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('RAC vs MAC — Performance & Energy', fontsize=14, fontweight='bold')
+        fig.suptitle('Rotate-Accumulate vs Multiply-Accumulate — Performance', fontsize=14, fontweight='bold')
 
         # Group by batch=32 (largest batch for best GPU utilization)
         b32 = [r for r in results if r['batch'] == 32]
@@ -360,8 +379,8 @@ def main():
 
             # Plot 1: Throughput vs Size
             ax = axes[0][0]
-            ax.plot(szs, [r['gf_mac'] for r in b32], 'b-o', label='MAC (cuBLAS)', linewidth=2)
-            ax.plot(szs, [r['gf_rac'] for r in b32], 'r-s', label='RAC (SFU)', linewidth=2)
+            ax.plot(szs, [r['gf_mac'] for r in b32], 'b-o', label='MAC (hipBLAS)', linewidth=2)
+            ax.plot(szs, [r['gf_rac'] for r in b32], 'r-s', label='RAC', linewidth=2)
             ax.plot(szs, [r['gf_fused'] for r in b32], 'g-^', label='RAC+GELU (fused)', linewidth=2)
             ax.set_xlabel('Matrix Size (N×N)')
             ax.set_ylabel('Throughput (GFLOPS)')
@@ -383,17 +402,23 @@ def main():
             ax.set_xscale('log', base=2)
             ax.set_yscale('log')
 
-            # Plot 3: Speedup (RAC / MAC)
+            # Plot 3: Speedup (RAC & RAC+GELU vs MAC)
             ax = axes[1][0]
-            speedups = [r['speedup'] for r in b32]
-            colors = ['green' if s >= 1.0 else 'red' for s in speedups]
-            ax.bar(range(len(szs)), speedups, color=colors, alpha=0.7)
+            x_pos = np.arange(len(szs))
+            bar_w = 0.35
+            sp_rac = [r['speedup_rac'] for r in b32]
+            sp_fused = [r['speedup_fused'] for r in b32]
+            colors_rac = ['green' if s >= 1.0 else 'red' for s in sp_rac]
+            colors_fused = ['darkgreen' if s >= 1.0 else 'orange' for s in sp_fused]
+            ax.bar(x_pos - bar_w/2, sp_rac, bar_w, color=colors_rac, alpha=0.7, label='RAC')
+            ax.bar(x_pos + bar_w/2, sp_fused, bar_w, color=colors_fused, alpha=0.7, label='RAC+GELU')
             ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1)
-            ax.set_xticks(range(len(szs)))
+            ax.set_xticks(x_pos)
             ax.set_xticklabels([str(s) for s in szs])
             ax.set_xlabel('Matrix Size (N×N)')
-            ax.set_ylabel('Speedup (MAC_time / RAC_time)')
-            ax.set_title('RAC Speedup (>1 = RAC wins)')
+            ax.set_ylabel('Speedup vs MAC (>1 = RAC wins)')
+            ax.set_title('RAC Speedup over MAC')
+            ax.legend()
             ax.grid(True, alpha=0.3)
 
             # Plot 4: Energy per Op
