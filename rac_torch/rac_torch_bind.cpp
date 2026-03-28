@@ -24,8 +24,7 @@ void rac_launch_nn(
 static void* _get_stream() {
     /* PyTorch's current stream, cast to raw pointer */
 #ifdef USE_ROCM
-    /* Use default stream — we call hipDeviceSynchronize after launches */
-    return nullptr;
+    return nullptr;  /* default stream — synchronous on HIP */
 #else
     return (void*)c10::cuda::getCurrentCUDAStream().stream();
 #endif
