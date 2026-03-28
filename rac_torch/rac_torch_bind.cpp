@@ -42,7 +42,7 @@ torch::Tensor rac_matmul_forward(torch::Tensor A, torch::Tensor B) {
     B = B.contiguous();
 
     int M = A.size(0), K = A.size(1), N = B.size(1);
-    auto C = torch::zeros({M, N}, A.options());
+    auto C = torch::empty({M, N}, A.options());
 
     rac_launch_nn(
         A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(),
@@ -71,7 +71,7 @@ torch::Tensor rac_linear_forward(
     auto weight_t = weight.t().contiguous();
     int M = input_2d.size(0);
 
-    auto output = torch::zeros({M, out_features}, input_2d.options());
+    auto output = torch::empty({M, out_features}, input_2d.options());
 
     rac_launch_nn(
         input_2d.data_ptr<float>(), weight_t.data_ptr<float>(),
