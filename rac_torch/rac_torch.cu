@@ -25,7 +25,7 @@
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
 
-/* Small kernel: simple 16x16 tiled */
+/* Tier 1: Small kernel — simple 16x16 tiled (lowest launch overhead) */
 #define TILE_S 16
 
 /* Large kernel: register micro-tiled 4x4 (64x64 block, 256 threads) */
@@ -34,7 +34,15 @@
 #define BK   16
 #define TM   4
 #define TN   4
-/* threads per block: (BN/TN) x (BM/TM) = 16 x 16 = 256 */
+/* Tier 2 threads: (BN/TN) x (BM/TM) = 16 x 16 = 256 */
+
+/* Tier 3: Large kernel — 128x128 micro-8x8 (maximum arithmetic intensity) */
+#define BM8 128
+#define BN8 128
+#define BK8 16
+#define TM8 8
+#define TN8 8
+/* Tier 3 threads: (BN8/TN8) x (BM8/TM8) = 16 x 16 = 256 */
 
 /* ── Small tiled kernel (for M*N < threshold) ───────────────────────── */
 
@@ -323,6 +331,82 @@ void rac_matmul_micro_tn(
     }
 }
 
+/* ── Tier 3: Register micro-tiled 8×8 NN kernel (128×128 blocks) ─────── */
+
+__global__
+void rac_matmul_micro8_nn(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float*       __restrict__ C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    __shared__ float sA8[BK8][BM8];
+    __shared__ float sB8[BK8][BN8];
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int row0 = by * BM8 + ty * TM8;
+    const int col0 = bx * BN8 + tx * TN8;
+    const int tid = ty * (BN8 / TN8) + tx;
+
+    float acc[TM8][TN8];
+    #pragma unroll
+    for (int i = 0; i < TM8; i++)
+        #pragma unroll
+        for (int j = 0; j < TN8; j++)
+            acc[i][j] = 0.0f;
+
+    for (int t = 0; t < K; t += BK8) {
+        #pragma unroll
+        for (int i = 0; i < (BM8 * BK8) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BM8, sm = idx % BM8;
+            int gm = by * BM8 + sm, gk = t + sk;
+            sA8[sk][sm] = (gm < M && gk < K) ? A[gm * K + gk] : 0.0f;
+        }
+        #pragma unroll
+        for (int i = 0; i < (BK8 * BN8) / 256; i++) {
+            int idx = tid + i * 256;
+            int sk = idx / BN8, sn = idx % BN8;
+            int gk = t + sk, gn = bx * BN8 + sn;
+            sB8[sk][sn] = (gk < K && gn < N) ? B[gk * N + gn] : 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK8; kk++) {
+            float a_reg[TM8], b_reg[TN8];
+            #pragma unroll
+            for (int i = 0; i < TM8; i++) a_reg[i] = sA8[kk][ty * TM8 + i];
+            #pragma unroll
+            for (int j = 0; j < TN8; j++) b_reg[j] = sB8[kk][tx * TN8 + j];
+            #pragma unroll
+            for (int i = 0; i < TM8; i++)
+                #pragma unroll
+                for (int j = 0; j < TN8; j++)
+                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM8; i++) {
+        int gm = row0 + i;
+        if (gm >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN8; j++) {
+            int gn = col0 + j;
+            if (gn < N) {
+                if (beta != 0.0f)
+                    C[gm * N + gn] = fmaf(alpha, acc[i][j], beta * C[gm * N + gn]);
+                else
+                    C[gm * N + gn] = alpha * acc[i][j];
+            }
+        }
+    }
+}
+
 /* ── Activation function enum ─────────────────────────────────────────── */
 /*  0=none, 1=relu, 2=gelu, 3=silu                                       */
 
@@ -448,13 +532,23 @@ static void _launch_nn(
     int M, int N, int K, float alpha, float beta,
     cudaStream_t stream)
 {
+    long long volume = (long long)M * N * K;
+
     if ((long long)M * N < 4096) {
+        /* Tier 1: Small — 16×16 tiles, minimal launch overhead */
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
         rac_matmul_small<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
         RAC_KERNEL_CHECK();
+    } else if (M >= 128 && N >= 128 && K >= 128) {
+        /* Tier 3: Large — 128×128 micro-8×8, max arithmetic intensity */
+        dim3 block(BN8/TN8, BM8/TM8);
+        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
+        rac_matmul_micro8_nn<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+        RAC_KERNEL_CHECK();
     } else {
-        dim3 block(BN/TN, BM/TM);  /* 16x16 = 256 threads */
+        /* Tier 2: Medium — 64×64 micro-4×4 */
+        dim3 block(BN/TN, BM/TM);
         dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
         rac_matmul_micro_nn<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
         RAC_KERNEL_CHECK();
