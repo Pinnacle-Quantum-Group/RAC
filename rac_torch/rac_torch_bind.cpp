@@ -18,6 +18,14 @@ void rac_launch_nn(
     const float* A, const float* B, float* C,
     int M, int N, int K, float alpha, float beta,
     void* stream);  /* hipStream_t is just a void* at ABI level */
+void rac_launch_nt(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, float alpha, float beta,
+    void* stream);
+void rac_launch_tn(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, float alpha, float beta,
+    void* stream);
 }
 
 /* Get the raw HIP stream from PyTorch */
@@ -68,13 +76,13 @@ torch::Tensor rac_linear_forward(
     int in_features = weight.size(1);
 
     auto input_2d = input.reshape({-1, in_features}).contiguous();
-    auto weight_t = weight.t().contiguous();
     int M = input_2d.size(0);
 
     auto output = torch::empty({M, out_features}, input_2d.options());
 
-    rac_launch_nn(
-        input_2d.data_ptr<float>(), weight_t.data_ptr<float>(),
+    /* NT kernel: C[M,out] = input[M,in] @ weight[out,in]^T — no transpose needed */
+    rac_launch_nt(
+        input_2d.data_ptr<float>(), weight.contiguous().data_ptr<float>(),
         output.data_ptr<float>(),
         M, out_features, in_features, 1.0f, 0.0f, _get_stream());
 
@@ -99,19 +107,19 @@ std::vector<torch::Tensor> rac_matmul_backward(
     torch::Tensor grad_A, grad_B;
 
     if (need_grad_A) {
+        /* grad_A[M,K] = grad_C[M,N] @ B[K,N]^T → NT kernel */
         grad_A = torch::empty({M, K}, A.options());
-        auto Bt = B.t().contiguous();
-        rac_launch_nn(
-            grad_C.data_ptr<float>(), Bt.data_ptr<float>(),
+        rac_launch_nt(
+            grad_C.data_ptr<float>(), B.data_ptr<float>(),
             grad_A.data_ptr<float>(),
             M, K, N, 1.0f, 0.0f, _get_stream());
     }
 
     if (need_grad_B) {
+        /* grad_B[K,N] = A[M,K]^T @ grad_C[M,N] → TN kernel with A=[M,K] treated as [K,M]^T */
         grad_B = torch::empty({K, N}, B.options());
-        auto At = A.t().contiguous();
-        rac_launch_nn(
-            At.data_ptr<float>(), grad_C.data_ptr<float>(),
+        rac_launch_tn(
+            A.data_ptr<float>(), grad_C.data_ptr<float>(),
             grad_B.data_ptr<float>(),
             K, N, M, 1.0f, 0.0f, _get_stream());
     }
@@ -130,16 +138,17 @@ std::vector<torch::Tensor> rac_linear_backward(
     auto inp = input.reshape({-1, in_features}).contiguous();
     int M = inp.size(0);
 
+    /* grad_input[M,in] = go[M,out] @ weight[out,in] → NN kernel (weight already [out,in]) */
     auto grad_input = torch::empty({M, in_features}, inp.options());
     rac_launch_nn(
         go.data_ptr<float>(), weight.contiguous().data_ptr<float>(),
         grad_input.data_ptr<float>(),
         M, in_features, out_features, 1.0f, 0.0f, _get_stream());
 
+    /* grad_weight[out,in] = go[M,out]^T @ inp[M,in] → TN kernel */
     auto grad_weight = torch::empty({out_features, in_features}, weight.options());
-    auto got = go.t().contiguous();
-    rac_launch_nn(
-        got.data_ptr<float>(), inp.data_ptr<float>(),
+    rac_launch_tn(
+        go.data_ptr<float>(), inp.data_ptr<float>(),
         grad_weight.data_ptr<float>(),
         out_features, in_features, M, 1.0f, 0.0f, _get_stream());
 
