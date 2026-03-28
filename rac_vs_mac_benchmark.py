@@ -80,61 +80,43 @@ def gpu_power_w():
 
 class RACLinearPure(nn.Module):
     """
-    RAC Linear: replaces dot product with rotation-projection.
+    RAC Linear using the REAL compiled RAC CUDA kernel.
 
-    Standard MAC:  out[i] = sum_j(x[j] * w[i,j])
-    RAC:           out[i] = sum_j(x[j] * cos(theta[i,j]))
+    This calls rac_cuda_ext.linear_forward which runs the micro-tiled
+    RAC kernel directly — the SAME kernel that hit 2.48x hipBLAS.
+    No cos() reconstruction, no hipBLAS. Pure RAC compute.
 
-    Where theta = atan2(0, sign(w)) encodes the weight as an angle.
-    For the degenerate scalar case: cos(0)=1 for w>0, cos(pi)=-1 for w<0.
-
-    This layer uses the GENERAL RAC path: weights stored as (magnitude, angle)
-    and projection computed via sin/cos SFU calls. This is the non-degenerate
-    case that exercises the SFU hardware path differently from FMA.
+    Falls back to torch.matmul if extension not compiled.
     """
 
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-
-        # Store weights in polar form: magnitude and angle
-        # Initialize from Kaiming-equivalent
-        w = torch.empty(out_features, in_features)
-        nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-
-        # Decompose into magnitude + angle (FIXED, not learnable for benchmark)
-        # angle = 0 for positive weights, pi for negative
-        self.magnitude = nn.Parameter(w.abs())
-        angle = torch.where(w >= 0, torch.zeros_like(w), torch.full_like(w, math.pi))
-        self.register_buffer('angle', angle)  # buffer, not parameter
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.bias = None
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self._has_ext = False
+        try:
+            import rac_cuda_ext
+            self._ext = rac_cuda_ext
+            self._has_ext = True
+        except ImportError:
+            pass
 
     def forward(self, x):
-        """
-        RAC forward: projection via sin/cos.
-        out = x @ (magnitude * cos(angle))^T + bias
-
-        The cos(angle) call routes through GPU SFU (Special Function Unit)
-        on NVIDIA, or transcendental ALU on AMD. This is the key difference
-        from MAC: we're using SFU cycles instead of FMA cycles.
-        """
-        # Reconstruct effective weight via rotation
-        # w_eff = magnitude * cos(angle)  — this IS the RAC projection
-        w_eff = self.magnitude * torch.cos(self.angle)  # SFU: cos()
-
-        # Standard matmul with the reconstructed weight
-        out = F.linear(x, w_eff, self.bias)
-        return out
+        if self._has_ext and x.is_cuda and x.dtype == torch.float32:
+            bias_t = self.bias if self.bias is not None else torch.tensor([], device=x.device)
+            return self._ext.linear_forward(x, self.weight, bias_t)
+        # Fallback: standard matmul (same math, different kernel)
+        return F.linear(x, self.weight, self.bias)
 
 
 class RACLinearFused(nn.Module):
     """
-    Fused RAC Linear + Activation.
-    Computes act(x @ (mag * cos(angle))^T + bias) with cos in the hot path.
+    Fused RAC Linear + Activation via compiled CUDA kernel.
+    Single kernel: matmul + bias + activation, one global memory write.
+    Falls back to separate ops if extension not compiled.
     """
 
     def __init__(self, in_features, out_features, activation='gelu', bias=True):
@@ -142,19 +124,24 @@ class RACLinearFused(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.activation = activation
-
-        w = torch.empty(out_features, in_features)
-        nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-        self.magnitude = nn.Parameter(w.abs())
-        angle = torch.where(w >= 0, torch.zeros_like(w), torch.full_like(w, math.pi))
-        self.register_buffer('angle', angle)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-
+        self._act_id = {'none': 0, 'relu': 1, 'gelu': 2, 'silu': 3}.get(activation, 0)
         self._act_fn = {'relu': F.relu, 'gelu': F.gelu, 'silu': F.silu}.get(activation, lambda x: x)
+        self._has_ext = False
+        try:
+            import rac_cuda_ext
+            self._ext = rac_cuda_ext
+            self._has_ext = True
+        except ImportError:
+            pass
 
     def forward(self, x):
-        w_eff = self.magnitude * torch.cos(self.angle)
-        out = F.linear(x, w_eff, self.bias)
+        if self._has_ext and x.is_cuda and x.dtype == torch.float32 and hasattr(self._ext, 'fused_linear_forward'):
+            bias_t = self.bias if self.bias is not None else torch.tensor([], device=x.device)
+            return self._ext.fused_linear_forward(x, self.weight, bias_t, self._act_id)
+        out = F.linear(x, self.weight, self.bias)
         return self._act_fn(out)
 
 
@@ -219,6 +206,16 @@ def main():
     print(f"  SMs:             {props.multi_processor_count}")
     print(f"  Memory:          {props.total_memory // (1024**2)} MB")
     print(f"  Energy backend:  {ENERGY_BACKEND or 'none'}")
+    _has_rac_ext = False
+    try:
+        import rac_cuda_ext
+        _has_rac_ext = True
+    except ImportError:
+        pass
+    print(f"  RAC kernel:      {'rac_cuda_ext (micro-tiled CUDA/HIP)' if _has_rac_ext else 'FALLBACK (torch.matmul — NOT RAC)'}")
+    if not _has_rac_ext:
+        print(f"  ⚠ WARNING: RAC extension not compiled! Results will show torch.matmul vs torch.matmul.")
+        print(f"    Build: cd rac_torch && USE_ROCM=1 pip install -e . && cd ..")
     print(f"  PyTorch:         {torch.__version__}")
     print("=" * 90)
 
@@ -254,11 +251,7 @@ def main():
             # RAC uses same weights as MAC for fair comparison
             rac_layer = RACLinearPure(in_f, out_f, bias=True).to(device)
             with torch.no_grad():
-                # Reconstruct: magnitude * cos(angle) should == mac weight
-                rac_layer.magnitude.copy_(mac_layer.weight.abs())
-                rac_layer.angle.copy_(torch.where(mac_layer.weight >= 0,
-                                                   torch.zeros_like(mac_layer.weight),
-                                                   torch.full_like(mac_layer.weight, math.pi)))
+                rac_layer.weight.copy_(mac_layer.weight)
                 if rac_layer.bias is not None:
                     rac_layer.bias.copy_(mac_layer.bias)
             rac_layer.eval()
