@@ -223,13 +223,14 @@ void rac_launch_nn(
     int M, int N, int K, float alpha, float beta,
     hipStream_t stream)
 {
-    /* For now: use only tier 2 (micro-4x4) which was proven correct
-     * in rac_benchmark_hip_opt. Tier 3 (micro-8x8) needs debugging
-     * for the PyTorch binding path. */
     if ((long long)M * N < 4096) {
         dim3 block(TILE_S, TILE_S);
         dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
         rac_matmul_small_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
+    } else if (M >= 128 && N >= 128 && K >= 128) {
+        dim3 block(BN8/TN8, BM8/TM8);
+        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
+        rac_matmul_micro8_nn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
     } else {
         dim3 block(BN/TN, BM/TM);
         dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
