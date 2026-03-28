@@ -42,13 +42,25 @@ g++ -O3 -std=c++17 -fPIC -DUSE_ROCM -D__HIP_PLATFORM_AMD__ -c \
 
 echo "   rac_torch_bind.o OK"
 
-# Step 3: Link both into final .so
-echo "── Linking..."
+# Step 3: Device-link the HIP object (embeds GPU fatbin)
+echo "── Device linking..."
+${HIPCC} --offload-arch=${GFX} \
+    -fgpu-rdc --hip-link \
+    -shared -fPIC \
+    rac_kernels.o \
+    -o rac_kernels_linked.o
+
+echo "   rac_kernels_linked.o OK"
+
+# Step 4: Final link — combine device-linked kernels + PyTorch bindings
+echo "── Final linking..."
 g++ -shared \
-    rac_kernels.o rac_torch_bind.o \
+    rac_kernels_linked.o rac_torch_bind.o \
     -L${TORCH_DIR}/lib \
+    -L/opt/rocm-7.1.1/lib \
     -ltorch -ltorch_hip -lc10 -lc10_hip -ltorch_python -lamdhip64 \
     -Wl,-rpath,${TORCH_DIR}/lib \
+    -Wl,-rpath,/opt/rocm-7.1.1/lib \
     -o rac_cuda_ext${PY_EXT}
 
 echo "   rac_cuda_ext${PY_EXT} OK"
