@@ -25,7 +25,8 @@ from collections import defaultdict
 
 # ── Energy measurement backend ──────────────────────────────────────────────
 
-ENERGY_BACKEND = None  # 'nvml', 'rocm', or None
+ENERGY_BACKEND = None  # 'nvml', 'hwmon', 'rocm', or None
+_hwmon_energy_path = None  # sysfs path for AMD GPU energy counter
 
 try:
     import pynvml
@@ -35,6 +36,22 @@ try:
 except Exception:
     pass
 
+# AMD GPU: try hwmon sysfs energy counter (microjoules, no subprocess overhead)
+if ENERGY_BACKEND is None:
+    import glob as _glob
+    for hwmon in sorted(_glob.glob('/sys/class/drm/card*/device/hwmon/hwmon*')):
+        energy_file = os.path.join(hwmon, 'energy1_input')
+        if os.path.exists(energy_file):
+            try:
+                with open(energy_file) as f:
+                    int(f.read().strip())
+                _hwmon_energy_path = energy_file
+                ENERGY_BACKEND = 'hwmon'
+                break
+            except Exception:
+                pass
+
+# Fallback: rocm-smi for power sampling
 if ENERGY_BACKEND is None:
     try:
         import subprocess
@@ -45,11 +62,18 @@ if ENERGY_BACKEND is None:
         pass
 
 
-def gpu_energy_mj():
-    """Return cumulative GPU energy in millijoules, or 0 if unavailable."""
+def gpu_energy_uj():
+    """Return cumulative GPU energy in microjoules, or 0 if unavailable."""
     if ENERGY_BACKEND == 'nvml':
         try:
-            return pynvml.nvmlDeviceGetTotalEnergyConsumption(_nvml_handle)
+            # nvml returns millijoules
+            return pynvml.nvmlDeviceGetTotalEnergyConsumption(_nvml_handle) * 1000
+        except Exception:
+            return 0
+    if ENERGY_BACKEND == 'hwmon':
+        try:
+            with open(_hwmon_energy_path) as f:
+                return int(f.read().strip())
         except Exception:
             return 0
     return 0
@@ -62,11 +86,18 @@ def gpu_power_w():
             return pynvml.nvmlDeviceGetPowerUsage(_nvml_handle) / 1000.0
         except Exception:
             return 0
+    if ENERGY_BACKEND == 'hwmon':
+        power_file = _hwmon_energy_path.replace('energy1_input', 'power1_average')
+        try:
+            with open(power_file) as f:
+                return int(f.read().strip()) / 1e6  # microwatts → watts
+        except Exception:
+            return 0
     if ENERGY_BACKEND == 'rocm':
         try:
+            import subprocess, json
             r = subprocess.run(['rocm-smi', '--showpower', '--json'],
                                capture_output=True, text=True)
-            import json
             data = json.loads(r.stdout)
             for card in data.values():
                 if isinstance(card, dict) and 'Average Graphics Package Power' in card:
@@ -151,6 +182,7 @@ def benchmark_layer(layer, x, n_warmup=10, n_iters=100):
     """
     Benchmark a layer: returns (latency_ms, energy_mj, output).
     Uses CUDA events for precise GPU timing.
+    Energy via hardware counters (hwmon/nvml) or power sampling (rocm-smi).
     """
     # Warmup
     with torch.no_grad():
@@ -160,7 +192,7 @@ def benchmark_layer(layer, x, n_warmup=10, n_iters=100):
     torch.cuda.synchronize()
 
     # Energy measurement
-    e0 = gpu_energy_mj()
+    e0 = gpu_energy_uj()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
@@ -171,10 +203,20 @@ def benchmark_layer(layer, x, n_warmup=10, n_iters=100):
     end_event.record()
 
     torch.cuda.synchronize()
-    e1 = gpu_energy_mj()
+    e1 = gpu_energy_uj()
 
     latency_ms = start_event.elapsed_time(end_event) / n_iters
-    energy_mj = (e1 - e0) / n_iters if (e1 - e0) > 0 else 0
+    total_time_s = start_event.elapsed_time(end_event) / 1000.0
+
+    if (e1 - e0) > 0:
+        # Hardware energy counter available (hwmon or nvml)
+        energy_mj = (e1 - e0) / 1000.0 / n_iters  # microjoules → millijoules per iter
+    elif ENERGY_BACKEND == 'rocm':
+        # Fallback: estimate from average power × time
+        power = gpu_power_w()
+        energy_mj = (power * total_time_s * 1000.0) / n_iters if power > 0 else 0
+    else:
+        energy_mj = 0
 
     return latency_ms, energy_mj, out
 
@@ -348,11 +390,24 @@ def main():
         e_results = [r for r in results if r['e_mac'] > 0 and r['e_rac'] > 0]
         if e_results:
             avg_energy_ratio = np.mean([r['energy_ratio'] for r in e_results])
-            print(f"\n  Average energy ratio (MAC/RAC): {avg_energy_ratio:.2f}x")
+            print(f"\n  Energy (RAC vs MAC):")
+            print(f"    Average energy ratio (MAC/RAC): {avg_energy_ratio:.2f}x")
             if avg_energy_ratio > 1.0:
-                print(f"  → RAC uses {(1 - 1/avg_energy_ratio)*100:.1f}% less energy on average")
+                print(f"    RAC uses {(1 - 1/avg_energy_ratio)*100:.1f}% less energy on average")
             else:
-                print(f"  → MAC uses {(1 - avg_energy_ratio)*100:.1f}% less energy on average")
+                print(f"    MAC uses {(1 - avg_energy_ratio)*100:.1f}% less energy on average")
+
+            e_fused = [r for r in results if r['e_mac'] > 0 and r['e_fused'] > 0]
+            if e_fused:
+                avg_fused = np.mean([r['energy_ratio_fused'] for r in e_fused])
+                print(f"\n  Energy (RAC+GELU vs MAC):")
+                print(f"    Average energy ratio (MAC/RAC+GELU): {avg_fused:.2f}x")
+                if avg_fused > 1.0:
+                    print(f"    RAC+GELU uses {(1 - 1/avg_fused)*100:.1f}% less energy on average")
+                else:
+                    print(f"    MAC uses {(1 - avg_fused)*100:.1f}% less energy on average")
+        else:
+            print(f"\n  Energy measurement: not available (need hwmon sysfs or pynvml)")
 
         # Accuracy
         max_errs = [r['max_err'] for r in results]
