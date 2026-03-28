@@ -127,17 +127,55 @@ def gpu_power_w():
             return 0
     if ENERGY_BACKEND == 'rocm':
         try:
-            import subprocess
-            # Try plain text parsing first (more reliable across versions)
-            r = subprocess.run(['rocm-smi', '--showpower'],
-                               capture_output=True, text=True)
-            if r.returncode == 0:
-                import re
-                # Match patterns like "123.456 W" or "Average Graphics Package Power (W): 123.456"
-                for line in r.stdout.splitlines():
-                    m = re.search(r'(\d+\.?\d*)\s*W', line)
-                    if m:
-                        return float(m.group(1))
+            import subprocess, re
+            # Try multiple rocm-smi invocations — format varies across ROCm versions
+            for cmd in [
+                ['rocm-smi', '--showpower'],
+                ['rocm-smi', '-P'],
+                ['rocm-smi', '--showpower', '--json'],
+            ]:
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if r.returncode != 0:
+                        continue
+                    output = r.stdout
+                    # Try JSON first
+                    if '--json' in cmd:
+                        import json
+                        try:
+                            data = json.loads(output)
+                            # Walk all values looking for power readings
+                            def _find_power(obj):
+                                if isinstance(obj, dict):
+                                    for k, v in obj.items():
+                                        if 'power' in k.lower() and isinstance(v, (int, float)) and v > 0:
+                                            return float(v)
+                                        if isinstance(v, str) and 'w' in v.lower():
+                                            m = re.search(r'(\d+\.?\d*)', v)
+                                            if m: return float(m.group(1))
+                                        found = _find_power(v)
+                                        if found: return found
+                                elif isinstance(obj, list):
+                                    for item in obj:
+                                        found = _find_power(item)
+                                        if found: return found
+                                return None
+                            pw = _find_power(data)
+                            if pw and pw > 0:
+                                return pw
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    # Plain text: find any floating point number on a line containing "power" or "watt" or "W"
+                    for line in output.splitlines():
+                        ll = line.lower()
+                        if any(kw in ll for kw in ('power', 'watt', ' w', '(w)')):
+                            m = re.search(r'(\d+\.?\d+)', line)
+                            if m:
+                                val = float(m.group(1))
+                                if 0.1 < val < 1000:  # sanity: between 0.1W and 1000W
+                                    return val
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    continue
         except Exception:
             return 0
     return 0
@@ -286,6 +324,14 @@ def main():
     _energy_mode = 'counter' if _init_energy > 0 else ('power sampling' if _init_power > 0 else 'unavailable')
     print(f"  Energy backend:  {ENERGY_BACKEND or 'none'} ({_energy_mode}"
           f"{f', {_init_power:.1f}W' if _init_power > 0 else ''})")
+    if _init_power == 0 and ENERGY_BACKEND == 'rocm':
+        # Debug: show what rocm-smi actually outputs
+        try:
+            import subprocess as _sp
+            _r = _sp.run(['rocm-smi', '--showpower'], capture_output=True, text=True, timeout=5)
+            print(f"  rocm-smi debug:  exit={_r.returncode}, output={repr(_r.stdout[:200])}")
+        except Exception:
+            pass
     _has_rac_ext = False
     try:
         import rac_cuda_ext
