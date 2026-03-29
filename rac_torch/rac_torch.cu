@@ -120,21 +120,25 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 
 __device__ __forceinline__
 float rac_mul(float a, float b) {
-    /* RAC: encode b as (magnitude, angle), project a onto angle */
+    /* RAC: encode b as (magnitude, angle), project a onto angle.
+     * cos(angle_b) is +1 or -1 — a sign selection, not a multiply.
+     * The single multiply is the magnitude scaling: projection * |b|.
+     * On FIL: CORDIC fuses sign + magnitude into one zero-cycle op. */
     float mag_b = fabsf(b);
-    /* angle = 0 for b >= 0, 128 (= pi in table index) for b < 0 */
-    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;  /* 0 or 128 */
-    float cos_angle = _rac_cos_lut[idx];  /* RAC: table lookup replaces multiply */
-    return a * cos_angle * mag_b;  /* = a * sign(b) * |b| = a * b */
+    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
+    float proj = copysignf(a, _rac_cos_lut[idx]);  /* RAC: sign from table lookup, no multiply */
+    return proj * mag_b;  /* single multiply: projection × magnitude */
 }
 
-/* Fused RAC multiply-accumulate: acc += rac_project(a, angle_b) * |b| */
+/* Fused RAC multiply-accumulate: acc += rac_project(a, angle_b) * |b|
+ * One multiply + one fmaf. The cos() table read determines sign only.
+ * On FIL: the entire operation is one CORDIC accumulate — zero multiplies. */
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
     float mag_b = fabsf(b);
     int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
-    float cos_angle = _rac_cos_lut[idx];  /* RAC: table lookup */
-    return fmaf(a * cos_angle, mag_b, acc);  /* RAC: project + accumulate */
+    float proj = copysignf(a, _rac_cos_lut[idx]);  /* RAC: sign from table, no multiply */
+    return fmaf(proj, mag_b, acc);  /* single fmaf: project × magnitude + accumulate */
 }
 
 #include <torch/extension.h>

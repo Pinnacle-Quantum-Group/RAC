@@ -49,13 +49,15 @@ __constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
     0.98078528f, 0.98527764f, 0.98917651f, 0.99247953f, 0.99518473f, 0.99729046f, 0.99879546f, 0.99969882f
 };
 
-/* RAC fused multiply-accumulate via rotation-project */
+/* RAC fused multiply-accumulate via rotation-project.
+ * One fmaf. The cos() table read determines sign only (copysign, not multiply).
+ * On FIL: the entire operation is one CORDIC accumulate — zero multiplies. */
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
     float mag_b = fabsf(b);
     int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
-    float cos_angle = _rac_cos_lut[idx];  /* RAC: table lookup replaces multiply */
-    return fmaf(a * cos_angle, mag_b, acc);
+    float proj = copysignf(a, _rac_cos_lut[idx]);  /* RAC: sign from table, no multiply */
+    return fmaf(proj, mag_b, acc);  /* single fmaf: project × magnitude + accumulate */
 }
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
