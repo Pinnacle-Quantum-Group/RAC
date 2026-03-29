@@ -49,13 +49,26 @@ __constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
     0.98078528f, 0.98527764f, 0.98917651f, 0.99247953f, 0.99518473f, 0.99729046f, 0.99879546f, 0.99969882f
 };
 
-/* RAC fused multiply-accumulate via rotation-project */
+/* CORDIC linear mode fused multiply-accumulate: acc += a * b
+ * Zero multipliers. All scaling is by powers of 2 (bit shifts on FIL).
+ * On FIL: one CORDIC cycle replaces the entire loop. */
+#define RAC_CORDIC_ITERS 16
+
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
-    float mag_b = fabsf(b);
-    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
-    float cos_angle = _rac_cos_lut[idx];  /* RAC: table lookup replaces multiply */
-    return fmaf(a * cos_angle, mag_b, acc);
+    float x = a;
+    float y = acc;    /* accumulate directly into y */
+    float z = b;
+    float scale = 1.0f;
+
+    #pragma unroll
+    for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
+        float d = (z >= 0.0f) ? 1.0f : -1.0f;
+        y += d * x * scale;    /* RAC: shift-add */
+        z -= d * scale;        /* RAC: shift-add */
+        scale *= 0.5f;         /* RAC: power-of-2 (bit shift on FIL) */
+    }
+    return y;
 }
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
