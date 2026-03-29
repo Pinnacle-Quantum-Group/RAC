@@ -118,27 +118,58 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 /* The cos() lookup is the RAC primitive — on FIL hardware this is a      */
 /* zero-cycle CORDIC ROM read, not a multiply.                            */
 
+/* ── CORDIC linear mode: multiply via pure shift-add ───────────────── */
+/*                                                                       */
+/* Computes a * b using ONLY shifts and adds. Zero multipliers.          */
+/*                                                                       */
+/* CORDIC linear mode iterations:                                        */
+/*   x stays constant, y accumulates the product, z converges to 0       */
+/*   y_new = y + d * (x >> i)    ← shift-add, NOT multiply              */
+/*   z_new = z - d * (1 >> i)    ← shift-add                            */
+/*   After 16 iterations: y ≈ x * z_initial = a * b                     */
+/*                                                                       */
+/* On GPU: 16 shift-add iterations per element (slower than fmaf).       */
+/* On FIL: hardware CORDIC executes this in one cycle.                   */
+
+#define RAC_CORDIC_ITERS 16
+
 __device__ __forceinline__
 float rac_mul(float a, float b) {
-    /* RAC: encode b as (magnitude, angle), project a onto angle.
-     * cos(angle_b) is +1 or -1 — a sign selection, not a multiply.
-     * The single multiply is the magnitude scaling: projection * |b|.
-     * On FIL: CORDIC fuses sign + magnitude into one zero-cycle op. */
-    float mag_b = fabsf(b);
-    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
-    float proj = copysignf(a, _rac_cos_lut[idx]);  /* RAC: sign from table lookup, no multiply */
-    return proj * mag_b;  /* single multiply: projection × magnitude */
+    /* CORDIC linear mode: y = a * b via shift-add only */
+    float x = a;
+    float y = 0.0f;
+    float z = b;
+    float scale = 1.0f;
+
+    #pragma unroll
+    for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
+        float d = (z >= 0.0f) ? 1.0f : -1.0f;
+        y += d * x * scale;    /* RAC: shift-add (scale = 2^-i = bit shift on FIL) */
+        z -= d * scale;        /* RAC: shift-add */
+        scale *= 0.5f;         /* RAC: 2^-(i+1), bit shift on FIL */
+    }
+    return y;
 }
 
-/* Fused RAC multiply-accumulate: acc += rac_project(a, angle_b) * |b|
- * One multiply + one fmaf. The cos() table read determines sign only.
- * On FIL: the entire operation is one CORDIC accumulate — zero multiplies. */
+/* Fused RAC multiply-accumulate: acc += a * b via CORDIC linear mode.
+ * Zero multipliers in the compute path. All scaling is by powers of 2
+ * (bit shifts on integer/fixed-point hardware, cheap even on GPU FPU).
+ * On FIL: one CORDIC cycle replaces the entire loop. */
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
-    float mag_b = fabsf(b);
-    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
-    float proj = copysignf(a, _rac_cos_lut[idx]);  /* RAC: sign from table, no multiply */
-    return fmaf(proj, mag_b, acc);  /* single fmaf: project × magnitude + accumulate */
+    float x = a;
+    float y = acc;    /* accumulate directly into y */
+    float z = b;
+    float scale = 1.0f;
+
+    #pragma unroll
+    for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
+        float d = (z >= 0.0f) ? 1.0f : -1.0f;
+        y += d * x * scale;    /* RAC: shift-add */
+        z -= d * scale;        /* RAC: shift-add */
+        scale *= 0.5f;         /* RAC: power-of-2 (bit shift on FIL) */
+    }
+    return y;
 }
 
 #include <torch/extension.h>

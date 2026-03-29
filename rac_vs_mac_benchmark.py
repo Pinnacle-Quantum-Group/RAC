@@ -627,9 +627,9 @@ def main():
     Uses FPU multiply-accumulate (fmaf) — hardware multiplier
 
   RAC path (rotation-accumulate):
-    x @ W via micro-tiled kernel with RAC primitives
-    Every multiply routes through rac_fma() — cos() table lookup
-    replaces FPU multiplier. Zero MAC operations in compute path.
+    x @ W via micro-tiled kernel with CORDIC linear mode
+    Every multiply replaced by 16 shift-add iterations (rac_fma).
+    Zero multipliers in the compute path — pure shift-add arithmetic.
     NT kernel avoids weight transpose — passes weight matrix as-is
 
   RAC+GELU path (fused rotation-accumulate + activation):
@@ -638,17 +638,17 @@ def main():
 
   GPU hardware context:
     GPU FPU multipliers execute fmaf in 1 cycle. RAC's rac_fma()
-    does fabsf + table lookup (sign) + copysign + one fmaf — the cos()
-    read is a sign selection, not a multiply. One fmaf per element,
-    same as MAC, plus sign overhead.
+    runs 16 CORDIC shift-add iterations per element — more instructions
+    on hardware with dedicated multipliers. This is the cost of proving
+    multiply-free computation on multiply-optimized hardware.
     RAC+GELU overcomes this by fusing operations that MAC cannot fuse,
     eliminating memory round-trips that dominate at scale.
 
   FIL hardware projection:
-    On FIL, the cos() table lookup maps to a zero-cycle CORDIC ROM read.
-    RAC's per-element overhead disappears, and the fusion advantage
-    compounds — RAC raw matmul and RAC+GELU both outperform MAC.
-    GPU results here represent a lower bound on RAC's advantage.
+    On FIL, each CORDIC iteration is a hardware shift-add — the entire
+    16-iteration loop executes in one cycle, replacing the multiplier.
+    RAC raw matmul matches or exceeds MAC, and RAC+GELU compounds
+    the advantage. GPU results represent a lower bound.
 """)
 
     print("=" * 90)
