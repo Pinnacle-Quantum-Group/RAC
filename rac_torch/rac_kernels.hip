@@ -50,23 +50,29 @@ __constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
 };
 
 /* CORDIC linear mode fused multiply-accumulate: acc += a * b
- * Zero multipliers. All scaling is by powers of 2 (bit shifts on FIL).
+ * Zero multipliers. All scaling via precomputed power-of-2 table.
  * On FIL: one CORDIC cycle replaces the entire loop. */
 #define RAC_CORDIC_ITERS 16
+
+__constant__ float _rac_pow2_table[RAC_CORDIC_ITERS] = {
+    1.0f, 0.5f, 0.25f, 0.125f,
+    0.0625f, 0.03125f, 0.015625f, 0.0078125f,
+    0.00390625f, 0.001953125f, 0.0009765625f, 0.00048828125f,
+    0.000244140625f, 0.0001220703125f, 0.00006103515625f, 0.000030517578125f
+};
 
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
     float x = a;
-    float y = acc;    /* accumulate directly into y */
+    float y = acc;
     float z = b;
-    float scale = 1.0f;
 
     #pragma unroll
     for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
         float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        y += d * x * scale;    /* RAC: shift-add */
-        z -= d * scale;        /* RAC: shift-add */
-        scale *= 0.5f;         /* RAC: power-of-2 (bit shift on FIL) */
+        float s = _rac_pow2_table[i];  /* RAC: table read, not multiply */
+        y += d * x * s;   /* RAC: shift-add */
+        z -= d * s;        /* RAC: shift-add */
     }
     return y;
 }
