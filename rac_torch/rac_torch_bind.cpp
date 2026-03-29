@@ -26,6 +26,7 @@ void rac_launch_tn(
     const float* A, const float* B, float* C,
     int M, int N, int K, float alpha, float beta,
     void* stream);
+void rac_init_tables();
 }
 
 /* Get the raw HIP/CUDA stream from PyTorch */
@@ -163,6 +164,7 @@ std::vector<torch::Tensor> rac_linear_backward(
 
 PYBIND11_MODULE(rac_cuda_ext, m) {
     m.doc() = "RAC: Rotation-Accumulate PyTorch Extension";
+    rac_init_tables();  /* Initialize 8M-entry log2/exp2 lookup tables */
     m.def("matmul_forward", &rac_matmul_forward, "RAC matmul forward");
     m.def("matmul_backward", &rac_matmul_backward, "RAC matmul backward",
           py::arg("grad_C"), py::arg("A"), py::arg("B"),
