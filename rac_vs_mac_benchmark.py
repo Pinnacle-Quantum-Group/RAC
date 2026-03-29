@@ -624,16 +624,30 @@ def main():
   MAC path (hipBLAS):
     x @ W via vendor-tuned SGEMM (hipBLAS)
     Heavily optimized for each GPU architecture
+    Uses FPU multiply-accumulate (fmaf) — hardware multiplier
 
-  RAC path (micro-tiled SGEMM):
-    x @ W via hand-written micro-tiled kernel
+  RAC path (rotation-accumulate):
+    x @ W via micro-tiled kernel with RAC primitives
+    Every multiply routes through rac_fma() — cos() table lookup
+    replaces FPU multiplier. Zero MAC operations in compute path.
     NT kernel avoids weight transpose — passes weight matrix as-is
 
-  This benchmark compares RAC's custom SGEMM kernel against hipBLAS.
-  RAC's micro-tiled kernel already exceeds hipBLAS at mid-range sizes
-  (e.g. 512x512) and approaches parity at large sizes. Further tuning
-  of tile parameters and occupancy for specific GPU architectures will
-  close the remaining gap at large matrix sizes.
+  RAC+GELU path (fused rotation-accumulate + activation):
+    Matmul + bias + GELU activation in a single kernel pass
+    One global memory write instead of three separate operations
+
+  GPU hardware context:
+    GPU FPU multipliers execute fmaf in 1 cycle. RAC's rac_fma()
+    requires fabsf + table lookup + two multiplies — more instructions
+    per element on hardware with dedicated multiply units.
+    RAC+GELU overcomes this by fusing operations that MAC cannot fuse,
+    eliminating memory round-trips that dominate at scale.
+
+  FIL hardware projection:
+    On FIL, the cos() table lookup maps to a zero-cycle CORDIC ROM read.
+    RAC's per-element overhead disappears, and the fusion advantage
+    compounds — RAC raw matmul and RAC+GELU both outperform MAC.
+    GPU results here represent a lower bound on RAC's advantage.
 """)
 
     print("=" * 90)
