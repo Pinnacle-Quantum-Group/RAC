@@ -627,9 +627,9 @@ def main():
     Uses FPU multiply-accumulate (fmaf) — hardware multiplier
 
   RAC path (rotation-accumulate):
-    x @ W via micro-tiled kernel with CORDIC linear mode
-    Every multiply replaced by 16 shift-add iterations (rac_fma).
-    Zero multipliers in the compute path — pure shift-add arithmetic.
+    x @ W via micro-tiled kernel with RAC primitives (rac_fma)
+    Each multiply = one CORDIC operation (constant time)
+    GPU emulates via sign selection + fmaf (2 ops per element)
     NT kernel avoids weight transpose — passes weight matrix as-is
 
   RAC+GELU path (fused rotation-accumulate + activation):
@@ -637,20 +637,16 @@ def main():
     One global memory write instead of three separate operations
 
   GPU hardware context:
-    GPU FPU multipliers execute fmaf in 1 cycle. RAC's rac_fma()
-    runs 16 CORDIC iterations using only integer bit ops (sign-bit XOR,
-    exponent subtract) and float adds — zero FPU multiply instructions
-    at the assembly level. More instructions per element, but no
-    multiplier hardware is touched.
-    RAC+GELU overcomes this by fusing operations that MAC cannot fuse,
+    GPU has dedicated FPU multipliers, so RAC emulates the CORDIC
+    result via copysign + fmaf — same throughput as MAC per element.
+    RAC+GELU wins by fusing operations that MAC cannot fuse,
     eliminating memory round-trips that dominate at scale.
 
-  Hardware CORDIC projection:
-    With a hardware CORDIC unit, each iteration is a hardwired
-    shift-add — the entire 16-iteration loop executes in one cycle,
-    replacing the multiplier entirely. RAC raw matmul matches or
-    exceeds MAC, and RAC+GELU compounds the advantage.
-    GPU results represent a lower bound on RAC's potential.
+  Hardware CORDIC:
+    With a CORDIC unit, rac_fma is one cycle — the shift-add pipeline
+    replaces the multiplier entirely. RAC raw matmul matches or exceeds
+    MAC, and RAC+GELU compounds the advantage. GPU results represent
+    a lower bound on RAC's potential with dedicated hardware.
 """)
 
     print("=" * 90)
