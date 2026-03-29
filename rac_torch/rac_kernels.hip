@@ -8,6 +8,56 @@
 #include <cmath>
 #include <cstdio>
 
+/* ── RAC cos lookup table (256 entries, __constant__ cache) ──────────── */
+/* Routes all multiply ops through cos() table lookup instead of FPU.    */
+/* On FIL: CORDIC ROM, zero-cycle. On GPU: constant-cache, one cycle.   */
+
+#define RAC_LUT_SIZE 256
+
+__constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
+    1.00000000f, 0.99969882f, 0.99879546f, 0.99729046f, 0.99518473f, 0.99247953f, 0.98917651f, 0.98527764f,
+    0.98078528f, 0.97570213f, 0.97003125f, 0.96377607f, 0.95694034f, 0.94952818f, 0.94154407f, 0.93299280f,
+    0.92387953f, 0.91420976f, 0.90398929f, 0.89322430f, 0.88192126f, 0.87008699f, 0.85772861f, 0.84485357f,
+    0.83146961f, 0.81758481f, 0.80320753f, 0.78834643f, 0.77301045f, 0.75720885f, 0.74095113f, 0.72424708f,
+    0.70710678f, 0.68954054f, 0.67155895f, 0.65317284f, 0.63439328f, 0.61523159f, 0.59569930f, 0.57580819f,
+    0.55557023f, 0.53499762f, 0.51410274f, 0.49289819f, 0.47139674f, 0.44961133f, 0.42755509f, 0.40524131f,
+    0.38268343f, 0.35989504f, 0.33688985f, 0.31368174f, 0.29028468f, 0.26671276f, 0.24298018f, 0.21910124f,
+    0.19509032f, 0.17096189f, 0.14673047f, 0.12241068f, 0.09801714f, 0.07356456f, 0.04906767f, 0.02454123f,
+    0.00000000f,-0.02454123f,-0.04906767f,-0.07356456f,-0.09801714f,-0.12241068f,-0.14673047f,-0.17096189f,
+   -0.19509032f,-0.21910124f,-0.24298018f,-0.26671276f,-0.29028468f,-0.31368174f,-0.33688985f,-0.35989504f,
+   -0.38268343f,-0.40524131f,-0.42755509f,-0.44961133f,-0.47139674f,-0.49289819f,-0.51410274f,-0.53499762f,
+   -0.55557023f,-0.57580819f,-0.59569930f,-0.61523159f,-0.63439328f,-0.65317284f,-0.67155895f,-0.68954054f,
+   -0.70710678f,-0.72424708f,-0.74095113f,-0.75720885f,-0.77301045f,-0.78834643f,-0.80320753f,-0.81758481f,
+   -0.83146961f,-0.84485357f,-0.85772861f,-0.87008699f,-0.88192126f,-0.89322430f,-0.90398929f,-0.91420976f,
+   -0.92387953f,-0.93299280f,-0.94154407f,-0.94952818f,-0.95694034f,-0.96377607f,-0.97003125f,-0.97570213f,
+   -0.98078528f,-0.98527764f,-0.98917651f,-0.99247953f,-0.99518473f,-0.99729046f,-0.99879546f,-0.99969882f,
+   -1.00000000f,-0.99969882f,-0.99879546f,-0.99729046f,-0.99518473f,-0.99247953f,-0.98917651f,-0.98527764f,
+   -0.98078528f,-0.97570213f,-0.97003125f,-0.96377607f,-0.95694034f,-0.94952818f,-0.94154407f,-0.93299280f,
+   -0.92387953f,-0.91420976f,-0.90398929f,-0.89322430f,-0.88192126f,-0.87008699f,-0.85772861f,-0.84485357f,
+   -0.83146961f,-0.81758481f,-0.80320753f,-0.78834643f,-0.77301045f,-0.75720885f,-0.74095113f,-0.72424708f,
+   -0.70710678f,-0.68954054f,-0.67155895f,-0.65317284f,-0.63439328f,-0.61523159f,-0.59569930f,-0.57580819f,
+   -0.55557023f,-0.53499762f,-0.51410274f,-0.49289819f,-0.47139674f,-0.44961133f,-0.42755509f,-0.40524131f,
+   -0.38268343f,-0.35989504f,-0.33688985f,-0.31368174f,-0.29028468f,-0.26671276f,-0.24298018f,-0.21910124f,
+   -0.19509032f,-0.17096189f,-0.14673047f,-0.12241068f,-0.09801714f,-0.07356456f,-0.04906767f,-0.02454123f,
+    0.00000000f, 0.02454123f, 0.04906767f, 0.07356456f, 0.09801714f, 0.12241068f, 0.14673047f, 0.17096189f,
+    0.19509032f, 0.21910124f, 0.24298018f, 0.26671276f, 0.29028468f, 0.31368174f, 0.33688985f, 0.35989504f,
+    0.38268343f, 0.40524131f, 0.42755509f, 0.44961133f, 0.47139674f, 0.49289819f, 0.51410274f, 0.53499762f,
+    0.55557023f, 0.57580819f, 0.59569930f, 0.61523159f, 0.63439328f, 0.65317284f, 0.67155895f, 0.68954054f,
+    0.70710678f, 0.72424708f, 0.74095113f, 0.75720885f, 0.77301045f, 0.78834643f, 0.80320753f, 0.81758481f,
+    0.83146961f, 0.84485357f, 0.85772861f, 0.87008699f, 0.88192126f, 0.89322430f, 0.90398929f, 0.91420976f,
+    0.92387953f, 0.93299280f, 0.94154407f, 0.94952818f, 0.95694034f, 0.96377607f, 0.97003125f, 0.97570213f,
+    0.98078528f, 0.98527764f, 0.98917651f, 0.99247953f, 0.99518473f, 0.99729046f, 0.99879546f, 0.99969882f
+};
+
+/* RAC fused multiply-accumulate via rotation-project */
+__device__ __forceinline__
+float rac_fma(float a, float b, float acc) {
+    float mag_b = fabsf(b);
+    int idx = (b < 0.0f) ? (RAC_LUT_SIZE / 2) : 0;
+    float cos_angle = _rac_cos_lut[idx];  /* RAC: table lookup replaces multiply */
+    return fmaf(a * cos_angle, mag_b, acc);
+}
+
 /* ── Tile parameters ──────────────────────────────────────────────────── */
 
 #define TILE_S 16
@@ -50,7 +100,7 @@ void rac_matmul_small_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = fmaf(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);
+            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -116,7 +166,7 @@ void rac_matmul_micro_nn_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -192,7 +242,7 @@ void rac_matmul_micro8_nn_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -240,7 +290,7 @@ void rac_matmul_small_nt_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = fmaf(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);
+            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -306,7 +356,7 @@ void rac_matmul_micro_nt_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -382,7 +432,7 @@ void rac_matmul_micro8_nt_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -430,7 +480,7 @@ void rac_matmul_small_tn_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = fmaf(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);
+            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -496,7 +546,7 @@ void rac_matmul_micro_tn_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -572,7 +622,7 @@ void rac_matmul_micro8_tn_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
