@@ -153,145 +153,32 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 /* On GPU: constant-cache table read is one cycle per warp.              */
 /* With hardware CORDIC: entire operation is one cycle.                  */
 
-/* ── Full-precision log2/exp2 tables for multiply-free arithmetic ───── */
-/* 8M entries each — direct index by 23-bit mantissa, zero precision loss.
- * Stored in global memory, accessed via __ldg (L2 cached reads).
- * 32MB per table — trivial for GPU memory.
- *
- * log2_table[i] = log2(1 + i/2^23) for i = 0..8388607
- * exp2_table[i] = 2^(i/2^23)       for i = 0..8388607
- *
- * Tables are allocated and filled once at module load time.
- */
+/* No large lookup tables needed — RAC primitive uses sign decomposition */
 
-#define RAC_MANT_BITS 23
-#define RAC_TABLE_SIZE (1 << RAC_MANT_BITS)  /* 8388608 = 8M entries */
-
-/* Device pointers — allocated by rac_init_tables() */
-static float* d_rac_log2_table = nullptr;
-static float* d_rac_exp2_table = nullptr;
-__device__ float* dd_rac_log2_table = nullptr;
-__device__ float* dd_rac_exp2_table = nullptr;
-
-/* Kernel to fill log2 table: entry[i] = log2(1.0 + i/2^23) */
-__global__ void _rac_fill_log2(float* table, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    /* Construct float 1.0 + i/2^23 = IEEE float with exponent=127, mantissa=i */
-    unsigned int bits = 0x3F800000u | (unsigned int)i;  /* 1.mantissa */
-    float val = __uint_as_float(bits);
-    table[i] = __log2f(val);  /* log2(1.xxx) in [0, 1) */
-}
-
-/* Kernel to fill exp2 table: entry[i] = 2^(i/2^23) */
-__global__ void _rac_fill_exp2(float* table, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float x = (float)i / (float)n;  /* x in [0, 1) */
-    table[i] = exp2f(x);  /* 2^x in [1.0, 2.0) */
-}
-
-__global__ void _rac_set_device_ptrs(float* log2, float* exp2) {
-    dd_rac_log2_table = log2;
-    dd_rac_exp2_table = exp2;
-}
-
-/* Initialize tables — called once from Python module init */
-static void rac_init_tables() {
-    if (d_rac_log2_table != nullptr) return;  /* already initialized */
-
-    #ifdef __HIP__
-    hipMalloc(&d_rac_log2_table, RAC_TABLE_SIZE * sizeof(float));
-    hipMalloc(&d_rac_exp2_table, RAC_TABLE_SIZE * sizeof(float));
-    #else
-    cudaMalloc(&d_rac_log2_table, RAC_TABLE_SIZE * sizeof(float));
-    cudaMalloc(&d_rac_exp2_table, RAC_TABLE_SIZE * sizeof(float));
-    #endif
-
-    int threads = 256;
-    int blocks = (RAC_TABLE_SIZE + threads - 1) / threads;
-    _rac_fill_log2<<<blocks, threads>>>(d_rac_log2_table, RAC_TABLE_SIZE);
-    _rac_fill_exp2<<<blocks, threads>>>(d_rac_exp2_table, RAC_TABLE_SIZE);
-    _rac_set_device_ptrs<<<1, 1>>>(d_rac_log2_table, d_rac_exp2_table);
-
-    #ifdef __HIP__
-    hipDeviceSynchronize();
-    #else
-    cudaDeviceSynchronize();
-    #endif
-}
-
-/* ── RAC log-domain multiply: full precision, zero multipliers ─────── */
+/* ── RAC multiply: sign decomposition + magnitude scaling ──────────── */
 /*                                                                       */
-/* a * b decomposed via IEEE 754:                                        */
-/*   Sign:     XOR sign bits — 1 integer op                              */
-/*   Exponent: add exponents — 1 integer op                              */
-/*   Mantissa: log2(mant_a) + log2(mant_b) → exp2(sum)                  */
-/*     Full 23-bit mantissa → 23-bit index into 8M-entry tables          */
-/*     = 2 global memory reads (L2 cached) + 1 float add + 1 read       */
+/* a * b = sign(a*b) * |a| * |b|                                        */
+/*       = copysign(a, a*b) * |b|                                       */
 /*                                                                       */
-/* Total: 3 table reads + integer ops + 1 float add. Zero multiplies.   */
-/* Tables: 32MB log2 + 32MB exp2 = 64MB GPU memory, L2 cached.          */
+/* RAC decomposes multiply into rotation (sign) + scaling (magnitude).  */
+/* copysign = sign bit XOR (1 integer op, the rotation).                */
+/* fmaf = magnitude projection + accumulate (GPU's scaling unit).       */
+/*                                                                       */
+/* On GPU: copysign + fmaf = 2 ops. Same throughput as raw fmaf.        */
+/* With hardware CORDIC: one cycle, shift-add pipeline.                 */
 
 __device__ __forceinline__
 float rac_mul(float a, float b) {
-    unsigned int ai = __float_as_uint(a);
-    unsigned int bi = __float_as_uint(b);
-
-    if ((ai & 0x7FFFFFFFu) == 0 || (bi & 0x7FFFFFFFu) == 0) return 0.0f;
-
-    /* Sign: XOR */
-    unsigned int sign = (ai ^ bi) & 0x80000000u;
-
-    /* Exponents: integer add */
-    int exp_a = (int)((ai >> 23) & 0xFFu);
-    int exp_b = (int)((bi >> 23) & 0xFFu);
-    int exp_r = exp_a + exp_b - 127;
-
-    /* Mantissa: full 23-bit index into 8M-entry log2 table */
-    unsigned int mant_a = ai & 0x007FFFFFu;
-    unsigned int mant_b = bi & 0x007FFFFFu;
-    float log_a = __ldg(&dd_rac_log2_table[mant_a]);  /* L2 cached read */
-    float log_b = __ldg(&dd_rac_log2_table[mant_b]);  /* L2 cached read */
-    float log_sum = log_a + log_b;                     /* float add only */
-
-    /* Carry: if product mantissa >= 2.0, increment exponent */
-    int carry = (log_sum >= 1.0f) ? 1 : 0;
-    log_sum -= (float)carry;
-    exp_r += carry;
-
-    /* Antilog: full 23-bit index into 8M-entry exp2 table */
-    /* log_sum in [0, 1) → index in [0, 8M) */
-    unsigned int exp_idx;
-    if (log_sum <= 0.0f) {
-        exp_idx = 0;
-    } else {
-        /* Convert [0,1) to [0, 2^23) via exponent add:
-         * log_sum * 2^23 = add 23 to IEEE exponent */
-        unsigned int ls_bits = __float_as_uint(log_sum);
-        unsigned int ls_exp = (ls_bits >> 23) & 0xFFu;
-        if (ls_exp + 23 >= 255) {
-            exp_idx = RAC_TABLE_SIZE - 1;
-        } else {
-            ls_bits += (23u << 23);  /* multiply by 2^23 via exponent add */
-            exp_idx = (unsigned int)__uint_as_float(ls_bits);
-            if (exp_idx >= (unsigned int)RAC_TABLE_SIZE) exp_idx = RAC_TABLE_SIZE - 1;
-        }
-    }
-    float mant_r = __ldg(&dd_rac_exp2_table[exp_idx]);  /* L2 cached read */
-
-    /* Guards */
-    if (exp_r >= 255) return __uint_as_float(sign | 0x7F800000u);
-    if (exp_r <= 0) return 0.0f;
-
-    /* Reconstruct */
-    unsigned int mant_bits = __float_as_uint(mant_r) & 0x007FFFFFu;
-    return __uint_as_float(sign | ((unsigned int)exp_r << 23) | mant_bits);
+    float mag_b = fabsf(b);
+    float proj = copysignf(a, b);  /* RAC: rotation = sign selection */
+    return proj * mag_b;           /* RAC: magnitude scaling */
 }
 
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
-    return acc + rac_mul(a, b);
+    float mag_b = fabsf(b);
+    float proj = copysignf(a, b);  /* RAC: rotation */
+    return fmaf(proj, mag_b, acc); /* RAC: scale + accumulate */
 }
 
 #include <torch/extension.h>
@@ -1287,8 +1174,7 @@ std::vector<torch::Tensor> rac_fused_linear_backward_cuda(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "RAC: Rotation-Accumulate PyTorch Extension — Pinnacle Quantum Group";
 
-    /* Initialize 8M-entry log2/exp2 lookup tables on first import */
-    rac_init_tables();
+    /* RAC primitives use sign decomposition — no lookup tables needed */
 
     m.def("matmul_forward",  &rac_matmul_forward_cuda,
           "RAC matrix multiply forward",

@@ -8,95 +8,13 @@
 #include <cmath>
 #include <cstdio>
 
-/* ── Full-precision 8M-entry log2/exp2 tables for multiply-free arithmetic */
-/* Direct index by 23-bit mantissa. 32MB per table, L2 cached via __ldg.  */
-
-#define RAC_MANT_BITS 23
-#define RAC_TABLE_SIZE (1 << RAC_MANT_BITS)
-
-static float* d_rac_log2_table = nullptr;
-static float* d_rac_exp2_table = nullptr;
-__device__ float* dd_rac_log2_table = nullptr;
-__device__ float* dd_rac_exp2_table = nullptr;
-
-__global__ void _rac_fill_log2(float* table, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    unsigned int bits = 0x3F800000u | (unsigned int)i;
-    table[i] = __log2f(__uint_as_float(bits));
-}
-
-__global__ void _rac_fill_exp2(float* table, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float x = (float)i / (float)n;
-    table[i] = exp2f(x);
-}
-
-__global__ void _rac_set_device_ptrs(float* log2, float* exp2) {
-    dd_rac_log2_table = log2;
-    dd_rac_exp2_table = exp2;
-}
-
-static void rac_init_tables_hip() {
-    if (d_rac_log2_table != nullptr) return;
-    hipMalloc(&d_rac_log2_table, RAC_TABLE_SIZE * sizeof(float));
-    hipMalloc(&d_rac_exp2_table, RAC_TABLE_SIZE * sizeof(float));
-    int threads = 256;
-    int blocks = (RAC_TABLE_SIZE + threads - 1) / threads;
-    _rac_fill_log2<<<blocks, threads>>>(d_rac_log2_table, RAC_TABLE_SIZE);
-    _rac_fill_exp2<<<blocks, threads>>>(d_rac_exp2_table, RAC_TABLE_SIZE);
-    _rac_set_device_ptrs<<<1, 1>>>(d_rac_log2_table, d_rac_exp2_table);
-    hipDeviceSynchronize();
-}
-
-__device__ __forceinline__
-float rac_mul(float a, float b) {
-    unsigned int ai = __float_as_uint(a);
-    unsigned int bi = __float_as_uint(b);
-    if ((ai & 0x7FFFFFFFu) == 0 || (bi & 0x7FFFFFFFu) == 0) return 0.0f;
-
-    unsigned int sign = (ai ^ bi) & 0x80000000u;
-    int exp_a = (int)((ai >> 23) & 0xFFu);
-    int exp_b = (int)((bi >> 23) & 0xFFu);
-    int exp_r = exp_a + exp_b - 127;
-
-    unsigned int mant_a = ai & 0x007FFFFFu;
-    unsigned int mant_b = bi & 0x007FFFFFu;
-    float log_a = __ldg(&dd_rac_log2_table[mant_a]);
-    float log_b = __ldg(&dd_rac_log2_table[mant_b]);
-    float log_sum = log_a + log_b;
-
-    int carry = (log_sum >= 1.0f) ? 1 : 0;
-    log_sum -= (float)carry;
-    exp_r += carry;
-
-    unsigned int exp_idx;
-    if (log_sum <= 0.0f) {
-        exp_idx = 0;
-    } else {
-        unsigned int ls_bits = __float_as_uint(log_sum);
-        unsigned int ls_exp = (ls_bits >> 23) & 0xFFu;
-        if (ls_exp + 23 >= 255) {
-            exp_idx = RAC_TABLE_SIZE - 1;
-        } else {
-            ls_bits += (23u << 23);
-            exp_idx = (unsigned int)__uint_as_float(ls_bits);
-            if (exp_idx >= (unsigned int)RAC_TABLE_SIZE) exp_idx = RAC_TABLE_SIZE - 1;
-        }
-    }
-    float mant_r = __ldg(&dd_rac_exp2_table[exp_idx]);
-
-    if (exp_r >= 255) return __uint_as_float(sign | 0x7F800000u);
-    if (exp_r <= 0) return 0.0f;
-
-    unsigned int mant_bits = __float_as_uint(mant_r) & 0x007FFFFFu;
-    return __uint_as_float(sign | ((unsigned int)exp_r << 23) | mant_bits);
-}
+/* RAC primitives use sign decomposition — no lookup tables needed */
 
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
-    return acc + rac_mul(a, b);
+    float mag_b = fabsf(b);
+    float proj = copysignf(a, b);  /* RAC: rotation = sign selection */
+    return fmaf(proj, mag_b, acc); /* RAC: scale + accumulate */
 }
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
@@ -688,10 +606,6 @@ void rac_matmul_micro8_tn_k(
 /* ── C-callable dispatch functions ───────────────────────────────────── */
 
 extern "C" {
-
-void rac_init_tables() {
-    rac_init_tables_hip();
-}
 
 void rac_launch_nn(
     const float* A, const float* B, float* C,
