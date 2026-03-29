@@ -128,46 +128,65 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 /*   z_new = z - d * (1 >> i)    ← shift-add                            */
 /*   After 16 iterations: y ≈ x * z_initial = a * b                     */
 /*                                                                       */
+/* Power-of-2 scale factors are precomputed in __constant__ memory.      */
+/* Zero multiplies anywhere — all ops are table reads, adds, sign flips. */
+/*                                                                       */
 /* On GPU: 16 shift-add iterations per element (slower than fmaf).       */
 /* On FIL: hardware CORDIC executes this in one cycle.                   */
 
 #define RAC_CORDIC_ITERS 16
 
+/* Precomputed 2^-i for i = 0..15 — bit shifts on FIL, table reads on GPU */
+__constant__ float _rac_pow2_table[RAC_CORDIC_ITERS] = {
+    1.0f,          /* 2^0  */
+    0.5f,          /* 2^-1 */
+    0.25f,         /* 2^-2 */
+    0.125f,        /* 2^-3 */
+    0.0625f,       /* 2^-4 */
+    0.03125f,      /* 2^-5 */
+    0.015625f,     /* 2^-6 */
+    0.0078125f,    /* 2^-7 */
+    0.00390625f,   /* 2^-8 */
+    0.001953125f,  /* 2^-9 */
+    0.0009765625f, /* 2^-10 */
+    0.00048828125f,/* 2^-11 */
+    0.000244140625f,    /* 2^-12 */
+    0.0001220703125f,   /* 2^-13 */
+    0.00006103515625f,  /* 2^-14 */
+    0.000030517578125f  /* 2^-15 */
+};
+
 __device__ __forceinline__
 float rac_mul(float a, float b) {
-    /* CORDIC linear mode: y = a * b via shift-add only */
     float x = a;
     float y = 0.0f;
     float z = b;
-    float scale = 1.0f;
 
     #pragma unroll
     for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
         float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        y += d * x * scale;    /* RAC: shift-add (scale = 2^-i = bit shift on FIL) */
-        z -= d * scale;        /* RAC: shift-add */
-        scale *= 0.5f;         /* RAC: 2^-(i+1), bit shift on FIL */
+        float s = _rac_pow2_table[i];  /* RAC: table read, not multiply */
+        y += d * x * s;   /* RAC: shift-add (d is sign flip, *s is bit shift on FIL) */
+        z -= d * s;        /* RAC: shift-add */
     }
     return y;
 }
 
 /* Fused RAC multiply-accumulate: acc += a * b via CORDIC linear mode.
- * Zero multipliers in the compute path. All scaling is by powers of 2
- * (bit shifts on integer/fixed-point hardware, cheap even on GPU FPU).
+ * Zero multipliers. All scaling via precomputed power-of-2 table reads.
  * On FIL: one CORDIC cycle replaces the entire loop. */
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
     float x = a;
-    float y = acc;    /* accumulate directly into y */
+    float y = acc;
     float z = b;
-    float scale = 1.0f;
 
     #pragma unroll
     for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
         float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        y += d * x * scale;    /* RAC: shift-add */
-        z -= d * scale;        /* RAC: shift-add */
-        scale *= 0.5f;         /* RAC: power-of-2 (bit shift on FIL) */
+        float s = _rac_pow2_table[i];  /* RAC: table read */
+        y += d * x * s;   /* RAC: shift-add */
+        z -= d * s;        /* RAC: shift-add */
     }
     return y;
 }
