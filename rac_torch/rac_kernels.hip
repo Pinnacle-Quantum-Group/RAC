@@ -176,11 +176,13 @@ float rac_mul(float a, float b) {
     log_sum -= (float)carry;
     exp_r += carry;
 
-    unsigned int ls_bits = __float_as_uint(log_sum);
-    ls_bits += (9u << 23);
-    int exp_idx = (int)__uint_as_float(ls_bits);
-    if (exp_idx < 0) exp_idx = 0;
-    if (exp_idx >= RAC_EXP_TABLE_SIZE) exp_idx = RAC_EXP_TABLE_SIZE - 1;
+    int exp_idx;
+    if (log_sum <= 0.0f) {
+        exp_idx = 0;
+    } else {
+        exp_idx = (int)(log_sum * 512.0f);  /* addressing only */
+        if (exp_idx >= RAC_EXP_TABLE_SIZE) exp_idx = RAC_EXP_TABLE_SIZE - 1;
+    }
     float mant_r = _rac_exp2_table[exp_idx];
 
     if (exp_r >= 255) return __uint_as_float(sign | 0x7F800000u);

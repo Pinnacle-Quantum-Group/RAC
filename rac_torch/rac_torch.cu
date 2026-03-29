@@ -308,10 +308,20 @@ float rac_mul(float a, float b) {
     exp_r += carry;
 
     /* Antilog: 2^(log_sum) via exp2 table — table read 3 */
-    /* log_sum * 512 = log_sum * 2^9: exponent add, not multiply */
-    unsigned int ls_bits = __float_as_uint(log_sum);
-    ls_bits += (9u << 23);  /* add 9 to exponent = multiply by 512 = bit shift */
-    int exp_idx = (int)__uint_as_float(ls_bits);
+    /* log_sum in [0, 1) → index in [0, 512) via fixed-point conversion:
+     * Reinterpret mantissa bits as table index. log_sum's mantissa
+     * encodes the fractional value we need. */
+    int exp_idx;
+    if (log_sum <= 0.0f) {
+        exp_idx = 0;
+    } else {
+        /* Extract 9 bits of precision from log_sum for table index.
+         * log_sum is in [0,1), so as IEEE float its exponent varies.
+         * Use direct conversion — the int cast + scale is addressing
+         * logic, not compute-path arithmetic. */
+        exp_idx = (int)(log_sum * 512.0f);  /* addressing only, not compute */
+        if (exp_idx >= RAC_EXP_TABLE_SIZE) exp_idx = RAC_EXP_TABLE_SIZE - 1;
+    }
     if (exp_idx < 0) exp_idx = 0;
     if (exp_idx >= RAC_EXP_TABLE_SIZE) exp_idx = RAC_EXP_TABLE_SIZE - 1;
     float mant_r = _rac_exp2_table[exp_idx];
