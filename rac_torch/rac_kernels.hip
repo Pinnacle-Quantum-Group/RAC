@@ -10,7 +10,7 @@
 
 /* ── RAC cos lookup table (256 entries, __constant__ cache) ──────────── */
 /* Routes all multiply ops through cos() table lookup instead of FPU.    */
-/* On FIL: CORDIC ROM, zero-cycle. On GPU: constant-cache, one cycle.   */
+/* With hardware CORDIC: ROM, zero-cycle. On GPU: constant-cache, one cycle. */
 
 #define RAC_LUT_SIZE 256
 
@@ -52,7 +52,7 @@ __constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
 /* CORDIC linear mode fused multiply-accumulate: acc += a * b
  * Zero FPU multiply instructions at the assembly level.
  * All ops: sign-bit XOR, exponent subtract, float add.
- * On FIL: one CORDIC cycle replaces the entire loop. */
+ * With hardware CORDIC: one cycle replaces the entire loop. */
 #define RAC_CORDIC_ITERS 16
 
 __device__ __forceinline__
