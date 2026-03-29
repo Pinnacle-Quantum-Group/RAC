@@ -16,6 +16,8 @@
 
 static float* d_rac_log2_table = nullptr;
 static float* d_rac_exp2_table = nullptr;
+__device__ float* dd_rac_log2_table = nullptr;
+__device__ float* dd_rac_exp2_table = nullptr;
 
 __global__ void _rac_fill_log2(float* table, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -28,7 +30,12 @@ __global__ void _rac_fill_exp2(float* table, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float x = (float)i / (float)n;
-    table[i] = __exp2f(x);
+    table[i] = exp2f(x);
+}
+
+__global__ void _rac_set_device_ptrs(float* log2, float* exp2) {
+    dd_rac_log2_table = log2;
+    dd_rac_exp2_table = exp2;
 }
 
 static void rac_init_tables_hip() {
@@ -39,6 +46,7 @@ static void rac_init_tables_hip() {
     int blocks = (RAC_TABLE_SIZE + threads - 1) / threads;
     _rac_fill_log2<<<blocks, threads>>>(d_rac_log2_table, RAC_TABLE_SIZE);
     _rac_fill_exp2<<<blocks, threads>>>(d_rac_exp2_table, RAC_TABLE_SIZE);
+    _rac_set_device_ptrs<<<1, 1>>>(d_rac_log2_table, d_rac_exp2_table);
     hipDeviceSynchronize();
 }
 
@@ -55,8 +63,8 @@ float rac_mul(float a, float b) {
 
     unsigned int mant_a = ai & 0x007FFFFFu;
     unsigned int mant_b = bi & 0x007FFFFFu;
-    float log_a = __ldg(&d_rac_log2_table[mant_a]);
-    float log_b = __ldg(&d_rac_log2_table[mant_b]);
+    float log_a = __ldg(&dd_rac_log2_table[mant_a]);
+    float log_b = __ldg(&dd_rac_log2_table[mant_b]);
     float log_sum = log_a + log_b;
 
     int carry = (log_sum >= 1.0f) ? 1 : 0;
@@ -77,7 +85,7 @@ float rac_mul(float a, float b) {
             if (exp_idx >= (unsigned int)RAC_TABLE_SIZE) exp_idx = RAC_TABLE_SIZE - 1;
         }
     }
-    float mant_r = __ldg(&d_rac_exp2_table[exp_idx]);
+    float mant_r = __ldg(&dd_rac_exp2_table[exp_idx]);
 
     if (exp_r >= 255) return __uint_as_float(sign | 0x7F800000u);
     if (exp_r <= 0) return 0.0f;

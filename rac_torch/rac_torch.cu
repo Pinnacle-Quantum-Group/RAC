@@ -170,6 +170,8 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 /* Device pointers — allocated by rac_init_tables() */
 static float* d_rac_log2_table = nullptr;
 static float* d_rac_exp2_table = nullptr;
+__device__ float* dd_rac_log2_table = nullptr;
+__device__ float* dd_rac_exp2_table = nullptr;
 
 /* Kernel to fill log2 table: entry[i] = log2(1.0 + i/2^23) */
 __global__ void _rac_fill_log2(float* table, int n) {
@@ -186,7 +188,12 @@ __global__ void _rac_fill_exp2(float* table, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float x = (float)i / (float)n;  /* x in [0, 1) */
-    table[i] = __exp2f(x);  /* 2^x in [1.0, 2.0) */
+    table[i] = exp2f(x);  /* 2^x in [1.0, 2.0) */
+}
+
+__global__ void _rac_set_device_ptrs(float* log2, float* exp2) {
+    dd_rac_log2_table = log2;
+    dd_rac_exp2_table = exp2;
 }
 
 /* Initialize tables — called once from Python module init */
@@ -205,6 +212,7 @@ static void rac_init_tables() {
     int blocks = (RAC_TABLE_SIZE + threads - 1) / threads;
     _rac_fill_log2<<<blocks, threads>>>(d_rac_log2_table, RAC_TABLE_SIZE);
     _rac_fill_exp2<<<blocks, threads>>>(d_rac_exp2_table, RAC_TABLE_SIZE);
+    _rac_set_device_ptrs<<<1, 1>>>(d_rac_log2_table, d_rac_exp2_table);
 
     #ifdef __HIP__
     hipDeviceSynchronize();
@@ -243,8 +251,8 @@ float rac_mul(float a, float b) {
     /* Mantissa: full 23-bit index into 8M-entry log2 table */
     unsigned int mant_a = ai & 0x007FFFFFu;
     unsigned int mant_b = bi & 0x007FFFFFu;
-    float log_a = __ldg(&d_rac_log2_table[mant_a]);  /* L2 cached read */
-    float log_b = __ldg(&d_rac_log2_table[mant_b]);  /* L2 cached read */
+    float log_a = __ldg(&dd_rac_log2_table[mant_a]);  /* L2 cached read */
+    float log_b = __ldg(&dd_rac_log2_table[mant_b]);  /* L2 cached read */
     float log_sum = log_a + log_b;                     /* float add only */
 
     /* Carry: if product mantissa >= 2.0, increment exponent */
@@ -270,7 +278,7 @@ float rac_mul(float a, float b) {
             if (exp_idx >= (unsigned int)RAC_TABLE_SIZE) exp_idx = RAC_TABLE_SIZE - 1;
         }
     }
-    float mant_r = __ldg(&d_rac_exp2_table[exp_idx]);  /* L2 cached read */
+    float mant_r = __ldg(&dd_rac_exp2_table[exp_idx]);  /* L2 cached read */
 
     /* Guards */
     if (exp_r >= 255) return __uint_as_float(sign | 0x7F800000u);
