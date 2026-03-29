@@ -136,44 +136,51 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 
 #define RAC_CORDIC_ITERS 16
 
-/* Precomputed 2^-i for i = 0..15 — bit shifts on FIL, table reads on GPU */
-__constant__ float _rac_pow2_table[RAC_CORDIC_ITERS] = {
-    1.0f,          /* 2^0  */
-    0.5f,          /* 2^-1 */
-    0.25f,         /* 2^-2 */
-    0.125f,        /* 2^-3 */
-    0.0625f,       /* 2^-4 */
-    0.03125f,      /* 2^-5 */
-    0.015625f,     /* 2^-6 */
-    0.0078125f,    /* 2^-7 */
-    0.00390625f,   /* 2^-8 */
-    0.001953125f,  /* 2^-9 */
-    0.0009765625f, /* 2^-10 */
-    0.00048828125f,/* 2^-11 */
-    0.000244140625f,    /* 2^-12 */
-    0.0001220703125f,   /* 2^-13 */
-    0.00006103515625f,  /* 2^-14 */
-    0.000030517578125f  /* 2^-15 */
-};
+/* ── Bit-level CORDIC helpers: zero FPU multiply instructions ──────── */
+/* d * x:     XOR sign bit (1 integer op, 0 FPU ops)                    */
+/* x * 2^-i:  subtract i from IEEE 754 exponent (1 integer op, 0 FPU)  */
+/* On FIL: both are hardwired — zero cycles.                            */
+
+__device__ __forceinline__
+float _rac_sign_flip(float x, float z) {
+    /* if z < 0: flip sign of x. Pure integer bit op, no FPU. */
+    unsigned int xi = __float_as_uint(x);
+    unsigned int zi = __float_as_uint(z);
+    xi ^= (zi & 0x80000000u);  /* XOR sign bit of z into x */
+    return __uint_as_float(xi);
+}
+
+__device__ __forceinline__
+float _rac_shift(float x, int i) {
+    /* x * 2^-i via exponent subtract. No FPU multiply.
+     * Handles zero/denormal: if x == 0, stay zero. */
+    unsigned int xi = __float_as_uint(x);
+    if (xi == 0 || (xi & 0x7F800000u) == 0) return 0.0f;  /* zero/denormal guard */
+    xi -= ((unsigned int)i << 23);  /* subtract i from exponent field */
+    return __uint_as_float(xi);
+}
 
 __device__ __forceinline__
 float rac_mul(float a, float b) {
+    /* CORDIC linear mode: a * b via pure integer bit ops + float adds.
+     * Zero FPU multiply instructions. */
     float x = a;
     float y = 0.0f;
     float z = b;
 
     #pragma unroll
     for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
-        float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        float s = _rac_pow2_table[i];  /* RAC: table read, not multiply */
-        y += d * x * s;   /* RAC: shift-add (d is sign flip, *s is bit shift on FIL) */
-        z -= d * s;        /* RAC: shift-add */
+        float dx = _rac_sign_flip(x, z);      /* d * x: sign bit XOR */
+        float shifted = _rac_shift(dx, i);     /* d * x * 2^-i: exponent subtract */
+        y += shifted;                           /* accumulate: float add only */
+        float dz = _rac_sign_flip(_rac_shift(__uint_as_float(0x3F800000u), i), z);
+        z -= dz;                                /* z -= d * 2^-i */
     }
     return y;
 }
 
 /* Fused RAC multiply-accumulate: acc += a * b via CORDIC linear mode.
- * Zero multipliers. All scaling via precomputed power-of-2 table reads.
+ * Zero FPU multiplies. All ops are: sign-bit XOR, exponent subtract, float add.
  * On FIL: one CORDIC cycle replaces the entire loop. */
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
@@ -183,10 +190,11 @@ float rac_fma(float a, float b, float acc) {
 
     #pragma unroll
     for (int i = 0; i < RAC_CORDIC_ITERS; i++) {
-        float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        float s = _rac_pow2_table[i];  /* RAC: table read */
-        y += d * x * s;   /* RAC: shift-add */
-        z -= d * s;        /* RAC: shift-add */
+        float dx = _rac_sign_flip(x, z);      /* d * x: sign bit XOR */
+        float shifted = _rac_shift(dx, i);     /* d * x * 2^-i: exponent subtract */
+        y += shifted;                           /* accumulate: float add only */
+        float dz = _rac_sign_flip(_rac_shift(__uint_as_float(0x3F800000u), i), z);
+        z -= dz;                                /* z -= d * 2^-i */
     }
     return y;
 }
