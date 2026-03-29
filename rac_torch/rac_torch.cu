@@ -169,16 +169,23 @@ __constant__ float _rac_sin_lut[RAC_LUT_SIZE] = {
 
 __device__ __forceinline__
 float rac_mul(float a, float b) {
-    float mag_b = fabsf(b);
-    float proj = copysignf(a, b);  /* RAC: rotation = sign selection */
-    return proj * mag_b;           /* RAC: magnitude scaling */
+    /* RAC: decompose b into sign + magnitude, apply sign to a via XOR */
+    unsigned int ai = __float_as_uint(a);
+    unsigned int bi = __float_as_uint(b);
+    unsigned int sign_b = bi & 0x80000000u;          /* extract b's sign */
+    float proj = __uint_as_float(ai ^ sign_b);       /* flip a's sign if b negative */
+    float mag_b = __uint_as_float(bi & 0x7FFFFFFFu); /* |b| via clear sign bit */
+    return proj * mag_b;                              /* RAC: magnitude scaling */
 }
 
 __device__ __forceinline__
 float rac_fma(float a, float b, float acc) {
-    float mag_b = fabsf(b);
-    float proj = copysignf(a, b);  /* RAC: rotation */
-    return fmaf(proj, mag_b, acc); /* RAC: scale + accumulate */
+    unsigned int ai = __float_as_uint(a);
+    unsigned int bi = __float_as_uint(b);
+    unsigned int sign_b = bi & 0x80000000u;
+    float proj = __uint_as_float(ai ^ sign_b);       /* RAC: rotation via sign XOR */
+    float mag_b = __uint_as_float(bi & 0x7FFFFFFFu); /* |b| */
+    return fmaf(proj, mag_b, acc);                    /* RAC: project + accumulate */
 }
 
 #include <torch/extension.h>
