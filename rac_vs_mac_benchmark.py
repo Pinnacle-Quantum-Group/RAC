@@ -638,9 +638,10 @@ def main():
 
   GPU hardware context:
     GPU FPU multipliers execute fmaf in 1 cycle. RAC's rac_fma()
-    runs 16 CORDIC shift-add iterations per element — more instructions
-    on hardware with dedicated multipliers. This is the cost of proving
-    multiply-free computation on multiply-optimized hardware.
+    runs 16 CORDIC iterations using only integer bit ops (sign-bit XOR,
+    exponent subtract) and float adds — zero FPU multiply instructions
+    at the assembly level. More instructions per element, but no
+    multiplier hardware is touched.
     RAC+GELU overcomes this by fusing operations that MAC cannot fuse,
     eliminating memory round-trips that dominate at scale.
 
