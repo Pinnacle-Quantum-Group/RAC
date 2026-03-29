@@ -10,7 +10,7 @@
 
 /* ── RAC cos lookup table (256 entries, __constant__ cache) ──────────── */
 /* Routes all multiply ops through cos() table lookup instead of FPU.    */
-/* On FIL: CORDIC ROM, zero-cycle. On GPU: constant-cache, one cycle.   */
+/* With hardware CORDIC: ROM, zero-cycle. On GPU: constant-cache, one cycle. */
 
 #define RAC_LUT_SIZE 256
 
@@ -52,7 +52,7 @@ __constant__ float _rac_cos_lut[RAC_LUT_SIZE] = {
 /* CORDIC linear mode fused multiply-accumulate: acc += a * b
  * Zero FPU multiply instructions at the assembly level.
  * All ops: sign-bit XOR, exponent subtract, float add.
- * On FIL: one CORDIC cycle replaces the entire loop. */
+ * With hardware CORDIC: one cycle replaces the entire loop. */
 #define RAC_CORDIC_ITERS 16
 
 __device__ __forceinline__
@@ -65,10 +65,16 @@ float _rac_sign_flip(float x, float z) {
 
 __device__ __forceinline__
 float _rac_shift(float x, int i) {
+    if (i == 0) return x;
     unsigned int xi = __float_as_uint(x);
-    if (xi == 0 || (xi & 0x7F800000u) == 0) return 0.0f;
-    xi -= ((unsigned int)i << 23);
-    return __uint_as_float(xi);
+    unsigned int sign = xi & 0x80000000u;
+    unsigned int abs_xi = xi & 0x7FFFFFFFu;
+    if (abs_xi == 0) return 0.0f;
+    int exp_bits = (int)((abs_xi >> 23) & 0xFFu);
+    exp_bits -= i;
+    if (exp_bits <= 0) return 0.0f;
+    abs_xi = (abs_xi & 0x007FFFFFu) | ((unsigned int)exp_bits << 23);
+    return __uint_as_float(sign | abs_xi);
 }
 
 __device__ __forceinline__
@@ -82,8 +88,9 @@ float rac_fma(float a, float b, float acc) {
         float dx = _rac_sign_flip(x, z);
         float shifted = _rac_shift(dx, i);
         y += shifted;
-        float dz = _rac_sign_flip(_rac_shift(__uint_as_float(0x3F800000u), i), z);
-        z -= dz;
+        float s2 = _rac_shift(__uint_as_float(0x3F800000u), i);
+        float ds = _rac_sign_flip(s2, z);
+        z -= ds;
     }
     return y;
 }

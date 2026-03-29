@@ -645,11 +645,12 @@ def main():
     RAC+GELU overcomes this by fusing operations that MAC cannot fuse,
     eliminating memory round-trips that dominate at scale.
 
-  FIL hardware projection:
-    On FIL, each CORDIC iteration is a hardware shift-add — the entire
-    16-iteration loop executes in one cycle, replacing the multiplier.
-    RAC raw matmul matches or exceeds MAC, and RAC+GELU compounds
-    the advantage. GPU results represent a lower bound.
+  Hardware CORDIC projection:
+    With a hardware CORDIC unit, each iteration is a hardwired
+    shift-add — the entire 16-iteration loop executes in one cycle,
+    replacing the multiplier entirely. RAC raw matmul matches or
+    exceeds MAC, and RAC+GELU compounds the advantage.
+    GPU results represent a lower bound on RAC's potential.
 """)
 
     print("=" * 90)
