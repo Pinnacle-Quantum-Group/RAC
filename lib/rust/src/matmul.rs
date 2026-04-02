@@ -95,6 +95,11 @@ pub fn fused_linear(
     if input.len() < m * k || weight.len() < n * k || output.len() < m * n {
         return Err(RacError::InvalidDimension);
     }
+    if let Some(b) = bias {
+        if b.len() < n {
+            return Err(RacError::InvalidDimension);
+        }
+    }
 
     let apply_act = |x: f32| -> f32 {
         match act {
@@ -205,5 +210,38 @@ mod tests {
         // out[1] = relu(1*(-1) + (-1)*1 + (-5)) = relu(-7) = 0
         assert!((output[0] - 0.0).abs() < 0.01);
         assert!((output[1] - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sgemm_invalid_dimension_returns_error() {
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [1.0f32, 2.0, 3.0, 4.0];
+        let mut c = [0.0f32; 3];
+
+        let err = sgemm(&a, &b, &mut c, 2, 2, 2, 1.0, 0.0, &Config::default()).unwrap_err();
+        assert_eq!(err, RacError::InvalidDimension);
+    }
+
+    #[test]
+    fn test_fused_linear_short_bias_returns_error() {
+        let input = [1.0f32, 2.0]; // 1x2
+        let weight = [1.0f32, 0.0, 0.0, 1.0]; // 2x2
+        let bias = [0.5f32]; // should be len 2
+        let mut output = [0.0f32; 2];
+
+        let err = fused_linear(
+            &input,
+            &weight,
+            Some(&bias),
+            &mut output,
+            1,
+            2,
+            2,
+            Activation::None,
+            &Config::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, RacError::InvalidDimension);
     }
 }
