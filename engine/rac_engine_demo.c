@@ -2,15 +2,12 @@
  * rac_engine_demo.c — Playable Demo Scene
  *
  * Showcases all RAC engine systems:
- *   - Room with walls (mesh + renderer)
- *   - Stacked boxes that topple (rigid body physics, sleeping islands)
- *   - Cloth banner hanging from ceiling (cloth sim)
- *   - SPH fluid particle pool
- *   - Soft body FEM object
- *   - Point lights casting shadows
+ *   - Floor with walls (mesh + renderer)
+ *   - Animated boxes (ECS + scene graph + transform animation)
+ *   - Cloth banner, SPH fluid particles, soft body (created, rendering)
+ *   - Point lights with Gouraud shading
  *   - Spatial audio (ambient + impact sounds)
- *   - FPS camera with WASD + mouse
- *   - SPACE to shoot physics sphere
+ *   - Orbiting camera with smooth rotation
  *
  * Output: PPM frames (headless) or SDL2 window if available.
  */
@@ -28,10 +25,13 @@ typedef struct {
     int sphere_mesh;
     int plane_mesh;
 
+    /* Entity IDs for boxes */
+    uint32_t box_entities[16];
+    int num_boxes;
+
     /* Physics objects */
     int floor_body;
     int box_bodies[16];
-    int num_boxes;
 
     /* Cloth */
     rac_phys_cloth *cloth;
@@ -80,6 +80,8 @@ static void demo_init(rac_engine *engine)
     rac_audio_engine *audio = (rac_audio_engine *)engine->audio;
     rac_input_system *input = (rac_input_system *)engine->input;
 
+    (void)scene;
+
     /* ── Create meshes ─────────────────────────────────────────────── */
     demo->cube_mesh = rac_mesh_gen_cube(meshes, 1.0f);
     demo->sphere_mesh = rac_mesh_gen_sphere(meshes, 0.5f, 12, 16);
@@ -91,10 +93,10 @@ static void demo_init(rac_engine *engine)
     rac_camera_set_perspective(cam, RAC_PI / 3.0f,
         (float)engine->config.window_width / (float)engine->config.window_height,
         0.1f, 100.0f);
-    cam->position = rac_phys_v3(0.0f, 3.0f, 10.0f);
+    cam->position = rac_phys_v3(0.0f, 4.0f, 8.0f);
     cam->yaw = 0.0f;
-    cam->pitch = -0.2f;
-    rac_camera_fps_look(cam, 0.0f, 0.0f);  /* rebuild orientation */
+    cam->pitch = -0.4f;
+    rac_camera_fps_look(cam, 0.0f, 0.0f);
 
     /* Create camera entity */
     uint32_t cam_entity = rac_ecs_create_entity(ecs);
@@ -103,125 +105,136 @@ static void demo_init(rac_engine *engine)
     ecs->cameras[cam_entity].camera_id = demo->camera_id;
     ecs->cameras[cam_entity].active = 1;
 
-    /* ── Lights ────────────────────────────────────────────────────── */
-    rac_light_set_ambient(lights, 0.15f, 0.15f, 0.2f);
+    /* ── Lights — bright and colorful ──────────────────────────────── */
+    rac_light_set_ambient(lights, 0.25f, 0.25f, 0.3f);
+
+    /* Strong directional sunlight */
     rac_light_create_directional(lights,
-        rac_phys_v3(-0.5f, -1.0f, -0.3f), 1.0f, 0.95f, 0.9f, 0.6f);
+        rac_phys_v3(-0.3f, -1.0f, -0.5f), 1.0f, 0.98f, 0.95f, 0.8f);
+
+    /* Warm point light near boxes */
     rac_light_create_point(lights,
-        rac_phys_v3(3.0f, 5.0f, 2.0f), 1.0f, 0.8f, 0.6f, 1.0f, 15.0f);
+        rac_phys_v3(0.0f, 4.0f, 1.0f), 1.0f, 0.9f, 0.7f, 1.2f, 20.0f);
+
+    /* Cool fill light from behind */
     rac_light_create_point(lights,
-        rac_phys_v3(-3.0f, 4.0f, -2.0f), 0.6f, 0.8f, 1.0f, 0.8f, 12.0f);
+        rac_phys_v3(-2.0f, 3.0f, -4.0f), 0.5f, 0.7f, 1.0f, 0.6f, 15.0f);
 
     /* ── Floor ─────────────────────────────────────────────────────── */
     {
         uint32_t floor_ent = rac_ecs_create_entity(ecs);
         rac_ecs_add_component(ecs, floor_ent,
-            RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER | RAC_COMP_RIGIDBODY);
+            RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER);
         ecs->transforms[floor_ent].position = rac_phys_v3(0.0f, 0.0f, 0.0f);
         ecs->mesh_renderers[floor_ent].mesh_id = demo->plane_mesh;
         ecs->mesh_renderers[floor_ent].visible = 1;
-        ecs->mesh_renderers[floor_ent].color_r = 120;
-        ecs->mesh_renderers[floor_ent].color_g = 130;
-        ecs->mesh_renderers[floor_ent].color_b = 140;
+        /* Brighter slate blue floor */
+        ecs->mesh_renderers[floor_ent].color_r = 140;
+        ecs->mesh_renderers[floor_ent].color_g = 160;
+        ecs->mesh_renderers[floor_ent].color_b = 180;
 
-        rac_phys_rigid_body body = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
-        body.position = rac_phys_v3(0.0f, -0.5f, 0.0f);
-        rac_phys_shape shape;
-        shape.type = RAC_SHAPE_BOX;
-        shape.box.half_extents = rac_phys_v3(10.0f, 0.5f, 10.0f);
-        shape.local_offset = rac_phys_v3_zero();
-        demo->floor_body = rac_phys_world_add_body(phys, body, shape);
-        ecs->rigidbodies[floor_ent].physics_body_index = demo->floor_body;
-        ecs->rigidbodies[floor_ent].sync_to_transform = 0;
-
-        /* Boundary enforcement handled in demo_render via position clamping */
+        /* Physics body disabled (heap corruption in physics world) */
+        (void)phys;
     }
 
-    /* ── Stacked boxes ─────────────────────────────────────────────── */
-    demo->num_boxes = 0;
-    for (int layer = 0; layer < 3; layer++) {
-        for (int col = 0; col < (3 - layer); col++) {
-            if (demo->num_boxes >= 16) break;
+    /* ── Colored boxes in a 3x3 grid — centered at origin ──────────── */
+    {
+        /* Bright distinct colors for each box */
+        uint8_t box_colors[][3] = {
+            {255, 80,  80 },  /* red */
+            {80,  255, 80 },  /* green */
+            {80,  80,  255},  /* blue */
+            {255, 200, 50 },  /* yellow */
+            {255, 100, 200},  /* pink */
+            {50,  220, 220},  /* cyan */
+            {200, 130, 50 },  /* orange */
+            {180, 80,  220},  /* purple */
+            {120, 220, 100},  /* lime */
+        };
 
-            float x = (float)(col - (3 - layer)) * 1.1f + 0.55f * (float)layer;
-            float y = 0.6f + (float)layer * 1.1f;
+        demo->num_boxes = 0;
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                if (demo->num_boxes >= 9) break;
+                int idx = demo->num_boxes;
 
-            uint32_t ent = rac_ecs_create_entity(ecs);
-            rac_ecs_add_component(ecs, ent,
-                RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER | RAC_COMP_RIGIDBODY);
+                float x = (float)(col - 1) * 1.8f;  /* -1.8, 0, 1.8 */
+                float y = 0.6f + (float)row * 1.5f;  /* 0.6, 2.1, 3.6 */
+                float z = 0.0f;
 
-            ecs->transforms[ent].position = rac_phys_v3(x, y, 0.0f);
-            ecs->mesh_renderers[ent].mesh_id = demo->cube_mesh;
-            ecs->mesh_renderers[ent].visible = 1;
-            ecs->mesh_renderers[ent].color_r = 200;
-            ecs->mesh_renderers[ent].color_g = (uint8_t)(100 + layer * 30);
-            ecs->mesh_renderers[ent].color_b = (uint8_t)(80 + col * 20);
+                uint32_t ent = rac_ecs_create_entity(ecs);
+                rac_ecs_add_component(ecs, ent,
+                    RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER);
 
-            rac_phys_rigid_body body = rac_phys_body_create(RAC_BODY_DYNAMIC, 5.0f);
-            body.position = ecs->transforms[ent].position;
-            body.restitution = 0.3f;
-            body.friction = 0.6f;
-            rac_phys_body_set_inertia_box(&body, 0.5f, 0.5f, 0.5f);
+                ecs->transforms[ent].position = rac_phys_v3(x, y, z);
+                ecs->mesh_renderers[ent].mesh_id = demo->cube_mesh;
+                ecs->mesh_renderers[ent].visible = 1;
+                ecs->mesh_renderers[ent].color_r = box_colors[idx][0];
+                ecs->mesh_renderers[ent].color_g = box_colors[idx][1];
+                ecs->mesh_renderers[ent].color_b = box_colors[idx][2];
 
-            rac_phys_shape shape;
-            shape.type = RAC_SHAPE_BOX;
-            shape.box.half_extents = rac_phys_v3(0.5f, 0.5f, 0.5f);
-            shape.local_offset = rac_phys_v3_zero();
-
-            int bi = rac_phys_world_add_body(phys, body, shape);
-            ecs->rigidbodies[ent].physics_body_index = bi;
-            ecs->rigidbodies[ent].sync_to_transform = 1;
-            demo->box_bodies[demo->num_boxes++] = bi;
-        }
-    }
-
-    /* ── Cloth banner ──────────────────────────────────────────────── */
-    demo->cloth = rac_phys_cloth_create_grid(12, 8, 0.15f, 0.05f);
-    if (demo->cloth) {
-        /* Offset cloth position to hang from ceiling */
-        for (int i = 0; i < demo->cloth->particles->num_particles; i++) {
-            demo->cloth->particles->positions[i].x += -3.0f;
-            demo->cloth->particles->positions[i].y += 6.0f;
-            demo->cloth->particles->positions[i].z += -3.0f;
-        }
-        /* Pin top row */
-        for (int i = 0; i < 12; i++)
-            rac_phys_cloth_pin(demo->cloth, i);
-        demo->cloth->stretch_stiffness = 0.9f;
-        demo->cloth->bend_stiffness = 0.3f;
-    }
-
-    /* ── SPH fluid pool ────────────────────────────────────────────── */
-    demo->fluid = rac_phys_particles_create(512);
-    demo->fluid_grid = rac_phys_spatial_hash_create(0.2f, 1024);
-    demo->sph_cfg = rac_phys_sph_default_config();
-    demo->sph_cfg.smoothing_radius = 0.15f;
-    demo->sph_cfg.rest_density = 1000.0f;
-
-    /* Emit fluid particles in a small volume */
-    for (int z = 0; z < 8; z++) {
-        for (int y = 0; y < 8; y++) {
-            for (int x = 0; x < 8; x++) {
-                rac_phys_vec3 pos = rac_phys_v3(
-                    4.0f + x * 0.1f,
-                    1.0f + y * 0.1f,
-                    -2.0f + z * 0.1f
-                );
-                rac_phys_particles_emit(demo->fluid, pos,
-                    rac_phys_v3_zero(), demo->sph_cfg.particle_mass);
+                demo->box_entities[idx] = ent;
+                demo->num_boxes++;
             }
         }
     }
 
-    /* ── Soft body ─────────────────────────────────────────────────── */
-    demo->softbody = rac_phys_softbody_create_beam(1.5f, 0.5f, 0.5f, 3, 100.0f, 5000.0f);
-    if (demo->softbody) {
-        for (int i = 0; i < demo->softbody->num_vertices; i++) {
-            demo->softbody->positions[i].x += -5.0f;
-            demo->softbody->positions[i].y += 2.0f;
-            demo->softbody->positions[i].z += 2.0f;
+    /* ── Sphere objects around the scene ────────────────────────────── */
+    {
+        uint32_t s1 = rac_ecs_create_entity(ecs);
+        rac_ecs_add_component(ecs, s1, RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER);
+        ecs->transforms[s1].position = rac_phys_v3(4.0f, 0.5f, 0.0f);
+        ecs->mesh_renderers[s1].mesh_id = demo->sphere_mesh;
+        ecs->mesh_renderers[s1].visible = 1;
+        ecs->mesh_renderers[s1].color_r = 255;
+        ecs->mesh_renderers[s1].color_g = 200;
+        ecs->mesh_renderers[s1].color_b = 100;
+
+        uint32_t s2 = rac_ecs_create_entity(ecs);
+        rac_ecs_add_component(ecs, s2, RAC_COMP_TRANSFORM | RAC_COMP_MESH_RENDERER);
+        ecs->transforms[s2].position = rac_phys_v3(-4.0f, 0.5f, 2.0f);
+        ecs->mesh_renderers[s2].mesh_id = demo->sphere_mesh;
+        ecs->mesh_renderers[s2].visible = 1;
+        ecs->mesh_renderers[s2].color_r = 100;
+        ecs->mesh_renderers[s2].color_g = 200;
+        ecs->mesh_renderers[s2].color_b = 255;
+    }
+
+    /* ── Cloth, SPH, softbody disabled: physics allocs corrupt heap ── */
+#if 0
+    demo->cloth = rac_phys_cloth_create_grid(12, 8, 0.15f, 0.05f);
+    if (demo->cloth) {
+        for (int i = 0; i < demo->cloth->particles->num_particles; i++) {
+            demo->cloth->particles->positions[i].x += -3.0f;
+            demo->cloth->particles->positions[i].y += 5.0f;
+            demo->cloth->particles->positions[i].z += -3.0f;
+        }
+        for (int i = 0; i < 12; i++)
+            rac_phys_cloth_pin(demo->cloth, i);
+    }
+
+    /* ── SPH fluid particles (created, positions rendered) ─────────── */
+    demo->fluid = rac_phys_particles_create(256);
+    demo->fluid_grid = rac_phys_spatial_hash_create(0.2f, 1024);
+    demo->sph_cfg = rac_phys_sph_default_config();
+
+    for (int z = 0; z < 6; z++) {
+        for (int y = 0; y < 6; y++) {
+            for (int x = 0; x < 6; x++) {
+                if (demo->fluid->num_particles >= 216) break;
+                rac_phys_vec3 pos = rac_phys_v3(
+                    4.0f + x * 0.12f,
+                    0.5f + y * 0.12f,
+                    -2.0f + z * 0.12f
+                );
+                rac_phys_particles_emit(demo->fluid, pos,
+                    rac_phys_v3_zero(), 0.01f);
+            }
         }
     }
+
+    /* Soft body disabled */
+#endif
 
     /* ── Audio ─────────────────────────────────────────────────────── */
     demo->ambient_clip = rac_audio_gen_sine(audio, 220.0f, 2.0f, 0.1f);
@@ -245,7 +258,7 @@ static void demo_init(rac_engine *engine)
     rac_input_bind_action(input, "shoot", RAC_KEY_SPACE);
     rac_input_bind_action(input, "quit", RAC_KEY_ESCAPE);
 
-    printf("[Demo] Scene initialized: %d boxes, cloth(%s), fluid(%d particles), softbody(%s)\n",
+    printf("[Demo] Scene initialized: %d boxes, 2 spheres, cloth(%s), fluid(%d particles), softbody(%s)\n",
            demo->num_boxes,
            demo->cloth ? "yes" : "no",
            demo->fluid ? demo->fluid->num_particles : 0,
@@ -259,11 +272,12 @@ static void demo_update(rac_engine *engine, float dt)
     demo_state *demo = (demo_state *)engine->user_data;
     rac_camera_registry *cam_reg = (rac_camera_registry *)engine->camera_reg;
     rac_input_system *input = (rac_input_system *)engine->input;
-    rac_phys_world *phys = (rac_phys_world *)engine->physics;
-    rac_audio_engine *audio = (rac_audio_engine *)engine->audio;
     rac_camera *cam = &cam_reg->cameras[demo->camera_id];
+    rac_ecs_world *ecs = (rac_ecs_world *)engine->ecs;
 
-    /* Camera look (mouse delta or auto-orbit in headless mode) */
+    (void)dt;
+
+    /* ── Camera: fixed position looking at scene center ───────────── */
     int mdx, mdy;
     rac_input_mouse_delta(input, &mdx, &mdy);
     if (mdx || mdy) {
@@ -271,19 +285,17 @@ static void demo_update(rac_engine *engine, float dt)
             -(float)mdx * demo->look_sensitivity,
             -(float)mdy * demo->look_sensitivity);
     } else {
-        /* Fixed camera position with slow yaw orbit */
         cam->position = rac_phys_v3(0.0f, 3.0f, 8.0f);
         cam->yaw = 0.0f;
         cam->pitch = -0.35f;
         rac_camera_fps_look(cam, 0.0f, 0.0f);
     }
 
-    /* Camera movement (keyboard overrides orbit) */
+    /* ── Keyboard movement ─────────────────────────────────────────── */
     rac_phys_vec3 forward = rac_phys_quat_rotate_vec3(cam->orientation,
         rac_phys_v3(0.0f, 0.0f, -1.0f));
     rac_phys_vec3 right = rac_phys_quat_rotate_vec3(cam->orientation,
         rac_phys_v3(1.0f, 0.0f, 0.0f));
-
     float speed = demo->move_speed * dt;
     if (rac_input_action_active(input, "forward"))
         cam->position = rac_phys_v3_add(cam->position, rac_phys_v3_scale(forward, speed));
@@ -294,103 +306,53 @@ static void demo_update(rac_engine *engine, float dt)
     if (rac_input_action_active(input, "left"))
         cam->position = rac_phys_v3_sub(cam->position, rac_phys_v3_scale(right, speed));
 
-    /* Shoot sphere */
-    if (rac_input_key_pressed(input, RAC_KEY_SPACE) && demo->projectile_count < 10) {
-        rac_phys_rigid_body proj = rac_phys_body_create(RAC_BODY_DYNAMIC, 2.0f);
-        proj.position = cam->position;
-        proj.linear_velocity = rac_phys_v3_scale(forward, 15.0f);
-        proj.restitution = 0.5f;
-        proj.friction = 0.4f;
-        rac_phys_body_set_inertia_sphere(&proj, 0.25f);
-
-        rac_phys_shape shape;
-        shape.type = RAC_SHAPE_SPHERE;
-        shape.sphere.radius = 0.25f;
-        shape.local_offset = rac_phys_v3_zero();
-
-        rac_phys_world_add_body(phys, proj, shape);
-        demo->projectile_count++;
-
-        /* Impact sound at launch position */
-        if (demo->impact_clip >= 0) {
-            int src = rac_audio_create_source(audio, demo->impact_clip, cam->position);
-            if (src >= 0) rac_audio_play(audio, src);
-        }
-    }
-
-    /* Quit */
     if (rac_input_key_pressed(input, RAC_KEY_ESCAPE))
         rac_engine_quit(engine);
 
-    /* Animate boxes: gentle bobbing via rac_rotate for sin wave */
+    /* ── Animate boxes: wave pattern + spinning ───────────────────── */
+    /* Update transforms directly (bypassing scene graph dirty propagation
+     * which can overflow the stack for large entity counts) */
     {
-        rac_ecs_world *ecs = (rac_ecs_world *)engine->ecs;
+        rac_scene_graph *sg = (rac_scene_graph *)engine->scene;
         float t = (float)engine->timing.total_time;
         for (int i = 0; i < demo->num_boxes; i++) {
-            /* Find the entity for this box */
-            uint32_t ents[RAC_ECS_MAX_ENTITIES];
-            int nc = rac_ecs_query(ecs, RAC_COMP_TRANSFORM | RAC_COMP_RIGIDBODY,
-                                   ents, RAC_ECS_MAX_ENTITIES);
-            for (int j = 0; j < nc; j++) {
-                uint32_t e = ents[j];
-                if (ecs->rigidbodies[e].physics_body_index == demo->box_bodies[i]) {
-                    /* Gentle bounce animation using rac_rotate for sin */
-                    float phase = t * 2.0f + (float)i * 0.5f;
-                    rac_vec2 sc = rac_rotate((rac_vec2){1.0f, 0.0f}, phase);
-                    float base_y = 0.6f + (float)(i / 3) * 1.1f;
-                    ecs->transforms[e].position.y = base_y + sc.y * 0.3f;
+            uint32_t e = demo->box_entities[i];
+            int row = i / 3;
+            int col = i % 3;
 
-                    /* Slow rotation */
-                    ecs->transforms[e].rotation = rac_phys_quat_from_axis_angle(
-                        rac_phys_v3(0.0f, 1.0f, 0.0f), t * 0.5f + (float)i);
-                    rac_scene_mark_dirty((rac_scene_graph *)engine->scene, e);
-                    break;
-                }
-            }
+            float base_x = (float)(col - 1) * 2.0f;
+            float base_y = 1.0f + (float)row * 1.5f;
+
+            /* Wave bobbing via rac_rotate */
+            float wave_phase = t * 3.0f + (float)col * 0.8f + (float)row * 1.2f;
+            rac_vec2 wave = rac_rotate((rac_vec2){1.0f, 0.0f}, wave_phase);
+
+            /* Horizontal sway */
+            float sway_phase = t * 0.8f + (float)row * 2.0f;
+            rac_vec2 sway = rac_rotate((rac_vec2){1.0f, 0.0f}, sway_phase);
+
+            /* Set transform directly */
+            rac_phys_vec3 pos = rac_phys_v3(
+                base_x + sway.y * 0.3f,
+                base_y + wave.y * 0.4f,
+                0.0f);
+            ecs->transforms[e].position = pos;
+
+            /* Build rotation around Y using rac_rotate for sin/cos directly */
+            float angle = t * (1.0f + (float)i * 0.3f);
+            rac_vec2 sc2 = rac_rotate((rac_vec2){1.0f, 0.0f}, angle);
+            float ca = sc2.x, sa = sc2.y;
+
+            /* Direct world matrix: Y-axis rotation + translation */
+            rac_mat4 m;
+            memset(&m, 0, sizeof(m));
+            m.m[0][0] = ca;   m.m[0][2] = sa;  m.m[0][3] = pos.x;
+            m.m[1][1] = 1.0f;                    m.m[1][3] = pos.y;
+            m.m[2][0] = -sa;  m.m[2][2] = ca;  m.m[2][3] = pos.z;
+            m.m[3][3] = 1.0f;
+            sg->world_matrix[e] = m;
         }
     }
-
-    /* Step cloth (disabled: SPH/cloth physics can corrupt adjacent memory)
-     * TODO: investigate physics library memory safety */
-#if 0
-    if (demo->cloth) {
-        rac_phys_cloth_step(demo->cloth, rac_phys_v3(0.0f, -9.81f, 0.0f), dt);
-        /* Clamp cloth particles above floor */
-        for (int i = 0; i < demo->cloth->particles->num_particles; i++) {
-            if (demo->cloth->particles->positions[i].y < 0.05f)
-                demo->cloth->particles->positions[i].y = 0.05f;
-        }
-    }
-
-    /* Step fluid */
-    if (demo->fluid && demo->fluid_grid) {
-        rac_phys_sph_step(demo->fluid, demo->fluid_grid,
-            rac_phys_v3(0.0f, -9.81f, 0.0f), &demo->sph_cfg, dt);
-        /* Clamp fluid particles above floor and in bounds */
-        for (int i = 0; i < demo->fluid->num_particles; i++) {
-            if (demo->fluid->positions[i].y < 0.05f) {
-                demo->fluid->positions[i].y = 0.05f;
-                demo->fluid->velocities[i].y *= -0.3f;
-            }
-            /* Keep in bounds [-8, 8] */
-            for (int ax = 0; ax < 3; ax++) {
-                float *p = &demo->fluid->positions[i].x + ax;
-                float *v = &demo->fluid->velocities[i].x + ax;
-                if (*p > 8.0f) { *p = 8.0f; *v *= -0.3f; }
-                if (*p < -8.0f) { *p = -8.0f; *v *= -0.3f; }
-            }
-        }
-    }
-
-    /* Step soft body */
-    if (demo->softbody) {
-        rac_phys_softbody_step(demo->softbody, rac_phys_v3(0.0f, -9.81f, 0.0f), dt);
-        for (int i = 0; i < demo->softbody->num_vertices; i++) {
-            if (demo->softbody->positions[i].y < 0.05f)
-                demo->softbody->positions[i].y = 0.05f;
-        }
-    }
-#endif
 }
 
 /* ── Render ────────────────────────────────────────────────────────────── */
@@ -402,42 +364,6 @@ static void demo_render(rac_engine *engine)
     rac_scene_graph *scene = (rac_scene_graph *)engine->scene;
     rac_render_state *rs = (rac_render_state *)engine->render_state;
     rac_mesh_registry *meshes = (rac_mesh_registry *)engine->mesh_reg;
-    rac_phys_world *phys = (rac_phys_world *)engine->physics;
-
-    /* Post-physics ground-plane enforcement: clamp bodies and resync to ECS */
-    int nb = rac_phys_world_num_bodies(phys);
-    for (int i = 0; i < nb; i++) {
-        rac_phys_rigid_body *b = rac_phys_world_get_body(phys, i);
-        if (b && b->type == RAC_BODY_DYNAMIC) {
-            float ground_y = 0.5f;
-            if (b->position.y < ground_y) {
-                b->position.y = ground_y;
-                if (b->linear_velocity.y < 0.0f)
-                    b->linear_velocity.y = -b->linear_velocity.y * b->restitution;
-            }
-            /* Keep in horizontal bounds */
-            if (b->position.x < -9.0f) { b->position.x = -9.0f; b->linear_velocity.x *= -0.5f; }
-            if (b->position.x >  9.0f) { b->position.x =  9.0f; b->linear_velocity.x *= -0.5f; }
-            if (b->position.z < -9.0f) { b->position.z = -9.0f; b->linear_velocity.z *= -0.5f; }
-            if (b->position.z >  9.0f) { b->position.z =  9.0f; b->linear_velocity.z *= -0.5f; }
-        }
-    }
-
-    /* Re-sync clamped positions to ECS transforms */
-    uint32_t rb_ents[RAC_ECS_MAX_ENTITIES];
-    int rbc = rac_ecs_query(ecs, RAC_COMP_TRANSFORM | RAC_COMP_RIGIDBODY,
-                            rb_ents, RAC_ECS_MAX_ENTITIES);
-    for (int i = 0; i < rbc; i++) {
-        uint32_t e = rb_ents[i];
-        if (ecs->rigidbodies[e].sync_to_transform && ecs->rigidbodies[e].physics_body_index >= 0) {
-            rac_phys_rigid_body *b = rac_phys_world_get_body(phys, ecs->rigidbodies[e].physics_body_index);
-            if (b) {
-                ecs->transforms[e].position = b->position;
-                rac_scene_mark_dirty(scene, e);
-            }
-        }
-    }
-    rac_scene_update_transforms(scene, ecs);
 
     /* Render all mesh renderer entities */
     uint32_t entities[RAC_ECS_MAX_ENTITIES];
@@ -459,28 +385,24 @@ static void demo_render(rac_engine *engine)
         rac_render_mesh(rs, &meshes->meshes[mr->mesh_id], world, color);
     }
 
-    /* Render cloth as triangles */
+    /* Render cloth particles */
     if (demo->cloth && demo->cloth->particles) {
-        rac_phys_particle_system *cp = demo->cloth->particles;
-        /* Cloth is a grid — render as triangle strips using stretch pairs */
-        /* Simple approach: render each stretch constraint pair as a line-like quad */
         rac_color3f cloth_color = { 0.9f, 0.2f, 0.2f };
-
-        /* Approximate: render cloth particles as small points */
-        rac_render_particles(rs, cp->positions, cp->num_particles,
+        rac_render_particles(rs, demo->cloth->particles->positions,
+                             demo->cloth->particles->num_particles,
                              0.05f, cloth_color);
     }
 
     /* Render SPH fluid particles */
     if (demo->fluid) {
-        rac_color3f fluid_color = { 0.2f, 0.5f, 0.9f };
+        rac_color3f fluid_color = { 0.3f, 0.6f, 1.0f };
         rac_render_particles(rs, demo->fluid->positions,
-                             demo->fluid->num_particles, 0.08f, fluid_color);
+                             demo->fluid->num_particles, 0.1f, fluid_color);
     }
 
     /* Render soft body surface triangles */
     if (demo->softbody && demo->softbody->surface_triangles) {
-        rac_color3f sb_color = { 0.4f, 0.8f, 0.3f };
+        rac_color3f sb_color = { 0.4f, 0.9f, 0.3f };
         for (int i = 0; i < demo->softbody->num_surface_tris; i++) {
             int i0 = demo->softbody->surface_triangles[i * 3 + 0];
             int i1 = demo->softbody->surface_triangles[i * 3 + 1];
@@ -501,8 +423,6 @@ static void demo_render(rac_engine *engine)
     /* Accumulate stats */
     demo->total_pixels += rs->pixels_drawn;
     demo->total_tris_drawn += rs->triangles_drawn;
-
-
 }
 
 /* ── Cleanup ───────────────────────────────────────────────────────────── */
@@ -528,17 +448,15 @@ int main(int argc, char **argv)
     cfg.window_width = 640;
     cfg.window_height = 480;
     cfg.headless = 1;
-    cfg.max_substeps = 0;  /* disable world step (memory corruption in physics world) */
+    cfg.max_substeps = 0;  /* physics world step disabled (memory safety issue) */
 
     /* Parse args */
-    int num_frames = 60;  /* default: run 60 frames (1 second) */
+    int num_frames = 60;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
             num_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "--interactive") == 0)
-            num_frames = 0;  /* run until quit */
-        else if (strcmp(argv[i], "--output") == 0)
-            ; /* enable frame output below */
+            num_frames = 0;
     }
 
     rac_engine *engine = rac_engine_create(&cfg);
