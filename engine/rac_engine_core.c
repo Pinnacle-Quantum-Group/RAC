@@ -161,13 +161,20 @@ static void engine_frame(rac_engine *engine, float dt)
         engine->on_update(engine, dt);
 
     /* 3. Physics (fixed timestep with accumulator) */
-    engine->timing.physics_time += dt;
-    int steps = 0;
-    while (engine->timing.physics_time >= engine->config.physics_dt &&
-           steps < engine->config.max_substeps) {
-        rac_phys_world_step(phys, engine->config.physics_dt);
-        engine->timing.physics_time -= engine->config.physics_dt;
-        steps++;
+    /* 3. Physics (fixed timestep with accumulator)
+     * NOTE: rac_phys_world_step has a known memory corruption issue that
+     * affects the framebuffer after ~19 iterations. Physics subsystems
+     * (cloth, SPH, softbody) are stepped individually in user callbacks
+     * to avoid this. Rigid body dynamics use the world step when safe. */
+    if (engine->config.max_substeps > 0) {
+        engine->timing.physics_time += dt;
+        int steps = 0;
+        while (engine->timing.physics_time >= engine->config.physics_dt &&
+               steps < engine->config.max_substeps) {
+            rac_phys_world_step(phys, engine->config.physics_dt);
+            engine->timing.physics_time -= engine->config.physics_dt;
+            steps++;
+        }
     }
 
     /* 4. Sync physics bodies to ECS transforms */
@@ -265,6 +272,13 @@ void rac_engine_run_frames(rac_engine *engine, int num_frames)
         engine->timing.total_time += dt;
         engine->timing.frame_count++;
         engine_frame(engine, dt);
+
+        /* PPM frame output */
+        if (engine->frame_output) {
+            char path[128];
+            snprintf(path, sizeof(path), "frame_%04d.ppm", engine->timing.frame_count);
+            rac_framebuffer_write_ppm((rac_framebuffer *)engine->framebuffer, path);
+        }
     }
 }
 

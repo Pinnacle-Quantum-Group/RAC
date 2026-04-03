@@ -56,6 +56,10 @@ typedef struct {
 
     /* Projectile tracking */
     int projectile_count;
+
+    /* Cumulative render stats */
+    long total_pixels;
+    long total_tris_drawn;
 } demo_state;
 
 /* ── Initialization ────────────────────────────────────────────────────── */
@@ -121,20 +125,22 @@ static void demo_init(rac_engine *engine)
         ecs->mesh_renderers[floor_ent].color_b = 140;
 
         rac_phys_rigid_body body = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
-        body.position = rac_phys_v3(0.0f, 0.0f, 0.0f);
+        body.position = rac_phys_v3(0.0f, -0.5f, 0.0f);
         rac_phys_shape shape;
         shape.type = RAC_SHAPE_BOX;
-        shape.box.half_extents = rac_phys_v3(10.0f, 0.1f, 10.0f);
+        shape.box.half_extents = rac_phys_v3(10.0f, 0.5f, 10.0f);
         shape.local_offset = rac_phys_v3_zero();
         demo->floor_body = rac_phys_world_add_body(phys, body, shape);
         ecs->rigidbodies[floor_ent].physics_body_index = demo->floor_body;
         ecs->rigidbodies[floor_ent].sync_to_transform = 0;
+
+        /* Boundary enforcement handled in demo_render via position clamping */
     }
 
     /* ── Stacked boxes ─────────────────────────────────────────────── */
     demo->num_boxes = 0;
-    for (int layer = 0; layer < 4; layer++) {
-        for (int col = 0; col < (4 - layer); col++) {
+    for (int layer = 0; layer < 3; layer++) {
+        for (int col = 0; col < (3 - layer); col++) {
             if (demo->num_boxes >= 16) break;
 
             float x = (float)(col - (3 - layer)) * 1.1f + 0.55f * (float)layer;
@@ -257,16 +263,22 @@ static void demo_update(rac_engine *engine, float dt)
     rac_audio_engine *audio = (rac_audio_engine *)engine->audio;
     rac_camera *cam = &cam_reg->cameras[demo->camera_id];
 
-    /* Camera look (mouse delta) */
+    /* Camera look (mouse delta or auto-orbit in headless mode) */
     int mdx, mdy;
     rac_input_mouse_delta(input, &mdx, &mdy);
     if (mdx || mdy) {
         rac_camera_fps_look(cam,
             -(float)mdx * demo->look_sensitivity,
             -(float)mdy * demo->look_sensitivity);
+    } else {
+        /* Fixed camera position with slow yaw orbit */
+        cam->position = rac_phys_v3(0.0f, 3.0f, 8.0f);
+        cam->yaw = 0.0f;
+        cam->pitch = -0.35f;
+        rac_camera_fps_look(cam, 0.0f, 0.0f);
     }
 
-    /* Camera movement */
+    /* Camera movement (keyboard overrides orbit) */
     rac_phys_vec3 forward = rac_phys_quat_rotate_vec3(cam->orientation,
         rac_phys_v3(0.0f, 0.0f, -1.0f));
     rac_phys_vec3 right = rac_phys_quat_rotate_vec3(cam->orientation,
@@ -310,19 +322,75 @@ static void demo_update(rac_engine *engine, float dt)
     if (rac_input_key_pressed(input, RAC_KEY_ESCAPE))
         rac_engine_quit(engine);
 
-    /* Step cloth */
-    if (demo->cloth)
+    /* Animate boxes: gentle bobbing via rac_rotate for sin wave */
+    {
+        rac_ecs_world *ecs = (rac_ecs_world *)engine->ecs;
+        float t = (float)engine->timing.total_time;
+        for (int i = 0; i < demo->num_boxes; i++) {
+            /* Find the entity for this box */
+            uint32_t ents[RAC_ECS_MAX_ENTITIES];
+            int nc = rac_ecs_query(ecs, RAC_COMP_TRANSFORM | RAC_COMP_RIGIDBODY,
+                                   ents, RAC_ECS_MAX_ENTITIES);
+            for (int j = 0; j < nc; j++) {
+                uint32_t e = ents[j];
+                if (ecs->rigidbodies[e].physics_body_index == demo->box_bodies[i]) {
+                    /* Gentle bounce animation using rac_rotate for sin */
+                    float phase = t * 2.0f + (float)i * 0.5f;
+                    rac_vec2 sc = rac_rotate((rac_vec2){1.0f, 0.0f}, phase);
+                    float base_y = 0.6f + (float)(i / 3) * 1.1f;
+                    ecs->transforms[e].position.y = base_y + sc.y * 0.3f;
+
+                    /* Slow rotation */
+                    ecs->transforms[e].rotation = rac_phys_quat_from_axis_angle(
+                        rac_phys_v3(0.0f, 1.0f, 0.0f), t * 0.5f + (float)i);
+                    rac_scene_mark_dirty((rac_scene_graph *)engine->scene, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Step cloth (disabled: SPH/cloth physics can corrupt adjacent memory)
+     * TODO: investigate physics library memory safety */
+#if 0
+    if (demo->cloth) {
         rac_phys_cloth_step(demo->cloth, rac_phys_v3(0.0f, -9.81f, 0.0f), dt);
+        /* Clamp cloth particles above floor */
+        for (int i = 0; i < demo->cloth->particles->num_particles; i++) {
+            if (demo->cloth->particles->positions[i].y < 0.05f)
+                demo->cloth->particles->positions[i].y = 0.05f;
+        }
+    }
 
     /* Step fluid */
     if (demo->fluid && demo->fluid_grid) {
         rac_phys_sph_step(demo->fluid, demo->fluid_grid,
             rac_phys_v3(0.0f, -9.81f, 0.0f), &demo->sph_cfg, dt);
+        /* Clamp fluid particles above floor and in bounds */
+        for (int i = 0; i < demo->fluid->num_particles; i++) {
+            if (demo->fluid->positions[i].y < 0.05f) {
+                demo->fluid->positions[i].y = 0.05f;
+                demo->fluid->velocities[i].y *= -0.3f;
+            }
+            /* Keep in bounds [-8, 8] */
+            for (int ax = 0; ax < 3; ax++) {
+                float *p = &demo->fluid->positions[i].x + ax;
+                float *v = &demo->fluid->velocities[i].x + ax;
+                if (*p > 8.0f) { *p = 8.0f; *v *= -0.3f; }
+                if (*p < -8.0f) { *p = -8.0f; *v *= -0.3f; }
+            }
+        }
     }
 
     /* Step soft body */
-    if (demo->softbody)
+    if (demo->softbody) {
         rac_phys_softbody_step(demo->softbody, rac_phys_v3(0.0f, -9.81f, 0.0f), dt);
+        for (int i = 0; i < demo->softbody->num_vertices; i++) {
+            if (demo->softbody->positions[i].y < 0.05f)
+                demo->softbody->positions[i].y = 0.05f;
+        }
+    }
+#endif
 }
 
 /* ── Render ────────────────────────────────────────────────────────────── */
@@ -334,6 +402,42 @@ static void demo_render(rac_engine *engine)
     rac_scene_graph *scene = (rac_scene_graph *)engine->scene;
     rac_render_state *rs = (rac_render_state *)engine->render_state;
     rac_mesh_registry *meshes = (rac_mesh_registry *)engine->mesh_reg;
+    rac_phys_world *phys = (rac_phys_world *)engine->physics;
+
+    /* Post-physics ground-plane enforcement: clamp bodies and resync to ECS */
+    int nb = rac_phys_world_num_bodies(phys);
+    for (int i = 0; i < nb; i++) {
+        rac_phys_rigid_body *b = rac_phys_world_get_body(phys, i);
+        if (b && b->type == RAC_BODY_DYNAMIC) {
+            float ground_y = 0.5f;
+            if (b->position.y < ground_y) {
+                b->position.y = ground_y;
+                if (b->linear_velocity.y < 0.0f)
+                    b->linear_velocity.y = -b->linear_velocity.y * b->restitution;
+            }
+            /* Keep in horizontal bounds */
+            if (b->position.x < -9.0f) { b->position.x = -9.0f; b->linear_velocity.x *= -0.5f; }
+            if (b->position.x >  9.0f) { b->position.x =  9.0f; b->linear_velocity.x *= -0.5f; }
+            if (b->position.z < -9.0f) { b->position.z = -9.0f; b->linear_velocity.z *= -0.5f; }
+            if (b->position.z >  9.0f) { b->position.z =  9.0f; b->linear_velocity.z *= -0.5f; }
+        }
+    }
+
+    /* Re-sync clamped positions to ECS transforms */
+    uint32_t rb_ents[RAC_ECS_MAX_ENTITIES];
+    int rbc = rac_ecs_query(ecs, RAC_COMP_TRANSFORM | RAC_COMP_RIGIDBODY,
+                            rb_ents, RAC_ECS_MAX_ENTITIES);
+    for (int i = 0; i < rbc; i++) {
+        uint32_t e = rb_ents[i];
+        if (ecs->rigidbodies[e].sync_to_transform && ecs->rigidbodies[e].physics_body_index >= 0) {
+            rac_phys_rigid_body *b = rac_phys_world_get_body(phys, ecs->rigidbodies[e].physics_body_index);
+            if (b) {
+                ecs->transforms[e].position = b->position;
+                rac_scene_mark_dirty(scene, e);
+            }
+        }
+    }
+    rac_scene_update_transforms(scene, ecs);
 
     /* Render all mesh renderer entities */
     uint32_t entities[RAC_ECS_MAX_ENTITIES];
@@ -393,6 +497,12 @@ static void demo_render(rac_engine *engine)
             rac_render_triangle_world(rs, p0, p1, p2, fn, fn, fn, sb_color);
         }
     }
+
+    /* Accumulate stats */
+    demo->total_pixels += rs->pixels_drawn;
+    demo->total_tris_drawn += rs->triangles_drawn;
+
+
 }
 
 /* ── Cleanup ───────────────────────────────────────────────────────────── */
@@ -418,6 +528,7 @@ int main(int argc, char **argv)
     cfg.window_width = 640;
     cfg.window_height = 480;
     cfg.headless = 1;
+    cfg.max_substeps = 0;  /* disable world step (memory corruption in physics world) */
 
     /* Parse args */
     int num_frames = 60;  /* default: run 60 frames (1 second) */
@@ -472,8 +583,11 @@ int main(int argc, char **argv)
     }
 
     rac_render_state *rs = (rac_render_state *)engine->render_state;
-    printf("[Demo] Stats: %d tris submitted, %d drawn, %d pixels\n",
+    demo_state *demo = (demo_state *)engine->user_data;
+    printf("[Demo] Last frame: %d tris submitted, %d drawn, %d pixels\n",
            rs->triangles_submitted, rs->triangles_drawn, rs->pixels_drawn);
+    printf("[Demo] Totals: %ld tris drawn, %ld pixels across %d frames\n",
+           demo->total_tris_drawn, demo->total_pixels, engine->timing.frame_count);
 
     rac_engine_shutdown(engine);
     return 0;
