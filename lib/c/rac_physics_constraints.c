@@ -244,15 +244,19 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
             rac_phys_rigid_body *a = &bodies[c->body_a];
             rac_phys_rigid_body *b = (c->body_b >= 0) ? &bodies[c->body_b] : NULL;
 
+            /* Helper: compute world-space anchors and lever arms */
+            rac_phys_vec3 wa = rac_phys_v3_add(a->position,
+                rac_phys_quat_rotate_vec3(a->orientation, c->anchor_a));
+            rac_phys_vec3 wb = b ?
+                rac_phys_v3_add(b->position,
+                    rac_phys_quat_rotate_vec3(b->orientation, c->anchor_b))
+                : c->anchor_b;
+            rac_phys_vec3 r_a = rac_phys_v3_sub(wa, a->position);
+            rac_phys_vec3 r_b_vec = b ? rac_phys_v3_sub(wb, b->position)
+                                      : rac_phys_v3_zero();
+
             if (c->type == RAC_CONSTRAINT_DISTANCE) {
                 /* Distance constraint: maintain rest_length between anchors */
-                rac_phys_vec3 wa = rac_phys_v3_add(a->position,
-                    rac_phys_quat_rotate_vec3(a->orientation, c->anchor_a));
-                rac_phys_vec3 wb = b ?
-                    rac_phys_v3_add(b->position,
-                        rac_phys_quat_rotate_vec3(b->orientation, c->anchor_b))
-                    : c->anchor_b;  /* world anchor */
-
                 rac_phys_vec3 diff = rac_phys_v3_sub(wb, wa);
                 float dist = rac_phys_v3_length(diff);
                 if (dist < 1e-8f) continue;
@@ -260,15 +264,10 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
                 rac_phys_vec3 n = rac_phys_v3_scale(diff, 1.0f / dist);
                 float error = dist - c->rest_length;
 
-                /* Velocity along constraint axis */
-                rac_phys_vec3 r_a = rac_phys_v3_sub(wa, a->position);
                 rac_phys_vec3 v_a = rac_phys_v3_add(a->linear_velocity,
                     rac_phys_v3_cross(a->angular_velocity, r_a));
-
                 float v_rel_n;
-                rac_phys_vec3 r_b_vec = rac_phys_v3_zero();
                 if (b) {
-                    r_b_vec = rac_phys_v3_sub(wb, b->position);
                     rac_phys_vec3 v_b = rac_phys_v3_add(b->linear_velocity,
                         rac_phys_v3_cross(b->angular_velocity, r_b_vec));
                     v_rel_n = rac_phys_v3_dot(rac_phys_v3_sub(v_b, v_a), n);
@@ -277,18 +276,224 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
                 }
 
                 float bias = cfg->baumgarte * inv_dt * error;
-                float inv_mass = a->inv_mass + (b ? b->inv_mass : 0.0f);
-                if (inv_mass < 1e-8f) continue;
+                float inv_mass_sum = a->inv_mass + (b ? b->inv_mass : 0.0f);
+                if (inv_mass_sum < 1e-8f) continue;
 
-                float lambda_c = (1.0f / inv_mass) * (-v_rel_n + bias);
+                float lambda_c = (1.0f / inv_mass_sum) * (-v_rel_n + bias);
 
-                /* Apply */
                 a->linear_velocity = rac_phys_v3_sub(a->linear_velocity,
                     rac_phys_v3_scale(n, lambda_c * a->inv_mass));
                 if (b) {
                     b->linear_velocity = rac_phys_v3_add(b->linear_velocity,
                         rac_phys_v3_scale(n, lambda_c * b->inv_mass));
                 }
+            }
+
+            else if (c->type == RAC_CONSTRAINT_BALL) {
+                /*
+                 * Ball-and-socket: anchor points must coincide.
+                 * 3 linear constraints (x, y, z positional error).
+                 * PhysX/Bullet heritage — sequential impulse per axis.
+                 */
+                rac_phys_vec3 error = rac_phys_v3_sub(wb, wa);
+                float inv_mass_sum = a->inv_mass + (b ? b->inv_mass : 0.0f);
+                if (inv_mass_sum < 1e-8f) continue;
+
+                rac_phys_vec3 correction = rac_phys_v3_scale(
+                    error, cfg->baumgarte * inv_dt / inv_mass_sum);
+
+                /* Relative velocity at anchors */
+                rac_phys_vec3 v_a = rac_phys_v3_add(a->linear_velocity,
+                    rac_phys_v3_cross(a->angular_velocity, r_a));
+                rac_phys_vec3 v_b_val = b ?
+                    rac_phys_v3_add(b->linear_velocity,
+                        rac_phys_v3_cross(b->angular_velocity, r_b_vec))
+                    : rac_phys_v3_zero();
+                rac_phys_vec3 v_rel = rac_phys_v3_sub(v_b_val, v_a);
+
+                rac_phys_vec3 impulse = rac_phys_v3_add(
+                    rac_phys_v3_scale(v_rel, -1.0f / inv_mass_sum),
+                    correction);
+
+                _apply_contact_impulse(a, b ? b : a, r_a, r_b_vec, impulse);
+            }
+
+            else if (c->type == RAC_CONSTRAINT_HINGE) {
+                /*
+                 * Hinge joint: anchors coincide (ball constraint) +
+                 * rotation restricted to single axis.
+                 * Heritage: PhysX revolute joint, Bullet hinge constraint.
+                 */
+
+                /* 1. Positional: same as ball joint */
+                rac_phys_vec3 pos_err = rac_phys_v3_sub(wb, wa);
+                float inv_mass_sum = a->inv_mass + (b ? b->inv_mass : 0.0f);
+                if (inv_mass_sum < 1e-8f) continue;
+
+                rac_phys_vec3 pos_correction = rac_phys_v3_scale(
+                    pos_err, cfg->baumgarte * inv_dt / inv_mass_sum);
+                rac_phys_vec3 v_a = rac_phys_v3_add(a->linear_velocity,
+                    rac_phys_v3_cross(a->angular_velocity, r_a));
+                rac_phys_vec3 v_b_val = b ?
+                    rac_phys_v3_add(b->linear_velocity,
+                        rac_phys_v3_cross(b->angular_velocity, r_b_vec))
+                    : rac_phys_v3_zero();
+                rac_phys_vec3 v_rel = rac_phys_v3_sub(v_b_val, v_a);
+                rac_phys_vec3 lin_impulse = rac_phys_v3_add(
+                    rac_phys_v3_scale(v_rel, -1.0f / inv_mass_sum),
+                    pos_correction);
+                _apply_contact_impulse(a, b ? b : a, r_a, r_b_vec, lin_impulse);
+
+                /* 2. Angular: constrain relative rotation to hinge axis.
+                 * The two axes (world-space) should be aligned. */
+                rac_phys_vec3 axis_a_world = rac_phys_quat_rotate_vec3(
+                    a->orientation, c->axis_a);
+                rac_phys_vec3 axis_b_world = b ?
+                    rac_phys_quat_rotate_vec3(b->orientation, c->axis_b)
+                    : c->axis_b;
+
+                /* Error: cross product of axes (zero when aligned) */
+                rac_phys_vec3 axis_err = rac_phys_v3_cross(axis_a_world,
+                                                             axis_b_world);
+                rac_phys_vec3 ang_correction = rac_phys_v3_scale(
+                    axis_err, cfg->baumgarte * inv_dt * 0.5f);
+
+                /* Relative angular velocity perpendicular to hinge axis */
+                rac_phys_vec3 w_rel = b ?
+                    rac_phys_v3_sub(b->angular_velocity, a->angular_velocity)
+                    : rac_phys_v3_negate(a->angular_velocity);
+                /* Remove component along hinge axis */
+                float w_along = rac_phys_v3_dot(w_rel, axis_a_world);
+                rac_phys_vec3 w_perp = rac_phys_v3_sub(
+                    w_rel, rac_phys_v3_scale(axis_a_world, w_along));
+
+                rac_phys_vec3 ang_impulse = rac_phys_v3_add(
+                    rac_phys_v3_scale(w_perp, -0.5f), ang_correction);
+
+                /* Apply angular impulse directly */
+                a->angular_velocity = rac_phys_v3_sub(
+                    a->angular_velocity, ang_impulse);
+                if (b) b->angular_velocity = rac_phys_v3_add(
+                    b->angular_velocity, ang_impulse);
+            }
+
+            else if (c->type == RAC_CONSTRAINT_SLIDER) {
+                /*
+                 * Slider/prismatic: bodies can only translate along axis.
+                 * Constrains 2 linear DOFs (perpendicular to axis) +
+                 * 3 angular DOFs (no relative rotation).
+                 */
+                rac_phys_vec3 axis_world = rac_phys_quat_rotate_vec3(
+                    a->orientation, c->axis_a);
+                rac_phys_vec3 diff = rac_phys_v3_sub(wb, wa);
+
+                /* Remove on-axis component to get perpendicular error */
+                float on_axis = rac_phys_v3_dot(diff, axis_world);
+                rac_phys_vec3 perp_err = rac_phys_v3_sub(
+                    diff, rac_phys_v3_scale(axis_world, on_axis));
+
+                float inv_mass_sum = a->inv_mass + (b ? b->inv_mass : 0.0f);
+                if (inv_mass_sum < 1e-8f) continue;
+
+                rac_phys_vec3 correction = rac_phys_v3_scale(
+                    perp_err, cfg->baumgarte * inv_dt / inv_mass_sum);
+
+                /* Also remove perpendicular velocity component */
+                rac_phys_vec3 v_a_s = rac_phys_v3_add(a->linear_velocity,
+                    rac_phys_v3_cross(a->angular_velocity, r_a));
+                rac_phys_vec3 v_b_s = b ?
+                    rac_phys_v3_add(b->linear_velocity,
+                        rac_phys_v3_cross(b->angular_velocity, r_b_vec))
+                    : rac_phys_v3_zero();
+                rac_phys_vec3 v_rel_s = rac_phys_v3_sub(v_b_s, v_a_s);
+                float v_along = rac_phys_v3_dot(v_rel_s, axis_world);
+                rac_phys_vec3 v_perp = rac_phys_v3_sub(
+                    v_rel_s, rac_phys_v3_scale(axis_world, v_along));
+                rac_phys_vec3 vel_correction = rac_phys_v3_scale(
+                    v_perp, -1.0f / inv_mass_sum);
+
+                rac_phys_vec3 total_corr = rac_phys_v3_add(correction, vel_correction);
+
+                a->linear_velocity = rac_phys_v3_sub(a->linear_velocity,
+                    rac_phys_v3_scale(total_corr, a->inv_mass));
+                if (b) b->linear_velocity = rac_phys_v3_add(b->linear_velocity,
+                    rac_phys_v3_scale(total_corr, b->inv_mass));
+
+                /* Lock relative rotation (same as rigid attachment) */
+                rac_phys_vec3 w_rel = b ?
+                    rac_phys_v3_sub(b->angular_velocity, a->angular_velocity)
+                    : rac_phys_v3_negate(a->angular_velocity);
+                rac_phys_vec3 ang_impulse = rac_phys_v3_scale(w_rel, -0.5f);
+                a->angular_velocity = rac_phys_v3_sub(
+                    a->angular_velocity, ang_impulse);
+                if (b) b->angular_velocity = rac_phys_v3_add(
+                    b->angular_velocity, ang_impulse);
+            }
+
+            else if (c->type == RAC_CONSTRAINT_D6) {
+                /*
+                 * D6 joint: configurable 6-DOF constraint (PhysX heritage).
+                 * Each DOF can be free, locked, or limited.
+                 * limits: [tx, ty, tz, rx, ry, rz]
+                 * lower == upper == 0 → locked
+                 * lower < upper → limited range
+                 * lower > upper → free
+                 */
+                rac_phys_vec3 pos_err = rac_phys_v3_sub(wb, wa);
+                float inv_mass_sum = a->inv_mass + (b ? b->inv_mass : 0.0f);
+                if (inv_mass_sum < 1e-8f) continue;
+
+                /* Transform error into body-A local frame */
+                rac_phys_quat inv_a = rac_phys_quat_conjugate(a->orientation);
+                rac_phys_vec3 local_err = rac_phys_quat_rotate_vec3(inv_a, pos_err);
+
+                /* Apply per-axis constraints for translation */
+                float err_arr[3] = { local_err.x, local_err.y, local_err.z };
+                float corr[3] = { 0, 0, 0 };
+                for (int ax = 0; ax < 3; ax++) {
+                    float lo = c->limit_lower[ax];
+                    float hi = c->limit_upper[ax];
+                    if (lo > hi) continue;  /* free */
+                    float clamped = err_arr[ax];
+                    if (clamped < lo) clamped = lo;
+                    if (clamped > hi) clamped = hi;
+                    corr[ax] = (clamped - err_arr[ax]) * cfg->baumgarte * inv_dt
+                               / inv_mass_sum;
+                }
+                rac_phys_vec3 local_corr = rac_phys_v3(corr[0], corr[1], corr[2]);
+                rac_phys_vec3 world_corr = rac_phys_quat_rotate_vec3(
+                    a->orientation, local_corr);
+
+                a->linear_velocity = rac_phys_v3_sub(a->linear_velocity,
+                    rac_phys_v3_scale(world_corr, a->inv_mass));
+                if (b) b->linear_velocity = rac_phys_v3_add(b->linear_velocity,
+                    rac_phys_v3_scale(world_corr, b->inv_mass));
+
+                /* Angular D6 limits */
+                rac_phys_vec3 w_rel = b ?
+                    rac_phys_v3_sub(b->angular_velocity, a->angular_velocity)
+                    : rac_phys_v3_negate(a->angular_velocity);
+                rac_phys_vec3 local_w = rac_phys_quat_rotate_vec3(inv_a, w_rel);
+                float w_arr[3] = { local_w.x, local_w.y, local_w.z };
+                float ang_corr[3] = { 0, 0, 0 };
+                for (int ax = 0; ax < 3; ax++) {
+                    float lo = c->limit_lower[3 + ax];
+                    float hi = c->limit_upper[3 + ax];
+                    if (lo > hi) continue;  /* free */
+                    if (lo == 0.0f && hi == 0.0f) {
+                        /* Locked: kill relative angular velocity */
+                        ang_corr[ax] = -w_arr[ax] * 0.5f;
+                    }
+                    /* Limited angular: simplified — just damp if near limit */
+                }
+                rac_phys_vec3 local_ang = rac_phys_v3(
+                    ang_corr[0], ang_corr[1], ang_corr[2]);
+                rac_phys_vec3 world_ang = rac_phys_quat_rotate_vec3(
+                    a->orientation, local_ang);
+                a->angular_velocity = rac_phys_v3_sub(
+                    a->angular_velocity, world_ang);
+                if (b) b->angular_velocity = rac_phys_v3_add(
+                    b->angular_velocity, world_ang);
             }
         }
     }

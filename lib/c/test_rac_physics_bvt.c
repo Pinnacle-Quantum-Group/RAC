@@ -903,6 +903,305 @@ static void test_fix14_rk4_integrator(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * §11  INCOMPLETE FEATURES — Now Implemented
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_ball_joint(void) {
+    printf("  [joints] ball-and-socket...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    bodies[0].position = rac_phys_v3(0, 5, 0);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(1, 5, 0);
+
+    rac_phys_constraint ball;
+    memset(&ball, 0, sizeof(ball));
+    ball.type = RAC_CONSTRAINT_BALL;
+    ball.body_a = 0;
+    ball.body_b = 1;
+    ball.anchor_a = rac_phys_v3(0.5f, 0, 0);  /* right side of A */
+    ball.anchor_b = rac_phys_v3(-0.5f, 0, 0); /* left side of B */
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+
+    /* Apply gravity to body B and solve */
+    bodies[1].linear_velocity = rac_phys_v3(0, -5, 0);
+    for (int i = 0; i < 10; i++)
+        rac_phys_pgs_solve(bodies, 2, &ball, 1, NULL, 0, &cfg, 1.0f/60.0f);
+
+    /* Ball joint should constrain motion — body B shouldn't freefall */
+    ASSERT_TRUE(bodies[1].linear_velocity.y > -5.0f,
+                "ball joint constrains downward velocity");
+}
+
+static void test_hinge_joint(void) {
+    printf("  [joints] hinge...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(1, 0, 0);
+
+    rac_phys_constraint hinge;
+    memset(&hinge, 0, sizeof(hinge));
+    hinge.type = RAC_CONSTRAINT_HINGE;
+    hinge.body_a = 0;
+    hinge.body_b = 1;
+    hinge.axis_a = rac_phys_v3(0, 1, 0);  /* hinge around Y */
+    hinge.axis_b = rac_phys_v3(0, 1, 0);
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+
+    /* Give body B angular velocity around non-hinge axis */
+    bodies[1].angular_velocity = rac_phys_v3(5, 0, 5);
+    for (int i = 0; i < 20; i++)
+        rac_phys_pgs_solve(bodies, 2, &hinge, 1, NULL, 0, &cfg, 1.0f/60.0f);
+
+    /* Hinge should reduce angular velocity in non-Y axes */
+    float off_axis = fabsf(bodies[1].angular_velocity.x) +
+                     fabsf(bodies[1].angular_velocity.z);
+    ASSERT_TRUE(off_axis < 10.0f, "hinge reduces off-axis rotation");
+}
+
+static void test_slider_joint(void) {
+    printf("  [joints] slider...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(1, 0, 0);
+
+    rac_phys_constraint slider;
+    memset(&slider, 0, sizeof(slider));
+    slider.type = RAC_CONSTRAINT_SLIDER;
+    slider.body_a = 0;
+    slider.body_b = 1;
+    slider.axis_a = rac_phys_v3(1, 0, 0);  /* slide along X */
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+
+    /* Push body B perpendicular to slider axis */
+    bodies[1].linear_velocity = rac_phys_v3(0, 5, 3);
+    for (int i = 0; i < 20; i++)
+        rac_phys_pgs_solve(bodies, 2, &slider, 1, NULL, 0, &cfg, 1.0f/60.0f);
+
+    /* Slider should reduce perpendicular velocity (iterative, partial reduction) */
+    float perp = fabsf(bodies[1].linear_velocity.y) +
+                 fabsf(bodies[1].linear_velocity.z);
+    float initial_perp = 5.0f + 3.0f;  /* initial y+z */
+    ASSERT_TRUE(perp < initial_perp, "slider constrains perpendicular motion");
+}
+
+static void test_d6_joint(void) {
+    printf("  [joints] D6 configurable...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(0, 0, 0);
+
+    rac_phys_constraint d6;
+    memset(&d6, 0, sizeof(d6));
+    d6.type = RAC_CONSTRAINT_D6;
+    d6.body_a = 0;
+    d6.body_b = 1;
+    /* Lock all rotation, free translation */
+    for (int i = 0; i < 3; i++) {
+        d6.limit_lower[i] = 1.0f;    /* tx,ty,tz: lower > upper = free */
+        d6.limit_upper[i] = -1.0f;
+    }
+    for (int i = 3; i < 6; i++) {
+        d6.limit_lower[i] = 0.0f;    /* rx,ry,rz: lower == upper == 0 = locked */
+        d6.limit_upper[i] = 0.0f;
+    }
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+    bodies[1].angular_velocity = rac_phys_v3(5, 5, 5);
+    for (int i = 0; i < 20; i++)
+        rac_phys_pgs_solve(bodies, 2, &d6, 1, NULL, 0, &cfg, 1.0f/60.0f);
+
+    float w = rac_phys_v3_length(bodies[1].angular_velocity);
+    ASSERT_TRUE(w < 8.66f, "D6 locked rotation reduces angular velocity");
+}
+
+static void test_fem_plasticity(void) {
+    printf("  [FEM] plasticity (permanent deformation)...\n");
+
+    rac_phys_soft_body *beam = rac_phys_softbody_create_beam(
+        0.5f, 0.1f, 0.1f, 2, 100.0f, 30.0f);
+    beam->solver_iterations = 16;
+    beam->damping = 0.95f;
+
+    /* Strong gravity to induce plastic deformation */
+    for (int i = 0; i < 120; i++)
+        rac_phys_softbody_step(beam, rac_phys_v3(0, -50.0f, 0), 1.0f/60.0f);
+
+    /* Check that plastic_strain accumulated in at least one element */
+    float max_plastic = 0.0f;
+    for (int e = 0; e < beam->num_elements; e++)
+        if (beam->elements[e].plastic_strain > max_plastic)
+            max_plastic = beam->elements[e].plastic_strain;
+
+    ASSERT_TRUE(max_plastic > 0.0f, "plasticity: strain accumulated");
+
+    rac_phys_softbody_destroy(beam);
+}
+
+static void test_fem_fracture(void) {
+    printf("  [FEM] fracture (mesh tearing)...\n");
+
+    rac_phys_soft_body *beam = rac_phys_softbody_create_beam(
+        0.5f, 0.1f, 0.1f, 2, 100.0f, 30.0f);
+    beam->solver_iterations = 16;
+    beam->damping = 0.95f;
+
+    /* Set low fracture threshold on all elements */
+    for (int e = 0; e < beam->num_elements; e++)
+        beam->elements[e].fracture_threshold = 1.0f;
+
+    /* Very strong forces to cause fracture */
+    for (int i = 0; i < 120; i++)
+        rac_phys_softbody_step(beam, rac_phys_v3(0, -200.0f, 0), 1.0f/60.0f);
+
+    /* Check that at least one element fractured (rest_volume = 0) */
+    int broken = 0;
+    for (int e = 0; e < beam->num_elements; e++)
+        if (beam->elements[e].rest_volume == 0.0f) broken++;
+
+    ASSERT_TRUE(broken > 0, "fracture: at least one element broke");
+
+    rac_phys_softbody_destroy(beam);
+}
+
+static void test_ccd_sphere_sweep(void) {
+    printf("  [CCD] sphere sweep tunneling prevention...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    cfg.gravity = rac_phys_v3_zero();  /* no gravity for clean test */
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+
+    /* Static wall */
+    rac_phys_rigid_body wall = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    wall.position = rac_phys_v3(10, 0, 0);
+    rac_phys_shape wall_shape;
+    memset(&wall_shape, 0, sizeof(wall_shape));
+    wall_shape.type = RAC_SHAPE_SPHERE;
+    wall_shape.sphere.radius = 1.0f;
+    rac_phys_world_add_body(world, wall, wall_shape);
+
+    /* Fast bullet heading toward wall */
+    rac_phys_rigid_body bullet = rac_phys_body_create(RAC_BODY_DYNAMIC, 0.1f);
+    bullet.position = rac_phys_v3(0, 0, 0);
+    bullet.linear_velocity = rac_phys_v3(500, 0, 0);  /* very fast */
+    bullet.restitution = 0.5f;
+    rac_phys_shape bullet_shape;
+    memset(&bullet_shape, 0, sizeof(bullet_shape));
+    bullet_shape.type = RAC_SHAPE_SPHERE;
+    bullet_shape.sphere.radius = 0.1f;
+    int bullet_idx = rac_phys_world_add_body(world, bullet, bullet_shape);
+
+    /* Step once — without CCD bullet would tunnel through */
+    rac_phys_world_step(world, 1.0f/60.0f);
+
+    rac_phys_rigid_body *b = rac_phys_world_get_body(world, bullet_idx);
+    /* CCD should have caught the tunneling — bullet should not be past x=11 */
+    ASSERT_TRUE(b->position.x < 12.0f, "CCD: bullet didn't tunnel through wall");
+
+    rac_phys_world_destroy(world);
+}
+
+static void test_sleeping_islands(void) {
+    printf("  [islands] sleeping island propagation...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    cfg.sleep_time = 0.01f;
+    cfg.sleep_threshold = 100.0f;
+    cfg.gravity = rac_phys_v3_zero();
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+
+    /* Create 3 touching spheres in a chain */
+    rac_phys_shape s;
+    memset(&s, 0, sizeof(s));
+    s.type = RAC_SHAPE_SPHERE;
+    s.sphere.radius = 0.6f;
+
+    rac_phys_rigid_body b0 = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    b0.position = rac_phys_v3(0, 0, 0);
+    int i0 = rac_phys_world_add_body(world, b0, s);
+
+    rac_phys_rigid_body b1 = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    b1.position = rac_phys_v3(1.0f, 0, 0);
+    int i1 = rac_phys_world_add_body(world, b1, s);
+
+    rac_phys_rigid_body b2 = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    b2.position = rac_phys_v3(2.0f, 0, 0);
+    int i2 = rac_phys_world_add_body(world, b2, s);
+
+    /* Let them sleep */
+    for (int i = 0; i < 10; i++)
+        rac_phys_world_step(world, 1.0f/60.0f);
+
+    ASSERT_TRUE(rac_phys_world_get_body(world, i0)->is_sleeping, "island: b0 sleeping");
+    ASSERT_TRUE(rac_phys_world_get_body(world, i1)->is_sleeping, "island: b1 sleeping");
+    ASSERT_TRUE(rac_phys_world_get_body(world, i2)->is_sleeping, "island: b2 sleeping");
+
+    /* Wake b0 — the island mechanism should propagate to connected bodies.
+     * Since all 3 share contacts (overlapping spheres), waking b0 should
+     * wake b1 too via the island union-find. */
+    rac_phys_world_get_body(world, i0)->is_sleeping = 0;
+    rac_phys_world_get_body(world, i0)->sleep_timer = 0.0f;
+
+    /* Single substep to trigger island wake propagation */
+    rac_phys_world_step(world, 1.0f/60.0f);
+
+    /* b1 should have been woken by island propagation (shares contacts) */
+    ASSERT_TRUE(!rac_phys_world_get_body(world, i1)->is_sleeping,
+                "island: b1 woken via island propagation");
+
+    rac_phys_world_destroy(world);
+    (void)i1; (void)i2;
+}
+
+static void test_box_raycast(void) {
+    printf("  [raycast] box intersection...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+
+    /* Add a box */
+    rac_phys_rigid_body box = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    box.position = rac_phys_v3(5, 0, 0);
+    rac_phys_shape box_shape;
+    memset(&box_shape, 0, sizeof(box_shape));
+    box_shape.type = RAC_SHAPE_BOX;
+    box_shape.box.half_extents = rac_phys_v3(1, 1, 1);
+    rac_phys_world_add_body(world, box, box_shape);
+
+    /* Ray toward box — should hit */
+    rac_phys_ray_hit hit = rac_phys_world_raycast(
+        world, rac_phys_v3(0, 0, 0), rac_phys_v3(1, 0, 0), 100.0f);
+    ASSERT_TRUE(hit.hit, "box raycast: hit");
+    ASSERT_NEAR(hit.distance, 4.0f, 0.1f, "box raycast: distance ≈ 4");
+    ASSERT_NEAR(hit.normal.x, -1.0f, 0.1f, "box raycast: normal faces -x");
+
+    /* Ray missing box — should not hit */
+    hit = rac_phys_world_raycast(
+        world, rac_phys_v3(0, 5, 0), rac_phys_v3(1, 0, 0), 100.0f);
+    ASSERT_TRUE(!hit.hit, "box raycast: miss");
+
+    /* Rotated box test */
+    rac_phys_rigid_body *bp = rac_phys_world_get_body(world, 0);
+    bp->orientation = rac_phys_quat_from_axis_angle(
+        rac_phys_v3(0, 0, 1), 0.785f);  /* 45° around Z */
+    hit = rac_phys_world_raycast(
+        world, rac_phys_v3(0, 0, 0), rac_phys_v3(1, 0, 0), 100.0f);
+    ASSERT_TRUE(hit.hit, "rotated box raycast: hit");
+
+    rac_phys_world_destroy(world);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * MAIN
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -958,6 +1257,17 @@ int main(void) {
     test_fix12_wake_on_contact();
     test_fix13_sph_boundary();
     test_fix14_rk4_integrator();
+
+    printf("\n§11 Feature Completion\n");
+    test_ball_joint();
+    test_hinge_joint();
+    test_slider_joint();
+    test_d6_joint();
+    test_fem_plasticity();
+    test_fem_fracture();
+    test_ccd_sphere_sweep();
+    test_sleeping_islands();
+    test_box_raycast();
 
     printf("\n════════════════════════════════════════════════════════════════\n");
     printf("  Results: %d/%d passed, %d failed\n",
