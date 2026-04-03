@@ -1,0 +1,500 @@
+/*
+ * test_rac_physics_bvt.c — RAC Physics Library Build Verification Tests
+ * Pinnacle Quantum Group — Michael A. Doran Jr. — April 2026
+ *
+ * Tests cover all 7 subsystems:
+ *   §1 Vec3/Quat math
+ *   §2 Rigid body dynamics
+ *   §3 Collision detection (spatial hash + narrow phase)
+ *   §4 Constraint solvers (PGS + PBD)
+ *   §5 Particle system + SPH fluids
+ *   §6 Cloth simulation
+ *   §7 Soft body FEM
+ *   §8 World integration
+ */
+
+#include "rac_physics.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+
+static int tests_run    = 0;
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+#define ASSERT_NEAR(val, expected, tol, msg) do { \
+    tests_run++; \
+    float _v = (val), _e = (expected), _t = (tol); \
+    if (fabsf(_v - _e) <= _t) { tests_passed++; } \
+    else { tests_failed++; \
+        printf("  FAIL: %s: got %f, expected %f (tol %f)\n", msg, _v, _e, _t); } \
+} while(0)
+
+#define ASSERT_TRUE(cond, msg) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; } \
+    else { tests_failed++; printf("  FAIL: %s\n", msg); } \
+} while(0)
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §1  VEC3 / QUAT MATH
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_vec3_basic(void) {
+    printf("  [vec3] basic operations...\n");
+
+    rac_phys_vec3 a = rac_phys_v3(1.0f, 2.0f, 3.0f);
+    rac_phys_vec3 b = rac_phys_v3(4.0f, 5.0f, 6.0f);
+
+    /* Add */
+    rac_phys_vec3 sum = rac_phys_v3_add(a, b);
+    ASSERT_NEAR(sum.x, 5.0f, 0.001f, "v3_add.x");
+    ASSERT_NEAR(sum.y, 7.0f, 0.001f, "v3_add.y");
+    ASSERT_NEAR(sum.z, 9.0f, 0.001f, "v3_add.z");
+
+    /* Dot product */
+    float d = rac_phys_v3_dot(a, b);
+    ASSERT_NEAR(d, 32.0f, 0.1f, "v3_dot");  /* 4+10+18 */
+
+    /* Cross product */
+    rac_phys_vec3 c = rac_phys_v3_cross(a, b);
+    ASSERT_NEAR(c.x, -3.0f, 0.1f, "v3_cross.x");
+    ASSERT_NEAR(c.y,  6.0f, 0.1f, "v3_cross.y");
+    ASSERT_NEAR(c.z, -3.0f, 0.1f, "v3_cross.z");
+
+    /* Length */
+    float len = rac_phys_v3_length(a);
+    ASSERT_NEAR(len, 3.7416f, 0.01f, "v3_length");
+
+    /* Normalize */
+    rac_phys_vec3 n = rac_phys_v3_normalize(a);
+    float nlen = rac_phys_v3_length(n);
+    ASSERT_NEAR(nlen, 1.0f, 0.01f, "v3_normalize_len");
+
+    /* Scale */
+    rac_phys_vec3 s = rac_phys_v3_scale(a, 2.0f);
+    ASSERT_NEAR(s.x, 2.0f, 0.05f, "v3_scale.x");
+    ASSERT_NEAR(s.y, 4.0f, 0.05f, "v3_scale.y");
+    ASSERT_NEAR(s.z, 6.0f, 0.05f, "v3_scale.z");
+}
+
+static void test_quat_basic(void) {
+    printf("  [quat] basic operations...\n");
+
+    /* Identity */
+    rac_phys_quat id = rac_phys_quat_identity();
+    ASSERT_NEAR(id.w, 1.0f, 0.001f, "quat_identity.w");
+
+    /* Rotate vector by 90° around Y axis */
+    rac_phys_vec3 y_axis = rac_phys_v3(0, 1, 0);
+    float half_pi = 3.14159265f * 0.5f;
+    rac_phys_quat q = rac_phys_quat_from_axis_angle(y_axis, half_pi);
+
+    rac_phys_vec3 v = rac_phys_v3(1, 0, 0);
+    rac_phys_vec3 rotated = rac_phys_quat_rotate_vec3(q, v);
+    /* (1,0,0) rotated 90° around Y → (0,0,-1) */
+    ASSERT_NEAR(rotated.x,  0.0f, 0.05f, "quat_rot90.x");
+    ASSERT_NEAR(rotated.y,  0.0f, 0.05f, "quat_rot90.y");
+    ASSERT_NEAR(rotated.z, -1.0f, 0.05f, "quat_rot90.z");
+
+    /* Quaternion multiply: two 90° rotations = 180° */
+    rac_phys_quat q2 = rac_phys_quat_mul(q, q);
+    rac_phys_vec3 rotated2 = rac_phys_quat_rotate_vec3(q2, v);
+    ASSERT_NEAR(rotated2.x, -1.0f, 0.1f, "quat_mul180.x");
+    ASSERT_NEAR(rotated2.y,  0.0f, 0.1f, "quat_mul180.y");
+
+    /* Normalize */
+    rac_phys_quat qn = rac_phys_quat_normalize(q);
+    float qlen = sqrtf(qn.w*qn.w + qn.x*qn.x + qn.y*qn.y + qn.z*qn.z);
+    ASSERT_NEAR(qlen, 1.0f, 0.01f, "quat_normalize_len");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §2  RIGID BODY DYNAMICS
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_rigid_body(void) {
+    printf("  [rigid body] dynamics...\n");
+
+    rac_phys_rigid_body ball = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    ball.position = rac_phys_v3(0, 10, 0);
+    rac_phys_body_set_inertia_sphere(&ball, 0.5f);
+
+    /* Apply gravity-like force for 1 second (60 steps at 1/60) */
+    for (int i = 0; i < 60; i++) {
+        rac_phys_body_apply_force(&ball, rac_phys_v3(0, -9.81f, 0));
+        rac_phys_body_integrate(&ball, 1.0f/60.0f, RAC_INTEGRATE_EULER);
+    }
+
+    /* After 1 second of free fall: y ≈ 10 - 0.5*9.81*1² = ~5.1 */
+    ASSERT_TRUE(ball.position.y < 10.0f, "ball fell");
+    ASSERT_TRUE(ball.position.y > 0.0f, "ball not through floor");
+
+    /* Velocity should be ~ -9.81 m/s after 1 second */
+    ASSERT_TRUE(ball.linear_velocity.y < -5.0f, "ball has downward velocity");
+
+    /* Static body should not move */
+    rac_phys_rigid_body ground = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    rac_phys_body_apply_force(&ground, rac_phys_v3(0, -100, 0));
+    rac_phys_body_integrate(&ground, 1.0f/60.0f, RAC_INTEGRATE_EULER);
+    ASSERT_NEAR(ground.position.y, 0.0f, 0.001f, "static body stays");
+}
+
+static void test_rigid_body_verlet(void) {
+    printf("  [rigid body] Verlet integration...\n");
+
+    rac_phys_rigid_body ball = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    ball.position = rac_phys_v3(0, 10, 0);
+    ball.linear_damping = 0.0f;
+
+    for (int i = 0; i < 60; i++) {
+        rac_phys_body_apply_force(&ball, rac_phys_v3(0, -9.81f, 0));
+        rac_phys_body_integrate(&ball, 1.0f/60.0f, RAC_INTEGRATE_VERLET);
+    }
+
+    ASSERT_TRUE(ball.position.y < 10.0f, "verlet: ball fell");
+    ASSERT_TRUE(ball.position.y > 0.0f, "verlet: ball above ground");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §3  COLLISION DETECTION
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_spatial_hash(void) {
+    printf("  [collision] spatial hash...\n");
+
+    rac_phys_spatial_hash *sh = rac_phys_spatial_hash_create(1.0f, 256);
+    ASSERT_TRUE(sh != NULL, "spatial hash created");
+
+    /* Insert 3 objects */
+    rac_phys_aabb a = {{ 0,0,0 }, { 1,1,1 }};
+    rac_phys_aabb b = {{ 0.5f,0.5f,0.5f }, { 1.5f,1.5f,1.5f }};
+    rac_phys_aabb c = {{ 10,10,10 }, { 11,11,11 }};
+
+    rac_phys_spatial_hash_insert(sh, a, 0);
+    rac_phys_spatial_hash_insert(sh, b, 1);
+    rac_phys_spatial_hash_insert(sh, c, 2);
+
+    /* Query near object A — should find A and B but not C */
+    int results[16];
+    int n = rac_phys_spatial_hash_query(sh, a, results, 16);
+    ASSERT_TRUE(n >= 2, "spatial hash finds overlapping objects");
+
+    /* Query near object C — should find C only */
+    n = rac_phys_spatial_hash_query(sh, c, results, 16);
+    int found_c = 0;
+    for (int i = 0; i < n; i++) if (results[i] == 2) found_c = 1;
+    ASSERT_TRUE(found_c, "spatial hash finds distant object");
+
+    rac_phys_spatial_hash_destroy(sh);
+}
+
+static void test_sphere_sphere_collision(void) {
+    printf("  [collision] sphere-sphere...\n");
+
+    rac_phys_contact_manifold m;
+
+    /* Overlapping spheres */
+    int hit = rac_phys_collide_sphere_sphere(
+        rac_phys_v3(0, 0, 0), 1.0f,
+        rac_phys_v3(1.5f, 0, 0), 1.0f, &m);
+    ASSERT_TRUE(hit, "spheres overlap");
+    ASSERT_NEAR(m.contacts[0].depth, 0.5f, 0.01f, "sphere overlap depth");
+
+    /* Non-overlapping spheres */
+    hit = rac_phys_collide_sphere_sphere(
+        rac_phys_v3(0, 0, 0), 1.0f,
+        rac_phys_v3(3.0f, 0, 0), 1.0f, &m);
+    ASSERT_TRUE(!hit, "spheres don't overlap");
+}
+
+static void test_sphere_box_collision(void) {
+    printf("  [collision] sphere-box...\n");
+
+    rac_phys_contact_manifold m;
+
+    /* Sphere touching box face */
+    int hit = rac_phys_collide_sphere_box(
+        rac_phys_v3(1.8f, 0, 0), 1.0f,
+        rac_phys_v3(0, 0, 0), rac_phys_quat_identity(),
+        rac_phys_v3(1, 1, 1), &m);
+    ASSERT_TRUE(hit, "sphere-box overlap");
+    ASSERT_TRUE(m.contacts[0].depth > 0.0f, "sphere-box depth > 0");
+
+    /* Sphere far from box */
+    hit = rac_phys_collide_sphere_box(
+        rac_phys_v3(5.0f, 0, 0), 1.0f,
+        rac_phys_v3(0, 0, 0), rac_phys_quat_identity(),
+        rac_phys_v3(1, 1, 1), &m);
+    ASSERT_TRUE(!hit, "sphere-box no overlap");
+}
+
+static void test_box_box_collision(void) {
+    printf("  [collision] box-box SAT...\n");
+
+    rac_phys_contact_manifold m;
+
+    /* Overlapping boxes */
+    int hit = rac_phys_collide_box_box(
+        rac_phys_v3(0, 0, 0), rac_phys_quat_identity(), rac_phys_v3(1, 1, 1),
+        rac_phys_v3(1.5f, 0, 0), rac_phys_quat_identity(), rac_phys_v3(1, 1, 1),
+        &m);
+    ASSERT_TRUE(hit, "boxes overlap");
+    ASSERT_TRUE(m.contacts[0].depth > 0.0f, "box-box depth > 0");
+
+    /* Non-overlapping */
+    hit = rac_phys_collide_box_box(
+        rac_phys_v3(0, 0, 0), rac_phys_quat_identity(), rac_phys_v3(1, 1, 1),
+        rac_phys_v3(5, 0, 0), rac_phys_quat_identity(), rac_phys_v3(1, 1, 1),
+        &m);
+    ASSERT_TRUE(!hit, "boxes don't overlap");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §4  CONSTRAINT SOLVERS
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_pbd_distance(void) {
+    printf("  [constraints] PBD distance...\n");
+
+    /* Two particles connected by a distance constraint */
+    rac_phys_vec3 positions[2] = {
+        { 0, 0, 0 },
+        { 2.5f, 0, 0 }  /* stretched beyond rest length of 1.0 */
+    };
+    float inv_masses[2] = { 1.0f, 1.0f };
+    int pairs[2] = { 0, 1 };
+    float rest[1] = { 1.0f };
+
+    rac_phys_pbd_config cfg = rac_phys_pbd_default_config();
+    cfg.iterations = 10;
+
+    rac_phys_pbd_solve_distance(positions, inv_masses, pairs, rest, 1, &cfg);
+
+    /* After solving, distance should be closer to 1.0 */
+    float dist = rac_phys_v3_length(rac_phys_v3_sub(positions[1], positions[0]));
+    ASSERT_NEAR(dist, 1.0f, 0.01f, "pbd distance converged");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §5  PARTICLE SYSTEM + SPH
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_particles(void) {
+    printf("  [particles] basic system...\n");
+
+    rac_phys_particle_system *ps = rac_phys_particles_create(100);
+    ASSERT_TRUE(ps != NULL, "particle system created");
+
+    /* Emit particles */
+    int id0 = rac_phys_particles_emit(ps, rac_phys_v3(0, 5, 0),
+                                       rac_phys_v3(0, 0, 0), 1.0f);
+    int id1 = rac_phys_particles_emit(ps, rac_phys_v3(1, 5, 0),
+                                       rac_phys_v3(0, 0, 0), 1.0f);
+    ASSERT_TRUE(id0 == 0, "first particle id=0");
+    ASSERT_TRUE(id1 == 1, "second particle id=1");
+    ASSERT_TRUE(ps->num_particles == 2, "2 particles");
+
+    /* Integrate with gravity */
+    rac_phys_particles_integrate(ps, rac_phys_v3(0, -9.81f, 0), 1.0f/60.0f);
+    ASSERT_TRUE(ps->positions[0].y < 5.0f, "particle fell");
+
+    rac_phys_particles_destroy(ps);
+}
+
+static void test_sph_density(void) {
+    printf("  [SPH] density computation...\n");
+
+    rac_phys_sph_config cfg = rac_phys_sph_default_config();
+    cfg.smoothing_radius = 0.5f;
+    cfg.particle_mass = 1.0f;
+
+    rac_phys_particle_system *ps = rac_phys_particles_create(50);
+    rac_phys_spatial_hash *grid = rac_phys_spatial_hash_create(0.5f, 256);
+
+    /* Create a cluster of particles */
+    for (int i = 0; i < 10; i++) {
+        rac_phys_particles_emit(ps,
+            rac_phys_v3((float)i * 0.1f, 0, 0),
+            rac_phys_v3_zero(), cfg.particle_mass);
+    }
+
+    rac_phys_sph_compute_density_pressure(ps, grid, &cfg);
+
+    /* Particles in cluster should have non-zero density */
+    ASSERT_TRUE(ps->densities[5] > 0.0f, "SPH density > 0");
+
+    rac_phys_spatial_hash_destroy(grid);
+    rac_phys_particles_destroy(ps);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §6  CLOTH SIMULATION
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_cloth(void) {
+    printf("  [cloth] PBD simulation...\n");
+
+    rac_phys_cloth *cloth = rac_phys_cloth_create_grid(5, 5, 0.2f, 1.0f);
+    ASSERT_TRUE(cloth != NULL, "cloth created");
+    ASSERT_TRUE(cloth->particles->num_particles == 25, "25 particles");
+    ASSERT_TRUE(cloth->num_stretch > 0, "stretch constraints exist");
+    ASSERT_TRUE(cloth->num_bend > 0, "bend constraints exist");
+
+    /* Pin top corners */
+    rac_phys_cloth_pin(cloth, 0);
+    rac_phys_cloth_pin(cloth, 4);
+
+    /* Record initial center position */
+    float y0 = cloth->particles->positions[12].y;
+
+    /* Simulate enough steps for gravity to take effect */
+    for (int i = 0; i < 120; i++)
+        rac_phys_cloth_step(cloth, rac_phys_v3(0, -9.81f, 0), 1.0f/60.0f);
+
+    /* Center should have dropped */
+    float y1 = cloth->particles->positions[12].y;
+    ASSERT_TRUE(y1 < y0, "cloth center dropped under gravity");
+
+    /* Pinned corners should not move */
+    ASSERT_NEAR(cloth->particles->positions[0].y, y0, 0.001f,
+                "pinned corner stays");
+
+    rac_phys_cloth_destroy(cloth);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §7  SOFT BODY FEM
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_softbody(void) {
+    printf("  [softbody] FEM beam...\n");
+
+    rac_phys_soft_body *beam = rac_phys_softbody_create_beam(
+        1.0f, 0.2f, 0.2f,  /* length, width, height */
+        4,                   /* segments */
+        100.0f,              /* density */
+        50.0f                /* Young's modulus (soft, stable with explicit Euler) */
+    );
+    ASSERT_TRUE(beam != NULL, "beam created");
+    ASSERT_TRUE(beam->num_vertices > 0, "beam has vertices");
+    ASSERT_TRUE(beam->num_elements > 0, "beam has elements");
+
+    /* Increase substeps and damping for numerical stability */
+    beam->solver_iterations = 16;
+    beam->damping = 0.95f;
+
+    /* Record tip position (last vertex along x) */
+    int tip = beam->num_vertices - 1;
+    float y0 = beam->positions[tip].y;
+
+    /* Simulate: beam should deflect under gravity (2 seconds) */
+    for (int i = 0; i < 120; i++)
+        rac_phys_softbody_step(beam, rac_phys_v3(0, -9.81f, 0), 1.0f/60.0f);
+
+    float y1 = beam->positions[tip].y;
+    ASSERT_TRUE(y1 < y0, "beam tip deflected under gravity");
+
+    /* Fixed end should not have moved */
+    ASSERT_NEAR(beam->positions[0].y, 0.0f, 0.001f, "fixed end stays");
+
+    rac_phys_softbody_destroy(beam);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §8  WORLD INTEGRATION
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static void test_world(void) {
+    printf("  [world] full pipeline...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+    ASSERT_TRUE(world != NULL, "world created");
+
+    /* Add a ground plane (static box) */
+    rac_phys_rigid_body ground = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    ground.position = rac_phys_v3(0, -1, 0);
+    rac_phys_shape ground_shape;
+    memset(&ground_shape, 0, sizeof(ground_shape));
+    ground_shape.type = RAC_SHAPE_BOX;
+    ground_shape.box.half_extents = rac_phys_v3(50, 1, 50);
+    rac_phys_world_add_body(world, ground, ground_shape);
+
+    /* Add a falling sphere */
+    rac_phys_rigid_body ball = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    ball.position = rac_phys_v3(0, 5, 0);
+    ball.restitution = 0.5f;
+    rac_phys_body_set_inertia_sphere(&ball, 0.5f);
+    rac_phys_shape ball_shape;
+    memset(&ball_shape, 0, sizeof(ball_shape));
+    ball_shape.type = RAC_SHAPE_SPHERE;
+    ball_shape.sphere.radius = 0.5f;
+    int ball_idx = rac_phys_world_add_body(world, ball, ball_shape);
+
+    ASSERT_TRUE(rac_phys_world_num_bodies(world) == 2, "2 bodies in world");
+
+    /* Step simulation for 2 seconds */
+    for (int i = 0; i < 120; i++)
+        rac_phys_world_step(world, 1.0f/60.0f);
+
+    /* Ball should have fallen and bounced */
+    rac_phys_rigid_body *b = rac_phys_world_get_body(world, ball_idx);
+    ASSERT_TRUE(b->position.y < 5.0f, "ball fell from initial height");
+
+    /* Ray cast test */
+    rac_phys_ray_hit hit = rac_phys_world_raycast(
+        world, rac_phys_v3(0, 10, 0), rac_phys_v3(0, -1, 0), 100.0f);
+    ASSERT_TRUE(hit.hit, "raycast hit something");
+
+    rac_phys_world_destroy(world);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * MAIN
+ * ════════════════════════════════════════════════════════════════════════ */
+
+int main(void) {
+    printf("╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║  RAC Native Physics Library — Build Verification Tests      ║\n");
+    printf("║  Pinnacle Quantum Group — April 2026                        ║\n");
+    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+
+    printf("§1 Vec3/Quat Math\n");
+    test_vec3_basic();
+    test_quat_basic();
+
+    printf("\n§2 Rigid Body Dynamics\n");
+    test_rigid_body();
+    test_rigid_body_verlet();
+
+    printf("\n§3 Collision Detection\n");
+    test_spatial_hash();
+    test_sphere_sphere_collision();
+    test_sphere_box_collision();
+    test_box_box_collision();
+
+    printf("\n§4 Constraint Solvers\n");
+    test_pbd_distance();
+
+    printf("\n§5 Particle Systems\n");
+    test_particles();
+    test_sph_density();
+
+    printf("\n§6 Cloth Simulation\n");
+    test_cloth();
+
+    printf("\n§7 Soft Body FEM\n");
+    test_softbody();
+
+    printf("\n§8 World Integration\n");
+    test_world();
+
+    printf("\n════════════════════════════════════════════════════════════════\n");
+    printf("  Results: %d/%d passed, %d failed\n",
+           tests_passed, tests_run, tests_failed);
+    printf("════════════════════════════════════════════════════════════════\n");
+
+    return tests_failed > 0 ? 1 : 0;
+}

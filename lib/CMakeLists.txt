@@ -116,12 +116,51 @@ if(TARGET rac_avx2)
     target_link_libraries(test_rac_threads rac_avx2 m)
 endif()
 
+# ── Physics library ─────────────────────────────────────────────────────
+#
+# RAC Native Physics: amalgamates CUDA (PhysX/Flex) + AMD (FEMFX/ROCm)
+# physics patterns, built entirely on RAC CORDIC primitives.
+#
+
+set(RAC_PHYSICS_SOURCES
+    c/rac_physics.c
+    c/rac_physics_collision.c
+    c/rac_physics_constraints.c
+    c/rac_physics_particles.c
+    c/rac_physics_softbody.c
+    c/rac_physics_world.c
+)
+
+add_library(rac_physics SHARED ${RAC_PHYSICS_SOURCES} c/rac_cpu.c)
+target_include_directories(rac_physics PUBLIC c/)
+target_link_libraries(rac_physics m)
+target_compile_options(rac_physics PRIVATE -O3 -march=native -Wall -Wextra)
+
+add_library(rac_physics_static STATIC ${RAC_PHYSICS_SOURCES} c/rac_cpu.c)
+target_include_directories(rac_physics_static PUBLIC c/)
+target_link_libraries(rac_physics_static m)
+target_compile_options(rac_physics_static PRIVATE -O3 -march=native -Wall -Wextra)
+
+if(OpenMP_C_FOUND)
+    target_link_libraries(rac_physics OpenMP::OpenMP_C)
+    target_link_libraries(rac_physics_static OpenMP::OpenMP_C)
+    message(STATUS "RAC Physics: OpenMP enabled for parallel SPH/particles")
+endif()
+
+# Physics BVT
+add_executable(test_rac_physics_bvt c/test_rac_physics_bvt.c)
+target_include_directories(test_rac_physics_bvt PRIVATE c/)
+target_link_libraries(test_rac_physics_bvt rac_physics_static m)
+add_test(NAME physics_bvt COMMAND test_rac_physics_bvt)
+
 # ── Install ─────────────────────────────────────────────────────────────
 
 install(TARGETS rac rac_static DESTINATION lib)
-install(FILES c/rac_cpu.h c/rac_avx2.h DESTINATION include/rac)
+install(TARGETS rac_physics rac_physics_static DESTINATION lib)
+install(FILES c/rac_cpu.h c/rac_avx2.h c/rac_physics.h DESTINATION include/rac)
 if(TARGET rac_avx2)
     install(TARGETS rac_avx2 DESTINATION lib)
 endif()
 
 message(STATUS "RAC library v${PROJECT_VERSION} configured")
+message(STATUS "RAC Physics library configured (rigid body, collision, constraints, SPH, cloth, FEM)")
