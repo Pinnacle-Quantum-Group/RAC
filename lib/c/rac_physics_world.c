@@ -46,7 +46,71 @@ struct rac_phys_world {
 
     /* Time accumulator for fixed timestep */
     float time_accumulator;
+
+    /* Sleeping islands (union-find) */
+    int island_parent[RAC_WORLD_MAX_BODIES];
+    int island_rank[RAC_WORLD_MAX_BODIES];
 };
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * SLEEPING ISLANDS (Union-Find / Disjoint Set)
+ *
+ * PhysX/Bullet heritage: bodies connected by contacts or joints form
+ * "islands." If all bodies in an island are below sleep threshold,
+ * the entire island sleeps. If any body is disturbed, the whole island
+ * wakes. This is O(n*α(n)) ≈ O(n) via path compression + union by rank.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static int _island_find(int *parent, int x) {
+    while (parent[x] != x) {
+        parent[x] = parent[parent[x]];  /* path compression */
+        x = parent[x];
+    }
+    return x;
+}
+
+static void _island_union(int *parent, int *rank, int a, int b) {
+    int ra = _island_find(parent, a);
+    int rb = _island_find(parent, b);
+    if (ra == rb) return;
+    if (rank[ra] < rank[rb]) { int t = ra; ra = rb; rb = t; }
+    parent[rb] = ra;
+    if (rank[ra] == rank[rb]) rank[ra]++;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * CONTINUOUS COLLISION DETECTION (CCD) — Sphere Sweep
+ *
+ * PhysX heritage: prevents fast-moving small objects from tunneling
+ * through walls. Uses conservative advancement (sphere sweep against
+ * spheres and planes).
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Sweep sphere A (moving from p0 to p1) against static sphere B.
+ * Returns time-of-impact t in [0,1], or -1 if no hit. */
+static float _ccd_sphere_sweep(rac_phys_vec3 p0, rac_phys_vec3 p1, float r_a,
+                                 rac_phys_vec3 b_pos, float r_b) {
+    rac_phys_vec3 d = rac_phys_v3_sub(p1, p0);        /* motion vector */
+    rac_phys_vec3 m = rac_phys_v3_sub(p0, b_pos);     /* relative position */
+    float r = r_a + r_b;
+
+    float dd = rac_phys_v3_dot(d, d);
+    float md = rac_phys_v3_dot(m, d);
+    float mm = rac_phys_v3_dot(m, m);
+
+    float a = dd;
+    float b = 2.0f * md;
+    float c = mm - r * r;
+
+    if (c < 0.0f) return 0.0f;  /* already overlapping */
+
+    float disc = b * b - 4.0f * a * c;
+    if (disc < 0.0f || a < 1e-8f) return -1.0f;
+
+    float t = (-b - sqrtf(disc)) / (2.0f * a);
+    if (t >= 0.0f && t <= 1.0f) return t;
+    return -1.0f;
+}
 
 /* ── Config defaults ───────────────────────────────────────────────────── */
 
@@ -268,35 +332,94 @@ static void _world_substep(rac_phys_world *w, float dt) {
                         w->contacts, w->num_contacts,
                         &w->config.pgs_config, dt);
 
-    /* 5. Integrate */
+    /* 4b. Build sleeping islands + wake propagation BEFORE integration,
+     *     so woken bodies actually get integrated this step. */
+    for (int i = 0; i < nb; i++) {
+        w->island_parent[i] = i;
+        w->island_rank[i] = 0;
+    }
+    for (int ci = 0; ci < w->num_contacts; ci++) {
+        rac_phys_contact_manifold *m = &w->contacts[ci];
+        if (m->body_a >= 0 && m->body_a < nb &&
+            m->body_b >= 0 && m->body_b < nb)
+            _island_union(w->island_parent, w->island_rank,
+                          m->body_a, m->body_b);
+    }
+    for (int ci = 0; ci < w->num_constraints; ci++) {
+        rac_phys_constraint *c = &w->constraints[ci];
+        if (c->body_a >= 0 && c->body_a < nb &&
+            c->body_b >= 0 && c->body_b < nb)
+            _island_union(w->island_parent, w->island_rank,
+                          c->body_a, c->body_b);
+    }
+    /* Wake-on-contact: awake body in island wakes entire island */
+    {
+        int island_awake[RAC_WORLD_MAX_BODIES];
+        memset(island_awake, 0, sizeof(int) * nb);
+        for (int i = 0; i < nb; i++) {
+            if (w->bodies[i].type == RAC_BODY_DYNAMIC && !w->bodies[i].is_sleeping) {
+                int root = _island_find(w->island_parent, i);
+                island_awake[root] = 1;
+            }
+        }
+        for (int i = 0; i < nb; i++) {
+            if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
+            int root = _island_find(w->island_parent, i);
+            if (island_awake[root] && w->bodies[i].is_sleeping) {
+                w->bodies[i].is_sleeping = 0;
+                /* Grace period: don't re-sleep for at least sleep_time */
+                w->bodies[i].sleep_timer = -w->config.sleep_time;
+            }
+        }
+    }
+
+    /* 5. Integrate (now includes freshly woken bodies) */
     for (int i = 0; i < nb; i++) {
         rac_phys_body_integrate(&w->bodies[i], dt, w->config.integrator);
     }
 
-    /* 6. Fix #12: Wake sleeping bodies involved in contacts */
-    for (int ci = 0; ci < w->num_contacts; ci++) {
-        rac_phys_contact_manifold *m = &w->contacts[ci];
-        if (m->body_a < 0 || m->body_a >= nb ||
-            m->body_b < 0 || m->body_b >= nb) continue;
+    /* 5b. CCD — sweep fast-moving spheres to prevent tunneling */
+    for (int i = 0; i < nb; i++) {
+        if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
+        if (w->shapes[i].type != RAC_SHAPE_SPHERE) continue;
 
-        rac_phys_rigid_body *ba = &w->bodies[m->body_a];
-        rac_phys_rigid_body *bb = &w->bodies[m->body_b];
+        float speed = rac_phys_v3_length(w->bodies[i].linear_velocity);
+        float r = w->shapes[i].sphere.radius;
+        if (speed * dt < r * 0.5f) continue;  /* skip slow bodies */
 
-        /* If either body in a contact pair is awake, wake the other */
-        int a_awake = (ba->type == RAC_BODY_DYNAMIC && !ba->is_sleeping);
-        int b_awake = (bb->type == RAC_BODY_DYNAMIC && !bb->is_sleeping);
+        rac_phys_vec3 p0 = rac_phys_v3_sub(w->bodies[i].position,
+            rac_phys_v3_scale(w->bodies[i].linear_velocity, dt));
+        rac_phys_vec3 p1 = w->bodies[i].position;
 
-        if (a_awake && bb->is_sleeping && bb->type == RAC_BODY_DYNAMIC) {
-            bb->is_sleeping = 0;
-            bb->sleep_timer = 0.0f;
-        }
-        if (b_awake && ba->is_sleeping && ba->type == RAC_BODY_DYNAMIC) {
-            ba->is_sleeping = 0;
-            ba->sleep_timer = 0.0f;
+        for (int j = 0; j < nb; j++) {
+            if (i == j) continue;
+            if (w->shapes[j].type != RAC_SHAPE_SPHERE) continue;
+
+            float toi = _ccd_sphere_sweep(p0, p1, r,
+                w->bodies[j].position, w->shapes[j].sphere.radius);
+            if (toi >= 0.0f && toi < 1.0f) {
+                /* Rewind to time of impact */
+                w->bodies[i].position = rac_phys_v3_add(p0,
+                    rac_phys_v3_scale(rac_phys_v3_sub(p1, p0), toi));
+                /* Reflect velocity along contact normal */
+                rac_phys_vec3 n = rac_phys_v3_normalize(
+                    rac_phys_v3_sub(w->bodies[i].position,
+                                     w->bodies[j].position));
+                float vn = rac_phys_v3_dot(w->bodies[i].linear_velocity, n);
+                if (vn < 0.0f) {
+                    float e = fminf(w->bodies[i].restitution,
+                                    w->bodies[j].restitution);
+                    w->bodies[i].linear_velocity = rac_phys_v3_sub(
+                        w->bodies[i].linear_velocity,
+                        rac_phys_v3_scale(n, (1.0f + e) * vn));
+                }
+                break;  /* handle one CCD event per body per step */
+            }
         }
     }
 
-    /* 7. Sleep management */
+    /* 6. Per-island sleep management: island sleeps only if ALL members idle */
+    /* First: update per-body sleep timers */
     for (int i = 0; i < nb; i++) {
         if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
 
@@ -305,12 +428,25 @@ static void _world_substep(rac_phys_world *w, float dt) {
 
         if (speed < w->config.sleep_threshold) {
             w->bodies[i].sleep_timer += dt;
-            if (w->bodies[i].sleep_timer >= w->config.sleep_time)
-                w->bodies[i].is_sleeping = 1;
         } else {
             w->bodies[i].sleep_timer = 0.0f;
             w->bodies[i].is_sleeping = 0;
         }
+    }
+    /* Check if entire island can sleep */
+    float island_min_timer[RAC_WORLD_MAX_BODIES];
+    for (int i = 0; i < nb; i++) island_min_timer[i] = 1e30f;
+    for (int i = 0; i < nb; i++) {
+        if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
+        int root = _island_find(w->island_parent, i);
+        if (w->bodies[i].sleep_timer < island_min_timer[root])
+            island_min_timer[root] = w->bodies[i].sleep_timer;
+    }
+    for (int i = 0; i < nb; i++) {
+        if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
+        int root = _island_find(w->island_parent, i);
+        if (island_min_timer[root] >= w->config.sleep_time)
+            w->bodies[i].is_sleeping = 1;
     }
 }
 
@@ -383,7 +519,62 @@ rac_phys_ray_hit rac_phys_world_raycast(const rac_phys_world *world,
                 }
             }
         }
-        /* Box ray intersection could be added here */
+        else if (shape->type == RAC_SHAPE_BOX) {
+            /* Ray-OBB intersection via slab method.
+             * Transform ray into box-local space, test against AABB. */
+            rac_phys_quat inv_rot = rac_phys_quat_conjugate(body->orientation);
+            rac_phys_vec3 local_origin = rac_phys_quat_rotate_vec3(
+                inv_rot, rac_phys_v3_sub(origin, body->position));
+            rac_phys_vec3 local_dir = rac_phys_quat_rotate_vec3(inv_rot, dir);
+
+            rac_phys_vec3 he = shape->box.half_extents;
+            float tmin = -1e30f, tmax = 1e30f;
+            float lo[3] = { local_origin.x, local_origin.y, local_origin.z };
+            float ld[3] = { local_dir.x, local_dir.y, local_dir.z };
+            float hea[3] = { he.x, he.y, he.z };
+            int valid = 1;
+
+            for (int ax = 0; ax < 3; ax++) {
+                if (fabsf(ld[ax]) < 1e-8f) {
+                    if (lo[ax] < -hea[ax] || lo[ax] > hea[ax]) { valid = 0; break; }
+                } else {
+                    float inv_d = 1.0f / ld[ax];
+                    float t1 = (-hea[ax] - lo[ax]) * inv_d;
+                    float t2 = ( hea[ax] - lo[ax]) * inv_d;
+                    if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+                    if (t1 > tmin) tmin = t1;
+                    if (t2 < tmax) tmax = t2;
+                    if (tmin > tmax) { valid = 0; break; }
+                }
+            }
+
+            if (valid && tmin > 0.0f && tmin < result.distance) {
+                result.hit = 1;
+                result.body_index = i;
+                result.distance = tmin;
+                result.point = rac_phys_v3_add(origin,
+                    rac_phys_v3_scale(dir, tmin));
+                /* Normal: find which slab was hit */
+                rac_phys_vec3 local_hit = rac_phys_v3_add(local_origin,
+                    rac_phys_v3_scale(local_dir, tmin));
+                rac_phys_vec3 local_n = rac_phys_v3_zero();
+                float min_dist = 1e30f;
+                float lh[3] = { local_hit.x, local_hit.y, local_hit.z };
+                for (int ax = 0; ax < 3; ax++) {
+                    float d_pos = fabsf(lh[ax] - hea[ax]);
+                    float d_neg = fabsf(lh[ax] + hea[ax]);
+                    float d = (d_pos < d_neg) ? d_pos : d_neg;
+                    if (d < min_dist) {
+                        min_dist = d;
+                        float *n_arr = &local_n.x;
+                        n_arr[0] = n_arr[1] = n_arr[2] = 0;
+                        n_arr[ax] = (lh[ax] > 0) ? 1.0f : -1.0f;
+                    }
+                }
+                result.normal = rac_phys_quat_rotate_vec3(
+                    body->orientation, local_n);
+            }
+        }
     }
 
     return result;

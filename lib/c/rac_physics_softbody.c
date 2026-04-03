@@ -256,8 +256,69 @@ static void _softbody_substep(rac_phys_soft_body *sb,
             }
         }
 
+        /*
+         * FEM plasticity (FEMFX heritage): if strain exceeds yield point,
+         * accumulate permanent plastic deformation. The elastic strain is
+         * reduced by the plastic component, so the element doesn't spring
+         * back to its original shape.
+         */
+        float strain_magnitude = 0.0f;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                strain_magnitude += strain.m[i][j] * strain.m[i][j];
+        strain_magnitude = sqrtf(strain_magnitude);
+
+        float yield_threshold = 0.1f;  /* onset of plastic deformation */
+        if (strain_magnitude > yield_threshold && tet->youngs_modulus > 0.0f) {
+            float plastic_rate = 0.01f;  /* fraction of excess strain → plastic */
+            float excess = strain_magnitude - yield_threshold;
+            float d_plastic = excess * plastic_rate;
+            tet->plastic_strain += d_plastic;
+
+            /* Reduce elastic strain by plastic component (strain softening) */
+            if (strain_magnitude > 1e-8f) {
+                float reduce = 1.0f - (d_plastic / strain_magnitude);
+                if (reduce < 0.0f) reduce = 0.0f;
+                for (int i = 0; i < 3; i++)
+                    for (int j = 0; j < 3; j++)
+                        strain.m[i][j] *= reduce;
+            }
+
+            /* Recompute stress with reduced strain */
+            trace_eps = strain.m[0][0] + strain.m[1][1] + strain.m[2][2];
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) {
+                    stress.m[i][j] = 2.0f * mu * strain.m[i][j];
+                    if (i == j) stress.m[i][j] += lambda * trace_eps;
+                }
+            }
+        }
+
         /* Rotate stress back to world space: P = R * σ */
         rac_phys_mat3 P = rac_phys_mat3_mul(R, stress);
+
+        /*
+         * FEM fracture (FEMFX heritage): if max principal stress exceeds
+         * fracture_threshold, disable the element by zeroing its rest volume.
+         * This effectively removes it from the simulation (mesh tearing).
+         */
+        if (tet->fracture_threshold > 0.0f) {
+            /* Approximate max principal stress via von Mises criterion:
+             * σ_vm = sqrt(σ_xx² + σ_yy² + σ_zz² - σ_xx*σ_yy
+             *        - σ_yy*σ_zz - σ_zz*σ_xx + 3*(σ_xy² + σ_yz² + σ_xz²))
+             */
+            float sxx = stress.m[0][0], syy = stress.m[1][1], szz = stress.m[2][2];
+            float sxy = stress.m[0][1], syz = stress.m[1][2], sxz = stress.m[0][2];
+            float vm_sq = sxx*sxx + syy*syy + szz*szz
+                        - sxx*syy - syy*szz - szz*sxx
+                        + 3.0f * (sxy*sxy + syz*syz + sxz*sxz);
+            float von_mises = (vm_sq > 0.0f) ? sqrtf(vm_sq) : 0.0f;
+
+            if (von_mises > tet->fracture_threshold) {
+                tet->rest_volume = 0.0f;  /* disable element — mesh tear */
+                continue;  /* skip force distribution for broken element */
+            }
+        }
 
         /* Force on each vertex: f_i = -V₀ * P * Dm_inv^T * e_i */
         rac_phys_mat3 Dm_inv_T = rac_phys_mat3_transpose(tet->Dm_inv);
