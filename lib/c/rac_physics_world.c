@@ -238,6 +238,12 @@ static void _world_substep(rac_phys_world *w, float dt) {
         for (int ci = 0; ci < n_cand && w->num_contacts < RAC_WORLD_MAX_CONTACTS; ci++) {
             int j = candidates[ci];
             if (j <= i) continue;  /* avoid duplicate pairs */
+            if (j >= nb) continue; /* Fix #7: bounds check candidate index */
+
+            /* Fix #7: validate shape indices before narrow phase */
+            if (w->bodies[i].shape_index < 0 || w->bodies[i].shape_index >= nb ||
+                w->bodies[j].shape_index < 0 || w->bodies[j].shape_index >= nb)
+                continue;
 
             /* Skip static-static pairs */
             if (w->bodies[i].type == RAC_BODY_STATIC &&
@@ -267,7 +273,30 @@ static void _world_substep(rac_phys_world *w, float dt) {
         rac_phys_body_integrate(&w->bodies[i], dt, w->config.integrator);
     }
 
-    /* 6. Sleep management */
+    /* 6. Fix #12: Wake sleeping bodies involved in contacts */
+    for (int ci = 0; ci < w->num_contacts; ci++) {
+        rac_phys_contact_manifold *m = &w->contacts[ci];
+        if (m->body_a < 0 || m->body_a >= nb ||
+            m->body_b < 0 || m->body_b >= nb) continue;
+
+        rac_phys_rigid_body *ba = &w->bodies[m->body_a];
+        rac_phys_rigid_body *bb = &w->bodies[m->body_b];
+
+        /* If either body in a contact pair is awake, wake the other */
+        int a_awake = (ba->type == RAC_BODY_DYNAMIC && !ba->is_sleeping);
+        int b_awake = (bb->type == RAC_BODY_DYNAMIC && !bb->is_sleeping);
+
+        if (a_awake && bb->is_sleeping && bb->type == RAC_BODY_DYNAMIC) {
+            bb->is_sleeping = 0;
+            bb->sleep_timer = 0.0f;
+        }
+        if (b_awake && ba->is_sleeping && ba->type == RAC_BODY_DYNAMIC) {
+            ba->is_sleeping = 0;
+            ba->sleep_timer = 0.0f;
+        }
+    }
+
+    /* 7. Sleep management */
     for (int i = 0; i < nb; i++) {
         if (w->bodies[i].type != RAC_BODY_DYNAMIC) continue;
 

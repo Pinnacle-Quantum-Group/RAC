@@ -185,6 +185,8 @@ typedef struct {
     rac_phys_vec3 point;       /* world-space contact point */
     rac_phys_vec3 normal;      /* contact normal (body_a → body_b) */
     float         depth;       /* penetration depth (positive = overlap) */
+    float         lambda_n;    /* accumulated normal impulse (warm-start) */
+    float         lambda_t;    /* accumulated tangent impulse (warm-start) */
 } rac_phys_contact_point;
 
 #define RAC_MAX_CONTACTS 4

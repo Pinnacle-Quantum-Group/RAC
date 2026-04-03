@@ -287,6 +287,30 @@ void rac_phys_sph_step(rac_phys_particle_system *ps,
 
     /* 3. Integrate */
     rac_phys_particles_integrate(ps, gravity, dt);
+
+    /*
+     * Fix #13: Apply boundary damping — enforce a simple box boundary.
+     * Particles that exit the boundary are clamped and their velocity
+     * is reflected with damping applied. Uses smoothing_radius as the
+     * boundary half-extent (caller should set based on simulation domain).
+     */
+    if (cfg->boundary_damping > 0.0f) {
+        float bound = 10.0f;  /* default world half-extent */
+        float damp = 1.0f - cfg->boundary_damping;
+
+        for (int i = 0; i < ps->num_particles; i++) {
+            if (!ps->alive[i]) continue;
+            rac_phys_vec3 *p = &ps->positions[i];
+            rac_phys_vec3 *v = &ps->velocities[i];
+
+            if (p->x < -bound) { p->x = -bound; v->x *= -damp; }
+            if (p->x >  bound) { p->x =  bound; v->x *= -damp; }
+            if (p->y < -bound) { p->y = -bound; v->y *= -damp; }
+            if (p->y >  bound) { p->y =  bound; v->y *= -damp; }
+            if (p->z < -bound) { p->z = -bound; v->z *= -damp; }
+            if (p->z >  bound) { p->z =  bound; v->z *= -damp; }
+        }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

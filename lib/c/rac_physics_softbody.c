@@ -47,7 +47,8 @@ static float _mat3_det(rac_phys_mat3 m) {
 
 static rac_phys_mat3 _mat3_inv(rac_phys_mat3 m) {
     float det = _mat3_det(m);
-    if (fabsf(det) < 1e-12f) return rac_phys_mat3_identity();
+    /* Fix #9: use larger threshold for float32 numerical stability */
+    if (fabsf(det) < 1e-6f) return rac_phys_mat3_identity();
 
     float inv_det = 1.0f / det;
     rac_phys_mat3 r;
@@ -280,10 +281,10 @@ static void _softbody_substep(rac_phys_soft_body *sb,
     for (int i = 0; i < nv; i++) {
         if (sb->inv_masses[i] <= 0.0f) continue;
 
-        /* Add gravity */
+        /* Add gravity: F_grav = mass * g (mass = 1/inv_mass) */
+        float mass_i = 1.0f / sb->inv_masses[i];
         rac_phys_vec3 total_force = rac_phys_v3_add(
-            forces[i],
-            rac_phys_v3_scale(gravity, 1.0f / sb->inv_masses[i]));
+            forces[i], rac_phys_v3_scale(gravity, mass_i));
 
         /* Symplectic Euler */
         rac_phys_vec3 accel = rac_phys_v3_scale(total_force, sb->inv_masses[i]);

@@ -452,6 +452,457 @@ static void test_world(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * §9  SAFETY REGRESSION TESTS (Critical fixes #1–#7)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Fix #1: PGS solver must not crash on out-of-bounds body indices */
+static void test_safety_pgs_bad_indices(void) {
+    printf("  [safety] PGS with invalid body indices...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+
+    /* Contact manifold referencing body index 999 (out of bounds) */
+    rac_phys_contact_manifold bad_contact;
+    memset(&bad_contact, 0, sizeof(bad_contact));
+    bad_contact.body_a = 0;
+    bad_contact.body_b = 999;  /* OOB */
+    bad_contact.num_contacts = 1;
+    bad_contact.contacts[0].normal = rac_phys_v3(0, 1, 0);
+    bad_contact.contacts[0].depth = 0.1f;
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+
+    /* Must not crash — OOB contact should be skipped */
+    rac_phys_pgs_solve(bodies, 2, NULL, 0, &bad_contact, 1, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(1, "PGS survived OOB body_b index");
+
+    /* Also test negative index */
+    bad_contact.body_a = -1;
+    bad_contact.body_b = 0;
+    rac_phys_pgs_solve(bodies, 2, NULL, 0, &bad_contact, 1, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(1, "PGS survived negative body_a index");
+
+    /* NULL bodies */
+    rac_phys_pgs_solve(NULL, 0, NULL, 0, NULL, 0, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(1, "PGS survived NULL bodies");
+}
+
+/* Fix #2: Spatial hash must handle overflow by growing */
+static void test_safety_spatial_hash_overflow(void) {
+    printf("  [safety] spatial hash overflow/grow...\n");
+
+    /* Create tiny hash (table_size=4) that will quickly overflow */
+    rac_phys_spatial_hash *sh = rac_phys_spatial_hash_create(1.0f, 4);
+    ASSERT_TRUE(sh != NULL, "tiny spatial hash created");
+
+    /* Insert 200 objects — far more than initial capacity (4*4=16 entries) */
+    for (int i = 0; i < 200; i++) {
+        rac_phys_aabb aabb = {
+            { (float)i, 0, 0 },
+            { (float)i + 0.5f, 0.5f, 0.5f }
+        };
+        rac_phys_spatial_hash_insert(sh, aabb, i);
+    }
+
+    /* Query for a late-inserted object — should still be findable */
+    rac_phys_aabb query = { { 150.0f, 0, 0 }, { 150.5f, 0.5f, 0.5f } };
+    int results[16];
+    int n = rac_phys_spatial_hash_query(sh, query, results, 16);
+
+    int found_150 = 0;
+    for (int i = 0; i < n; i++)
+        if (results[i] == 150) found_150 = 1;
+    ASSERT_TRUE(found_150, "late-inserted object found after overflow growth");
+
+    rac_phys_spatial_hash_destroy(sh);
+}
+
+/* Fix #4: Slerp must not produce NaN on degenerate inputs */
+static void test_safety_slerp_degenerate(void) {
+    printf("  [safety] slerp degenerate inputs...\n");
+
+    /* Identical quaternions — sin(theta) = 0 */
+    rac_phys_quat a = rac_phys_quat_identity();
+    rac_phys_quat b = rac_phys_quat_identity();
+    rac_phys_quat r = rac_phys_quat_slerp(a, b, 0.5f);
+    ASSERT_TRUE(isfinite(r.w), "slerp identical: w finite");
+    ASSERT_TRUE(isfinite(r.x), "slerp identical: x finite");
+    ASSERT_NEAR(r.w, 1.0f, 0.01f, "slerp identical: w ≈ 1");
+
+    /* Opposite quaternions (cos_theta = -1 before flip) */
+    rac_phys_quat neg = { -1.0f, 0.0f, 0.0f, 0.0f };
+    r = rac_phys_quat_slerp(a, neg, 0.5f);
+    ASSERT_TRUE(isfinite(r.w), "slerp opposite: w finite");
+    ASSERT_TRUE(isfinite(r.x), "slerp opposite: x finite");
+
+    /* Zero quaternion (degenerate) */
+    rac_phys_quat zero = { 0.0f, 0.0f, 0.0f, 0.0f };
+    r = rac_phys_quat_slerp(a, zero, 0.5f);
+    ASSERT_TRUE(isfinite(r.w), "slerp zero quat: w finite");
+
+    /* NaN quaternion */
+    rac_phys_quat nan_q = { 0.0f/0.0f, 0.0f, 0.0f, 0.0f };
+    r = rac_phys_quat_slerp(a, nan_q, 0.5f);
+    ASSERT_TRUE(isfinite(r.w), "slerp NaN quat: returns valid fallback");
+}
+
+/* Fix #5: GJK must not crash on NULL or zero-count vertex arrays */
+static void test_safety_gjk_bad_input(void) {
+    printf("  [safety] GJK with NULL/empty vertex arrays...\n");
+
+    rac_phys_contact_manifold m;
+    rac_phys_quat id = rac_phys_quat_identity();
+    rac_phys_vec3 origin = rac_phys_v3_zero();
+
+    /* NULL vertices */
+    int hit = rac_phys_gjk_intersect(
+        NULL, 0, origin, id,
+        NULL, 0, origin, id, &m);
+    ASSERT_TRUE(!hit, "GJK returns 0 for NULL vertices");
+
+    /* Zero vertex count */
+    rac_phys_vec3 verts[3] = {{0,0,0}, {1,0,0}, {0,1,0}};
+    hit = rac_phys_gjk_intersect(
+        verts, 0, origin, id,
+        verts, 3, origin, id, &m);
+    ASSERT_TRUE(!hit, "GJK returns 0 for zero vertex count");
+
+    /* One valid, one NULL */
+    hit = rac_phys_gjk_intersect(
+        verts, 3, origin, id,
+        NULL, 0, origin, id, &m);
+    ASSERT_TRUE(!hit, "GJK returns 0 for one NULL array");
+}
+
+/* Fix #6: Constraint solver must skip invalid body refs */
+static void test_safety_constraint_bad_indices(void) {
+    printf("  [safety] constraint solver with OOB body indices...\n");
+
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[0].position = rac_phys_v3(0, 0, 0);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(2, 0, 0);
+
+    /* Constraint with OOB body_a */
+    rac_phys_constraint bad_c;
+    memset(&bad_c, 0, sizeof(bad_c));
+    bad_c.type = RAC_CONSTRAINT_DISTANCE;
+    bad_c.body_a = 999;  /* OOB */
+    bad_c.body_b = 0;
+    bad_c.rest_length = 1.0f;
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+    rac_phys_pgs_solve(bodies, 2, &bad_c, 1, NULL, 0, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(1, "PGS survived OOB constraint body_a");
+
+    /* Constraint with body_b = -1 (world anchor, valid) */
+    bad_c.body_a = 0;
+    bad_c.body_b = -1;
+    rac_phys_pgs_solve(bodies, 2, &bad_c, 1, NULL, 0, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(1, "PGS survived world-anchor constraint (body_b=-1)");
+}
+
+/* Fix #7: World step must not crash when shapes are invalid */
+static void test_safety_world_invalid_shapes(void) {
+    printf("  [safety] world step with shape bounds...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+    ASSERT_TRUE(world != NULL, "world created for safety test");
+
+    /* Add a sphere body — should work normally */
+    rac_phys_rigid_body ball = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    ball.position = rac_phys_v3(0, 5, 0);
+    rac_phys_shape ball_shape;
+    memset(&ball_shape, 0, sizeof(ball_shape));
+    ball_shape.type = RAC_SHAPE_SPHERE;
+    ball_shape.sphere.radius = 0.5f;
+    int idx = rac_phys_world_add_body(world, ball, ball_shape);
+    ASSERT_TRUE(idx >= 0, "body added successfully");
+
+    /* Step world — should not crash even with single body */
+    for (int i = 0; i < 10; i++)
+        rac_phys_world_step(world, 1.0f/60.0f);
+    ASSERT_TRUE(1, "world step survived with valid body");
+
+    /* Manually corrupt a body's shape_index to test guard */
+    rac_phys_rigid_body *b = rac_phys_world_get_body(world, idx);
+    int saved_shape = b->shape_index;
+    b->shape_index = -1;  /* corrupt */
+    rac_phys_world_step(world, 1.0f/60.0f);
+    ASSERT_TRUE(1, "world step survived corrupted shape_index=-1");
+
+    b->shape_index = 99999;  /* corrupt OOB */
+    rac_phys_world_step(world, 1.0f/60.0f);
+    ASSERT_TRUE(1, "world step survived corrupted shape_index=99999");
+
+    b->shape_index = saved_shape;  /* restore */
+    rac_phys_world_destroy(world);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §10  IMPORTANT FIXES REGRESSION TESTS (#8–#14)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Fix #8: NaN quaternion must not corrupt rotation output */
+static void test_fix8_nan_quat_rotate(void) {
+    printf("  [fix #8] NaN quaternion rotation guard...\n");
+
+    rac_phys_vec3 v = rac_phys_v3(1.0f, 2.0f, 3.0f);
+
+    /* NaN quaternion should return vector unchanged */
+    rac_phys_quat nan_q = { 0.0f/0.0f, 0.0f, 0.0f, 0.0f };
+    rac_phys_vec3 r = rac_phys_quat_rotate_vec3(nan_q, v);
+    ASSERT_NEAR(r.x, 1.0f, 0.001f, "NaN quat rotate: x preserved");
+    ASSERT_NEAR(r.y, 2.0f, 0.001f, "NaN quat rotate: y preserved");
+    ASSERT_NEAR(r.z, 3.0f, 0.001f, "NaN quat rotate: z preserved");
+
+    /* Slerp with NaN should return first quaternion */
+    rac_phys_quat a = rac_phys_quat_identity();
+    rac_phys_quat result = rac_phys_quat_slerp(a, nan_q, 0.5f);
+    ASSERT_TRUE(isfinite(result.w) && isfinite(result.x), "slerp NaN: finite output");
+
+    /* Slerp output should always be normalized */
+    rac_phys_quat b = rac_phys_quat_from_axis_angle(rac_phys_v3(0,1,0), 1.0f);
+    result = rac_phys_quat_slerp(a, b, 0.5f);
+    float len = sqrtf(result.w*result.w + result.x*result.x +
+                      result.y*result.y + result.z*result.z);
+    ASSERT_NEAR(len, 1.0f, 0.01f, "slerp output is normalized");
+}
+
+/* Fix #9: FEM should handle nearly-degenerate elements without exploding */
+static void test_fix9_fem_singular_matrix(void) {
+    printf("  [fix #9] FEM singular matrix stability...\n");
+
+    /* Create a beam and simulate — should not produce NaN */
+    rac_phys_soft_body *beam = rac_phys_softbody_create_beam(
+        0.5f, 0.1f, 0.1f, 2, 100.0f, 50.0f);
+    ASSERT_TRUE(beam != NULL, "beam created for singular test");
+    beam->solver_iterations = 16;
+    beam->damping = 0.95f;
+
+    for (int i = 0; i < 60; i++)
+        rac_phys_softbody_step(beam, rac_phys_v3(0, -9.81f, 0), 1.0f/60.0f);
+
+    /* All positions should be finite (no NaN explosion) */
+    int all_finite = 1;
+    for (int i = 0; i < beam->num_vertices; i++) {
+        if (!isfinite(beam->positions[i].x) ||
+            !isfinite(beam->positions[i].y) ||
+            !isfinite(beam->positions[i].z)) {
+            all_finite = 0;
+            break;
+        }
+    }
+    ASSERT_TRUE(all_finite, "FEM beam: all positions finite after sim");
+
+    rac_phys_softbody_destroy(beam);
+}
+
+/* Fix #10: Warm-start should accelerate PGS convergence */
+static void test_fix10_warm_start(void) {
+    printf("  [fix #10] PGS warm-start accumulation...\n");
+
+    /* Set up two colliding spheres */
+    rac_phys_rigid_body bodies[2];
+    bodies[0] = rac_phys_body_create(RAC_BODY_STATIC, 0.0f);
+    bodies[0].position = rac_phys_v3(0, 0, 0);
+    bodies[1] = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    bodies[1].position = rac_phys_v3(0, 0.8f, 0);
+    bodies[1].linear_velocity = rac_phys_v3(0, -5.0f, 0);
+
+    rac_phys_contact_manifold contact;
+    memset(&contact, 0, sizeof(contact));
+    contact.body_a = 0;
+    contact.body_b = 1;
+    contact.num_contacts = 1;
+    contact.contacts[0].point = rac_phys_v3(0, 0.5f, 0);
+    contact.contacts[0].normal = rac_phys_v3(0, 1, 0);
+    contact.contacts[0].depth = 0.2f;
+    contact.contacts[0].lambda_n = 0.0f;
+    contact.contacts[0].lambda_t = 0.0f;
+
+    rac_phys_pgs_config cfg = rac_phys_pgs_default_config();
+
+    /* Solve once */
+    rac_phys_pgs_solve(bodies, 2, NULL, 0, &contact, 1, &cfg, 1.0f/60.0f);
+
+    /* lambda_n should have accumulated a positive impulse */
+    ASSERT_TRUE(contact.contacts[0].lambda_n > 0.0f,
+                "warm-start: lambda_n accumulated");
+
+    /* Second solve should benefit from warm-start */
+    float lambda_after_first = contact.contacts[0].lambda_n;
+    bodies[1].linear_velocity = rac_phys_v3(0, -5.0f, 0);  /* reset velocity */
+    rac_phys_pgs_solve(bodies, 2, NULL, 0, &contact, 1, &cfg, 1.0f/60.0f);
+    ASSERT_TRUE(contact.contacts[0].lambda_n > 0.0f,
+                "warm-start: lambda persists across solves");
+    (void)lambda_after_first;
+}
+
+/* Fix #11: Spatial hash dedup must handle large ID sets efficiently */
+static void test_fix11_spatial_hash_dedup(void) {
+    printf("  [fix #11] spatial hash O(n) dedup...\n");
+
+    rac_phys_spatial_hash *sh = rac_phys_spatial_hash_create(1.0f, 64);
+
+    /* Insert 500 objects, many overlapping the same cells */
+    for (int i = 0; i < 500; i++) {
+        float x = (float)(i % 10) * 0.5f;
+        float y = (float)(i / 10 % 10) * 0.5f;
+        rac_phys_aabb aabb = {{ x, y, 0 }, { x + 0.6f, y + 0.6f, 0.6f }};
+        rac_phys_spatial_hash_insert(sh, aabb, i);
+    }
+
+    /* Query a region that overlaps many objects */
+    rac_phys_aabb query = {{ 0, 0, 0 }, { 3, 3, 1 }};
+    int results[512];
+    int n = rac_phys_spatial_hash_query(sh, query, results, 512);
+
+    /* Should find objects without duplicates */
+    ASSERT_TRUE(n > 0, "dedup query: found objects");
+
+    /* Verify no duplicates in results */
+    int has_dup = 0;
+    for (int i = 0; i < n && !has_dup; i++)
+        for (int j = i + 1; j < n && !has_dup; j++)
+            if (results[i] == results[j]) has_dup = 1;
+    ASSERT_TRUE(!has_dup, "dedup query: no duplicates in results");
+
+    rac_phys_spatial_hash_destroy(sh);
+}
+
+/* Fix #12: Sleeping body should wake when contacted by moving body */
+static void test_fix12_wake_on_contact(void) {
+    printf("  [fix #12] wake sleeping bodies on contact...\n");
+
+    rac_phys_world_config cfg = rac_phys_world_default_config();
+    cfg.sleep_time = 0.01f;  /* sleep quickly for test */
+    cfg.sleep_threshold = 100.0f;  /* high threshold so bodies sleep fast */
+    rac_phys_world *world = rac_phys_world_create(&cfg);
+
+    /* Add a resting sphere (will sleep) */
+    rac_phys_rigid_body resting = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    resting.position = rac_phys_v3(0, 0.5f, 0);
+    rac_phys_body_set_inertia_sphere(&resting, 0.5f);
+    rac_phys_shape s;
+    memset(&s, 0, sizeof(s));
+    s.type = RAC_SHAPE_SPHERE;
+    s.sphere.radius = 0.5f;
+    int rest_idx = rac_phys_world_add_body(world, resting, s);
+
+    /* Step to let it sleep */
+    for (int i = 0; i < 10; i++)
+        rac_phys_world_step(world, 1.0f/60.0f);
+
+    rac_phys_rigid_body *rb = rac_phys_world_get_body(world, rest_idx);
+    ASSERT_TRUE(rb->is_sleeping, "resting body went to sleep");
+
+    /* Add a fast-moving sphere that will collide */
+    rac_phys_rigid_body mover = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    mover.position = rac_phys_v3(2.0f, 0.5f, 0);
+    mover.linear_velocity = rac_phys_v3(-10.0f, 0, 0);
+    rac_phys_body_set_inertia_sphere(&mover, 0.5f);
+    rac_phys_world_add_body(world, mover, s);
+
+    /* Step — collision should wake the resting body */
+    cfg.sleep_threshold = 0.01f;  /* restore normal threshold */
+    for (int i = 0; i < 30; i++)
+        rac_phys_world_step(world, 1.0f/60.0f);
+
+    /* The resting body should have been woken by the contact */
+    /* (even if it re-sleeps, it should have moved from original position) */
+    float moved = rac_phys_v3_length(
+        rac_phys_v3_sub(rb->position, rac_phys_v3(0, 0.5f, 0)));
+    /* We check it was woken (sleep timer reset or position changed) */
+    ASSERT_TRUE(moved > 0.001f || !rb->is_sleeping,
+                "sleeping body woke on contact");
+
+    rac_phys_world_destroy(world);
+}
+
+/* Fix #13: SPH boundary damping should contain fluid */
+static void test_fix13_sph_boundary(void) {
+    printf("  [fix #13] SPH boundary damping...\n");
+
+    rac_phys_sph_config cfg = rac_phys_sph_default_config();
+    cfg.smoothing_radius = 0.5f;
+    cfg.particle_mass = 1.0f;
+    cfg.boundary_damping = 0.5f;
+
+    rac_phys_particle_system *ps = rac_phys_particles_create(10);
+    rac_phys_spatial_hash *grid = rac_phys_spatial_hash_create(0.5f, 64);
+
+    /* Launch particle at high speed toward boundary */
+    rac_phys_particles_emit(ps, rac_phys_v3(9.0f, 0, 0),
+                             rac_phys_v3(100.0f, 0, 0), cfg.particle_mass);
+
+    /* Step several times */
+    for (int i = 0; i < 30; i++)
+        rac_phys_sph_step(ps, grid, rac_phys_v3_zero(), &cfg, 1.0f/60.0f);
+
+    /* Particle should be contained within bounds */
+    ASSERT_TRUE(ps->positions[0].x <= 10.0f,
+                "boundary: particle contained at +x");
+    ASSERT_TRUE(ps->positions[0].x >= -10.0f,
+                "boundary: particle contained at -x");
+
+    /* Velocity magnitude should be reduced by damping */
+    float speed = fabsf(ps->velocities[0].x);
+    ASSERT_TRUE(speed < 100.0f, "boundary: velocity damped from initial 100");
+
+    rac_phys_spatial_hash_destroy(grid);
+    rac_phys_particles_destroy(ps);
+}
+
+/* Fix #14: RK4 integrator should work and be more accurate than Euler */
+static void test_fix14_rk4_integrator(void) {
+    printf("  [fix #14] RK4 integration...\n");
+
+    /* Free-fall comparison: Euler vs RK4 vs analytical */
+    float dt = 1.0f / 60.0f;
+    float total_t = 1.0f;
+    int steps = (int)(total_t / dt);
+    float g = -9.81f;
+
+    /* Analytical: y = y0 + v0*t + 0.5*g*t² = 10 + 0 + 0.5*(-9.81)*1 = 5.095 */
+    float y_analytical = 10.0f + 0.5f * g * total_t * total_t;
+
+    /* Euler */
+    rac_phys_rigid_body euler_b = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    euler_b.position = rac_phys_v3(0, 10, 0);
+    euler_b.linear_damping = 0.0f;
+    for (int i = 0; i < steps; i++) {
+        rac_phys_body_apply_force(&euler_b, rac_phys_v3(0, g, 0));
+        rac_phys_body_integrate(&euler_b, dt, RAC_INTEGRATE_EULER);
+    }
+
+    /* RK4 */
+    rac_phys_rigid_body rk4_b = rac_phys_body_create(RAC_BODY_DYNAMIC, 1.0f);
+    rk4_b.position = rac_phys_v3(0, 10, 0);
+    rk4_b.linear_damping = 0.0f;
+    for (int i = 0; i < steps; i++) {
+        rac_phys_body_apply_force(&rk4_b, rac_phys_v3(0, g, 0));
+        rac_phys_body_integrate(&rk4_b, dt, RAC_INTEGRATE_RK4);
+    }
+
+    float euler_err = fabsf(euler_b.position.y - y_analytical);
+    float rk4_err = fabsf(rk4_b.position.y - y_analytical);
+
+    ASSERT_TRUE(rk4_b.position.y < 10.0f, "RK4: ball fell");
+    ASSERT_TRUE(rk4_b.position.y > 0.0f, "RK4: ball above ground");
+
+    /* RK4 should be at least as accurate as Euler (for constant force,
+     * both are exact, so we just verify RK4 works correctly) */
+    ASSERT_TRUE(rk4_err < 1.0f, "RK4: reasonable accuracy");
+    ASSERT_NEAR(rk4_b.position.y, y_analytical, 0.5f, "RK4: close to analytical");
+    (void)euler_err;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * MAIN
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -490,6 +941,23 @@ int main(void) {
 
     printf("\n§8 World Integration\n");
     test_world();
+
+    printf("\n§9 Safety Regression (Critical Fixes #1–#7)\n");
+    test_safety_pgs_bad_indices();
+    test_safety_spatial_hash_overflow();
+    test_safety_slerp_degenerate();
+    test_safety_gjk_bad_input();
+    test_safety_constraint_bad_indices();
+    test_safety_world_invalid_shapes();
+
+    printf("\n§10 Important Fixes (#8–#14)\n");
+    test_fix8_nan_quat_rotate();
+    test_fix9_fem_singular_matrix();
+    test_fix10_warm_start();
+    test_fix11_spatial_hash_dedup();
+    test_fix12_wake_on_contact();
+    test_fix13_sph_boundary();
+    test_fix14_rk4_integrator();
 
     printf("\n════════════════════════════════════════════════════════════════\n");
     printf("  Results: %d/%d passed, %d failed\n",

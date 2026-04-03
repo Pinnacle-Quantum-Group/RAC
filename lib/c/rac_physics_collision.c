@@ -90,7 +90,15 @@ void rac_phys_spatial_hash_clear(rac_phys_spatial_hash *sh) {
 }
 
 static void _insert_cell(rac_phys_spatial_hash *sh, int cx, int cy, int cz, int id) {
-    if (sh->num_entries >= sh->max_entries) return;
+    /* Fix #2: grow entries array on overflow instead of silently dropping */
+    if (sh->num_entries >= sh->max_entries) {
+        int new_max = sh->max_entries * 2;
+        _spatial_entry *new_entries = realloc(sh->entries,
+                                              sizeof(_spatial_entry) * new_max);
+        if (!new_entries) return;  /* OOM — degrade gracefully */
+        sh->entries = new_entries;
+        sh->max_entries = new_max;
+    }
 
     int bucket = _hash_coord(cx, cy, cz, sh->table_size);
     int ei = sh->num_entries++;
@@ -126,24 +134,59 @@ int rac_phys_spatial_hash_query(rac_phys_spatial_hash *sh,
     int max_cy = (int)floorf(aabb.max.y * sh->inv_cell_size);
     int max_cz = (int)floorf(aabb.max.z * sh->inv_cell_size);
 
+    /*
+     * Fix #11: O(n) dedup via bitset instead of O(n²) linear scan.
+     * Use stack-allocated bitset for IDs < 8192; fall back to heap for more.
+     */
+    #define _BITSET_STACK_IDS 8192
+    #define _BITSET_WORDS(n) (((n) + 31) / 32)
+
+    uint32_t stack_bits[_BITSET_WORDS(_BITSET_STACK_IDS)];
+    uint32_t *seen = stack_bits;
+    int bitset_ids = _BITSET_STACK_IDS;
+    int used_heap = 0;
+
+    /* Find max ID to size the bitset */
+    int max_id = 0;
+    for (int i = 0; i < sh->num_entries; i++)
+        if (sh->entries[i].id > max_id) max_id = sh->entries[i].id;
+    max_id++;  /* need id+1 bits */
+
+    if (max_id > _BITSET_STACK_IDS) {
+        seen = calloc(_BITSET_WORDS(max_id), sizeof(uint32_t));
+        if (!seen) return 0;  /* OOM fallback */
+        bitset_ids = max_id;
+        used_heap = 1;
+    } else {
+        memset(stack_bits, 0, sizeof(stack_bits));
+    }
+
     for (int cx = min_cx; cx <= max_cx && count < max_results; cx++) {
         for (int cy = min_cy; cy <= max_cy && count < max_results; cy++) {
             for (int cz = min_cz; cz <= max_cz && count < max_results; cz++) {
                 int bucket = _hash_coord(cx, cy, cz, sh->table_size);
                 int ei = sh->buckets[bucket];
                 while (ei != RAC_SPATIAL_HASH_NULL && count < max_results) {
-                    /* Deduplicate: check if already in results */
-                    int dup = 0;
-                    for (int r = 0; r < count; r++) {
-                        if (results[r] == sh->entries[ei].id) { dup = 1; break; }
+                    int id = sh->entries[ei].id;
+                    if (id >= 0 && id < bitset_ids) {
+                        uint32_t word = (uint32_t)id / 32;
+                        uint32_t bit  = 1u << ((uint32_t)id % 32);
+                        if (!(seen[word] & bit)) {
+                            seen[word] |= bit;
+                            results[count++] = id;
+                        }
                     }
-                    if (!dup) results[count++] = sh->entries[ei].id;
                     ei = sh->entries[ei].next;
                 }
             }
         }
     }
+
+    if (used_heap) free(seen);
     return count;
+
+    #undef _BITSET_STACK_IDS
+    #undef _BITSET_WORDS
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -451,6 +494,9 @@ int rac_phys_gjk_intersect(const rac_phys_vec3 *verts_a, int n_a,
                             const rac_phys_vec3 *verts_b, int n_b,
                             rac_phys_vec3 pos_b, rac_phys_quat rot_b,
                             rac_phys_contact_manifold *out) {
+    /* Fix #5: validate vertex arrays and counts */
+    if (!verts_a || n_a <= 0 || !verts_b || n_b <= 0) return 0;
+
     rac_phys_vec3 dir = rac_phys_v3_sub(pos_b, pos_a);
     if (rac_phys_v3_length_sq(dir) < 1e-8f)
         dir = rac_phys_v3(1.0f, 0.0f, 0.0f);

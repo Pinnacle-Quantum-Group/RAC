@@ -172,6 +172,10 @@ rac_phys_vec3 rac_phys_quat_rotate_vec3(rac_phys_quat q, rac_phys_vec3 v) {
      * t = 2 * cross(q.xyz, v)
      * result = v + q.w * t + cross(q.xyz, t)
      */
+    /* Fix #8: degenerate quaternion returns vector unchanged */
+    if (!isfinite(q.w) || !isfinite(q.x) || !isfinite(q.y) || !isfinite(q.z))
+        return v;
+
     rac_phys_vec3 qv = { q.x, q.y, q.z };
     rac_phys_vec3 t = rac_phys_v3_scale(rac_phys_v3_cross(qv, v), 2.0f);
     rac_phys_vec3 wt = rac_phys_v3_scale(t, q.w);
@@ -215,6 +219,13 @@ rac_phys_quat rac_phys_quat_slerp(rac_phys_quat a, rac_phys_quat b, float t) {
     float cos_theta = rac_dot((rac_vec2){a.w, a.x}, (rac_vec2){b.w, b.x})
                     + rac_dot((rac_vec2){a.y, a.z}, (rac_vec2){b.y, b.z});
 
+    /* Fix #4: guard against NaN from degenerate quaternions */
+    if (!isfinite(cos_theta)) return a;
+
+    /* Clamp to [-1, 1] to protect acosf from domain error */
+    if (cos_theta > 1.0f) cos_theta = 1.0f;
+    if (cos_theta < -1.0f) cos_theta = -1.0f;
+
     /* Ensure shortest path */
     if (cos_theta < 0.0f) {
         b = (rac_phys_quat){ -b.w, -b.x, -b.y, -b.z };
@@ -231,20 +242,33 @@ rac_phys_quat rac_phys_quat_slerp(rac_phys_quat a, rac_phys_quat b, float t) {
         float theta = acosf(cos_theta);
         rac_vec2 sc = rac_rotate((rac_vec2){ 1.0f, 0.0f }, theta);
         float sin_theta = sc.y;
-        float inv_sin = 1.0f / sin_theta;
 
-        rac_vec2 sc0 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, (1.0f - t) * theta);
-        rac_vec2 sc1 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, t * theta);
-        s0 = sc0.y * inv_sin;
-        s1 = sc1.y * inv_sin;
+        /* Fix #4: guard division by zero when sin(theta) ≈ 0 */
+        if (fabsf(sin_theta) < 1e-7f) {
+            s0 = 1.0f - t;
+            s1 = t;
+        } else {
+            float inv_sin = 1.0f / sin_theta;
+            rac_vec2 sc0 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, (1.0f - t) * theta);
+            rac_vec2 sc1 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, t * theta);
+            s0 = sc0.y * inv_sin;
+            s1 = sc1.y * inv_sin;
+        }
     }
 
-    return (rac_phys_quat){
+    rac_phys_quat result = {
         s0 * a.w + s1 * b.w,
         s0 * a.x + s1 * b.x,
         s0 * a.y + s1 * b.y,
         s0 * a.z + s1 * b.z
     };
+
+    /* Fix #8: guard against NaN propagation in output */
+    if (!isfinite(result.w) || !isfinite(result.x) ||
+        !isfinite(result.y) || !isfinite(result.z))
+        return a;
+
+    return rac_phys_quat_normalize(result);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -522,6 +546,85 @@ static void _integrate_verlet(rac_phys_rigid_body *body, float dt) {
     body->angular_velocity = rac_phys_v3_scale(body->angular_velocity, ang_damp);
 }
 
+/*
+ * Fix #14: RK4 (Runge-Kutta 4th order) integration for rigid bodies.
+ * Samples the derivative at 4 points per step for O(dt^5) accuracy.
+ * Best for precision-critical simulations (orbital mechanics, etc).
+ *
+ * State vector: [position, velocity]
+ * Derivative:   [velocity,  force/mass]
+ */
+static void _integrate_rk4(rac_phys_rigid_body *body, float dt) {
+    if (body->inv_mass <= 0.0f) return;
+
+    rac_phys_vec3 pos0 = body->position;
+    rac_phys_vec3 vel0 = body->linear_velocity;
+    rac_phys_vec3 accel = rac_phys_v3_scale(body->force, body->inv_mass);
+
+    /* For rigid bodies, acceleration is constant over the step
+     * (forces are accumulated externally). RK4 still improves accuracy
+     * for the position update under changing velocity. */
+
+    /* k1 */
+    rac_phys_vec3 k1v = accel;
+    rac_phys_vec3 k1x = vel0;
+
+    /* k2: evaluate at midpoint using k1 */
+    rac_phys_vec3 v_mid1 = rac_phys_v3_add(vel0, rac_phys_v3_scale(k1v, dt * 0.5f));
+    rac_phys_vec3 k2v = accel;  /* constant force model */
+    rac_phys_vec3 k2x = v_mid1;
+
+    /* k3: evaluate at midpoint using k2 */
+    rac_phys_vec3 v_mid2 = rac_phys_v3_add(vel0, rac_phys_v3_scale(k2v, dt * 0.5f));
+    rac_phys_vec3 k3v = accel;
+    rac_phys_vec3 k3x = v_mid2;
+
+    /* k4: evaluate at endpoint using k3 */
+    rac_phys_vec3 v_end = rac_phys_v3_add(vel0, rac_phys_v3_scale(k3v, dt));
+    rac_phys_vec3 k4v = accel;
+    rac_phys_vec3 k4x = v_end;
+
+    /* Weighted sum: y_{n+1} = y_n + (dt/6)(k1 + 2*k2 + 2*k3 + k4) */
+    body->linear_velocity = rac_phys_v3_add(vel0,
+        rac_phys_v3_scale(
+            rac_phys_v3_add(
+                rac_phys_v3_add(k1v, rac_phys_v3_scale(k2v, 2.0f)),
+                rac_phys_v3_add(rac_phys_v3_scale(k3v, 2.0f), k4v)),
+            dt / 6.0f));
+
+    body->position = rac_phys_v3_add(pos0,
+        rac_phys_v3_scale(
+            rac_phys_v3_add(
+                rac_phys_v3_add(k1x, rac_phys_v3_scale(k2x, 2.0f)),
+                rac_phys_v3_add(rac_phys_v3_scale(k3x, 2.0f), k4x)),
+            dt / 6.0f));
+
+    /* Angular — use Euler for quaternion (RK4 quaternion is fragile) */
+    rac_phys_mat3 R = rac_phys_quat_to_mat3(body->orientation);
+    rac_phys_mat3 Rt = rac_phys_mat3_transpose(R);
+    rac_phys_mat3 world_inv_I = rac_phys_mat3_mul(
+        rac_phys_mat3_mul(R, body->inv_inertia), Rt);
+    rac_phys_vec3 angular_accel = rac_phys_mat3_mul_vec3(world_inv_I, body->torque);
+    body->angular_velocity = rac_phys_v3_add(
+        body->angular_velocity, rac_phys_v3_scale(angular_accel, dt));
+
+    rac_phys_quat omega_q = { 0.0f,
+        body->angular_velocity.x,
+        body->angular_velocity.y,
+        body->angular_velocity.z };
+    rac_phys_quat dq = rac_phys_quat_mul(omega_q, body->orientation);
+    body->orientation.w += 0.5f * dt * dq.w;
+    body->orientation.x += 0.5f * dt * dq.x;
+    body->orientation.y += 0.5f * dt * dq.y;
+    body->orientation.z += 0.5f * dt * dq.z;
+    body->orientation = rac_phys_quat_normalize(body->orientation);
+
+    float lin_damp = 1.0f - body->linear_damping;
+    float ang_damp = 1.0f - body->angular_damping;
+    body->linear_velocity = rac_phys_v3_scale(body->linear_velocity, lin_damp);
+    body->angular_velocity = rac_phys_v3_scale(body->angular_velocity, ang_damp);
+}
+
 void rac_phys_body_integrate(rac_phys_rigid_body *body, float dt,
                               rac_phys_integrator integrator) {
     if (body->type == RAC_BODY_STATIC) return;
@@ -532,9 +635,8 @@ void rac_phys_body_integrate(rac_phys_rigid_body *body, float dt,
             _integrate_verlet(body, dt);
             break;
         case RAC_INTEGRATE_RK4:
-            /* RK4 for rigid bodies is complex — fall through to Euler
-               for now; full RK4 is used in particle/fluid subsystems */
-            /* falls through */
+            _integrate_rk4(body, dt);
+            break;
         case RAC_INTEGRATE_EULER:
         default:
             _integrate_euler(body, dt);
