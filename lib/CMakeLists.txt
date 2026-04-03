@@ -162,5 +162,18 @@ if(TARGET rac_avx2)
     install(TARGETS rac_avx2 DESTINATION lib)
 endif()
 
+# ── Game Engine ──────────────────────────────────────────────────────────
+#
+# RAC Native Game Engine: software rasterizer, spatial audio, ECS,
+# scene graph — all built on RAC CORDIC primitives.
+#
+
+option(RAC_ENGINE "Build RAC game engine" ON)
+
+if(RAC_ENGINE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/../engine engine_build)
+    message(STATUS "RAC Engine: enabled")
+endif()
+
 message(STATUS "RAC library v${PROJECT_VERSION} configured")
 message(STATUS "RAC Physics library configured (rigid body, collision, constraints, SPH, cloth, FEM)")
