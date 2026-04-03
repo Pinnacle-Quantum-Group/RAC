@@ -238,6 +238,12 @@ static void _world_substep(rac_phys_world *w, float dt) {
         for (int ci = 0; ci < n_cand && w->num_contacts < RAC_WORLD_MAX_CONTACTS; ci++) {
             int j = candidates[ci];
             if (j <= i) continue;  /* avoid duplicate pairs */
+            if (j >= nb) continue; /* Fix #7: bounds check candidate index */
+
+            /* Fix #7: validate shape indices before narrow phase */
+            if (w->bodies[i].shape_index < 0 || w->bodies[i].shape_index >= nb ||
+                w->bodies[j].shape_index < 0 || w->bodies[j].shape_index >= nb)
+                continue;
 
             /* Skip static-static pairs */
             if (w->bodies[i].type == RAC_BODY_STATIC &&

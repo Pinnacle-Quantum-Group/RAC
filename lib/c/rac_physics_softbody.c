@@ -280,10 +280,10 @@ static void _softbody_substep(rac_phys_soft_body *sb,
     for (int i = 0; i < nv; i++) {
         if (sb->inv_masses[i] <= 0.0f) continue;
 
-        /* Add gravity */
+        /* Add gravity: F_grav = mass * g (mass = 1/inv_mass) */
+        float mass_i = 1.0f / sb->inv_masses[i];
         rac_phys_vec3 total_force = rac_phys_v3_add(
-            forces[i],
-            rac_phys_v3_scale(gravity, 1.0f / sb->inv_masses[i]));
+            forces[i], rac_phys_v3_scale(gravity, mass_i));
 
         /* Symplectic Euler */
         rac_phys_vec3 accel = rac_phys_v3_scale(total_force, sb->inv_masses[i]);

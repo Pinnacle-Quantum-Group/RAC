@@ -110,13 +110,19 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
                          rac_phys_constraint *constraints, int num_constraints,
                          rac_phys_contact_manifold *contacts, int num_contacts,
                          const rac_phys_pgs_config *cfg, float dt) {
-    (void)num_bodies;
+    if (!bodies || num_bodies <= 0) return;
+    if (!cfg) return;
     float inv_dt = (dt > 0.0f) ? 1.0f / dt : 0.0f;
 
     for (int iter = 0; iter < cfg->iterations; iter++) {
         /* ── Solve contact constraints ──────────────────────────────── */
         for (int ci = 0; ci < num_contacts; ci++) {
             rac_phys_contact_manifold *m = &contacts[ci];
+
+            /* Fix #1: bounds-check body indices */
+            if (m->body_a < 0 || m->body_a >= num_bodies ||
+                m->body_b < 0 || m->body_b >= num_bodies) continue;
+
             rac_phys_rigid_body *a = &bodies[m->body_a];
             rac_phys_rigid_body *b = &bodies[m->body_b];
 
@@ -198,6 +204,11 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
         /* ── Solve joint/distance constraints ──────────────────────── */
         for (int ci = 0; ci < num_constraints; ci++) {
             rac_phys_constraint *c = &constraints[ci];
+
+            /* Fix #6: bounds-check constraint body indices */
+            if (c->body_a < 0 || c->body_a >= num_bodies) continue;
+            if (c->body_b >= num_bodies) continue;  /* -1 = world anchor (valid) */
+
             rac_phys_rigid_body *a = &bodies[c->body_a];
             rac_phys_rigid_body *b = (c->body_b >= 0) ? &bodies[c->body_b] : NULL;
 

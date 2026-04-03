@@ -90,7 +90,15 @@ void rac_phys_spatial_hash_clear(rac_phys_spatial_hash *sh) {
 }
 
 static void _insert_cell(rac_phys_spatial_hash *sh, int cx, int cy, int cz, int id) {
-    if (sh->num_entries >= sh->max_entries) return;
+    /* Fix #2: grow entries array on overflow instead of silently dropping */
+    if (sh->num_entries >= sh->max_entries) {
+        int new_max = sh->max_entries * 2;
+        _spatial_entry *new_entries = realloc(sh->entries,
+                                              sizeof(_spatial_entry) * new_max);
+        if (!new_entries) return;  /* OOM — degrade gracefully */
+        sh->entries = new_entries;
+        sh->max_entries = new_max;
+    }
 
     int bucket = _hash_coord(cx, cy, cz, sh->table_size);
     int ei = sh->num_entries++;
@@ -451,6 +459,9 @@ int rac_phys_gjk_intersect(const rac_phys_vec3 *verts_a, int n_a,
                             const rac_phys_vec3 *verts_b, int n_b,
                             rac_phys_vec3 pos_b, rac_phys_quat rot_b,
                             rac_phys_contact_manifold *out) {
+    /* Fix #5: validate vertex arrays and counts */
+    if (!verts_a || n_a <= 0 || !verts_b || n_b <= 0) return 0;
+
     rac_phys_vec3 dir = rac_phys_v3_sub(pos_b, pos_a);
     if (rac_phys_v3_length_sq(dir) < 1e-8f)
         dir = rac_phys_v3(1.0f, 0.0f, 0.0f);

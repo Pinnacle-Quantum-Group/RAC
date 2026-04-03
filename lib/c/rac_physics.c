@@ -215,6 +215,13 @@ rac_phys_quat rac_phys_quat_slerp(rac_phys_quat a, rac_phys_quat b, float t) {
     float cos_theta = rac_dot((rac_vec2){a.w, a.x}, (rac_vec2){b.w, b.x})
                     + rac_dot((rac_vec2){a.y, a.z}, (rac_vec2){b.y, b.z});
 
+    /* Fix #4: guard against NaN from degenerate quaternions */
+    if (!isfinite(cos_theta)) return a;
+
+    /* Clamp to [-1, 1] to protect acosf from domain error */
+    if (cos_theta > 1.0f) cos_theta = 1.0f;
+    if (cos_theta < -1.0f) cos_theta = -1.0f;
+
     /* Ensure shortest path */
     if (cos_theta < 0.0f) {
         b = (rac_phys_quat){ -b.w, -b.x, -b.y, -b.z };
@@ -231,12 +238,18 @@ rac_phys_quat rac_phys_quat_slerp(rac_phys_quat a, rac_phys_quat b, float t) {
         float theta = acosf(cos_theta);
         rac_vec2 sc = rac_rotate((rac_vec2){ 1.0f, 0.0f }, theta);
         float sin_theta = sc.y;
-        float inv_sin = 1.0f / sin_theta;
 
-        rac_vec2 sc0 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, (1.0f - t) * theta);
-        rac_vec2 sc1 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, t * theta);
-        s0 = sc0.y * inv_sin;
-        s1 = sc1.y * inv_sin;
+        /* Fix #4: guard division by zero when sin(theta) ≈ 0 */
+        if (fabsf(sin_theta) < 1e-7f) {
+            s0 = 1.0f - t;
+            s1 = t;
+        } else {
+            float inv_sin = 1.0f / sin_theta;
+            rac_vec2 sc0 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, (1.0f - t) * theta);
+            rac_vec2 sc1 = rac_rotate((rac_vec2){ 1.0f, 0.0f }, t * theta);
+            s0 = sc0.y * inv_sin;
+            s1 = sc1.y * inv_sin;
+        }
     }
 
     return (rac_phys_quat){
