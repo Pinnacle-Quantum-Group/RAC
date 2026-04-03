@@ -47,7 +47,8 @@ static float _mat3_det(rac_phys_mat3 m) {
 
 static rac_phys_mat3 _mat3_inv(rac_phys_mat3 m) {
     float det = _mat3_det(m);
-    if (fabsf(det) < 1e-12f) return rac_phys_mat3_identity();
+    /* Fix #9: use larger threshold for float32 numerical stability */
+    if (fabsf(det) < 1e-6f) return rac_phys_mat3_identity();
 
     float inv_det = 1.0f / det;
     rac_phys_mat3 r;

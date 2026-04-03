@@ -114,6 +114,30 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
     if (!cfg) return;
     float inv_dt = (dt > 0.0f) ? 1.0f / dt : 0.0f;
 
+    /* Fix #10: warm-start — apply previous frame's impulses scaled down.
+     * This gives the solver a head start from last frame's solution. */
+    float ws = cfg->warm_start_factor;
+    for (int ci = 0; ci < num_contacts; ci++) {
+        rac_phys_contact_manifold *m = &contacts[ci];
+        if (m->body_a < 0 || m->body_a >= num_bodies ||
+            m->body_b < 0 || m->body_b >= num_bodies) continue;
+
+        rac_phys_rigid_body *a = &bodies[m->body_a];
+        rac_phys_rigid_body *b = &bodies[m->body_b];
+        for (int pi = 0; pi < m->num_contacts; pi++) {
+            rac_phys_contact_point *cp = &m->contacts[pi];
+            cp->lambda_n *= ws;
+            cp->lambda_t *= ws;
+            /* Apply warm-start impulse */
+            if (fabsf(cp->lambda_n) > 1e-8f) {
+                rac_phys_vec3 r_a = rac_phys_v3_sub(cp->point, a->position);
+                rac_phys_vec3 r_b = rac_phys_v3_sub(cp->point, b->position);
+                rac_phys_vec3 ws_impulse = rac_phys_v3_scale(cp->normal, cp->lambda_n);
+                _apply_contact_impulse(a, b, r_a, r_b, ws_impulse);
+            }
+        }
+    }
+
     for (int iter = 0; iter < cfg->iterations; iter++) {
         /* ── Solve contact constraints ──────────────────────────────── */
         for (int ci = 0; ci < num_contacts; ci++) {
@@ -157,10 +181,15 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
                 float eff_mass = _contact_effective_mass(a, b, r_a, r_b, cp->normal);
                 float lambda = eff_mass * (-v_n + bias);
 
-                /* Clamp: accumulated impulse >= 0 (no pulling) */
-                float old_lambda = 0.0f;  /* simplified — no warm start cache per point */
+                /*
+                 * Fix #10: warm-start — accumulate impulses across iterations.
+                 * On first iteration, warm-start from previous frame's lambda.
+                 * Clamp accumulated impulse >= 0 (non-pulling constraint).
+                 */
+                float old_lambda = cp->lambda_n;
                 float new_lambda = fmaxf(old_lambda + lambda, 0.0f);
                 lambda = new_lambda - old_lambda;
+                cp->lambda_n = new_lambda;
 
                 rac_phys_vec3 impulse = rac_phys_v3_scale(cp->normal, lambda);
                 _apply_contact_impulse(a, b, r_a, r_b, impulse);
@@ -188,10 +217,13 @@ void rac_phys_pgs_solve(rac_phys_rigid_body *bodies, int num_bodies,
                             a, b, r_a, r_b, tangent);
                         float friction_lambda = eff_mass_t * (-v_tan_len);
 
-                        /* Coulomb clamp */
+                        /* Coulomb clamp with warm-start accumulation */
                         float max_friction = mu * new_lambda;
-                        friction_lambda = fmaxf(-max_friction,
-                            fminf(friction_lambda, max_friction));
+                        float old_ft = cp->lambda_t;
+                        float new_ft = fmaxf(-max_friction,
+                            fminf(old_ft + friction_lambda, max_friction));
+                        friction_lambda = new_ft - old_ft;
+                        cp->lambda_t = new_ft;
 
                         rac_phys_vec3 friction_impulse = rac_phys_v3_scale(
                             tangent, friction_lambda);
