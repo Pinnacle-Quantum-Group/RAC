@@ -72,7 +72,7 @@ endif()
 
 if(RAC_MPI)
     find_package(MPI REQUIRED)
-    add_executable(rac_mpi c/rac_mpi.c c/rac_cpu.c c/rac_avx2.c)
+    add_executable(rac_mpi c/rac_mpi.c c/rac_cpu.c c/rac_avx2.c c/rac_hal.c c/rac_zen3_kern.S c/rac_avx512_kern.S)
     target_include_directories(rac_mpi PRIVATE c/)
     target_compile_options(rac_mpi PRIVATE -O3 -mavx2 -mfma -march=native)
     target_link_libraries(rac_mpi MPI::MPI_C m)
