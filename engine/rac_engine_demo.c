@@ -474,8 +474,30 @@ static void demo_render(rac_engine *engine)
         }
     }
 
-    /* Render sprites (honey badger character) */
-    rac_sprite_render(&demo->sprites, rs);
+    /* Render sprites: draw honey badger as a large 2D character on screen */
+    if (demo->badger_sheet_id >= 0 && demo->badger_sprite_id >= 0) {
+        rac_sprite_instance *si = &demo->sprites.instances[demo->badger_sprite_id];
+        rac_sprite_sheet *sheet = &demo->sprites.sheets[demo->badger_sheet_id];
+
+        /* Draw at 4x scale (64*4 = 256px tall), positioned in lower-center */
+        int draw_scale = 4;
+        float t = (float)engine->timing.total_time;
+        rac_vec2 patrol = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 1.5f);
+
+        int base_x = rs->fb->width / 2 - (sheet->frame_w * draw_scale) / 2;
+        int patrol_offset = (int)(patrol.y * 120.0f);  /* walk 120px side to side */
+        int draw_x = base_x + patrol_offset;
+        int draw_y = rs->fb->height - sheet->frame_h * draw_scale - 20;
+
+        /* Bob up/down */
+        rac_vec2 bob = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 4.0f);
+        draw_y += (int)(bob.y * 6.0f);
+
+        int flip = (patrol.x < 0.0f) ? 1 : 0;
+
+        rac_sprite_draw_2d(rs->fb, sheet, si->current_frame,
+                           draw_x, draw_y, draw_scale, flip);
+    }
 
     /* Accumulate stats */
     demo->total_pixels += rs->pixels_drawn;

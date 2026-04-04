@@ -100,6 +100,10 @@ target_link_libraries(test_engine_mesh rac_engine)
 add_test(NAME engine_mesh_bvt COMMAND test_engine_mesh)
 
 message(STATUS "RAC Engine v0.1.0 configured")
+
+# Copy assets to build directory
+file(GLOB RAC_ASSETS "${CMAKE_CURRENT_SOURCE_DIR}/assets/*")
+file(COPY ${RAC_ASSETS} DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/assets/")
 message(STATUS "  Modules: ECS, Scene, Mesh, Camera, Light, Render, Audio, Input")
 message(STATUS "  Demo: rac_engine_demo")
 message(STATUS "  Tests: engine_ecs_bvt, engine_render_bvt, engine_audio_bvt, engine_mesh_bvt")
