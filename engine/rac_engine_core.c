@@ -211,7 +211,8 @@ static void engine_frame(rac_engine *engine, float dt)
 
     /* 8. Render */
     double render_start = rac_engine_get_time();
-    rac_framebuffer_clear(fb, 20, 20, 30);
+    /* Gradient sky: dark blue top → dark indigo bottom */
+    rac_framebuffer_clear_gradient(fb, 15, 20, 55, 12, 12, 25);
     rs->triangles_submitted = 0;
     rs->triangles_drawn = 0;
     rs->pixels_drawn = 0;

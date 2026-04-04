@@ -62,6 +62,27 @@ void rac_framebuffer_clear(rac_framebuffer *fb, uint8_t r, uint8_t g, uint8_t b)
     }
 }
 
+void rac_framebuffer_clear_gradient(rac_framebuffer *fb,
+                                    uint8_t tr, uint8_t tg, uint8_t tb,
+                                    uint8_t br, uint8_t bg, uint8_t bb)
+{
+    for (int y = 0; y < fb->height; y++) {
+        /* Interpolation factor: 0 at top, 1 at bottom */
+        int t256 = (y * 256) / fb->height;  /* fixed-point 0..255 */
+        int inv = 256 - t256;
+        uint8_t r = (uint8_t)((tr * inv + br * t256) >> 8);
+        uint8_t g = (uint8_t)((tg * inv + bg * t256) >> 8);
+        uint8_t b = (uint8_t)((tb * inv + bb * t256) >> 8);
+        for (int x = 0; x < fb->width; x++) {
+            int i = y * fb->width + x;
+            fb->pixels[i * 3 + 0] = r;
+            fb->pixels[i * 3 + 1] = g;
+            fb->pixels[i * 3 + 2] = b;
+            fb->depth[i] = 1e30f;
+        }
+    }
+}
+
 int rac_framebuffer_write_ppm(const rac_framebuffer *fb, const char *path)
 {
     FILE *f = fopen(path, "wb");

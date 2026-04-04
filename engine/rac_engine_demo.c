@@ -15,6 +15,12 @@
 
 /* ── Demo state ────────────────────────────────────────────────────────── */
 
+typedef enum {
+    BADGER_IDLE,
+    BADGER_WALK,
+    BADGER_SHOOT,
+} badger_state;
+
 typedef struct {
     int cube_mesh, sphere_mesh, plane_mesh, cylinder_mesh;
 
@@ -26,6 +32,14 @@ typedef struct {
     rac_sprite_registry sprites;
     int badger_sprite_id;
     int badger_sheet_id;
+
+    /* Badger behavior */
+    badger_state state;
+    float state_timer;        /* time in current state */
+    float patrol_x;           /* current x position */
+    float patrol_dir;         /* +1 or -1 */
+    float shoot_cooldown;     /* time until next shoot */
+    int muzzle_flash_timer;   /* frames of flash remaining */
 
     int camera_id;
     int ambient_clip, impact_clip, ambient_source;
@@ -213,19 +227,28 @@ static void demo_init(rac_engine *engine)
         demo->badger_sprite_id = rac_sprite_create(&demo->sprites,
             demo->badger_sheet_id, rac_phys_v3_zero(), 2.0f);
         if (demo->badger_sprite_id >= 0) {
-            int idle = rac_sprite_add_anim(&demo->sprites,
-                demo->badger_sprite_id, 0, 4, 8.0f, 1);
+            /* anim 0 = idle, anim 1 = walk, anim 2 = shoot */
             rac_sprite_add_anim(&demo->sprites,
-                demo->badger_sprite_id, 4, 4, 10.0f, 1);
+                demo->badger_sprite_id, 0, 4, 8.0f, 1);   /* idle */
             rac_sprite_add_anim(&demo->sprites,
-                demo->badger_sprite_id, 8, 4, 12.0f, 0);
-            rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, idle);
+                demo->badger_sprite_id, 4, 4, 10.0f, 1);   /* walk */
+            rac_sprite_add_anim(&demo->sprites,
+                demo->badger_sprite_id, 8, 4, 12.0f, 0);   /* shoot */
+            rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, 1); /* start walking */
             printf("[Demo] Badger sprite: sheet=%d, %dx%d, 12 frames\n",
                    demo->badger_sheet_id,
                    demo->sprites.sheets[demo->badger_sheet_id].frame_w,
                    demo->sprites.sheets[demo->badger_sheet_id].frame_h);
         }
     }
+
+    /* Badger behavior init */
+    demo->state = BADGER_WALK;
+    demo->state_timer = 0.0f;
+    demo->patrol_x = 0.0f;
+    demo->patrol_dir = 1.0f;
+    demo->shoot_cooldown = 0.8f;  /* first shot quickly */
+    demo->muzzle_flash_timer = 0;
 
     /* ── Audio ─────────────────────────────────────────────────────── */
     demo->ambient_clip = rac_audio_gen_sine(audio, 220.0f, 2.0f, 0.1f);
@@ -309,10 +332,69 @@ static void demo_update(rac_engine *engine, float dt)
         sg->world_matrix[e] = m;
     }
 
-    /* ── Sprite animation update ───────────────────────────────────── */
-    rac_sprite_update(&demo->sprites, dt);
+    /* ── Badger behavior: walk → stop → shoot → walk ─────────────── */
+    if (demo->badger_sprite_id >= 0) {
+        demo->state_timer += dt;
+        demo->shoot_cooldown -= dt;
+        float walk_speed = (float)engine->config.window_width * 0.08f;  /* px/sec scaled */
 
-    (void)dt;
+        switch (demo->state) {
+        case BADGER_WALK:
+            /* Walk in patrol_dir */
+            demo->patrol_x += demo->patrol_dir * walk_speed * dt;
+
+            /* Turn around at edges */
+            if (demo->patrol_x > 0.35f) {
+                demo->patrol_x = 0.35f;
+                demo->patrol_dir = -1.0f;
+            } else if (demo->patrol_x < -0.35f) {
+                demo->patrol_x = -0.35f;
+                demo->patrol_dir = 1.0f;
+            }
+
+            /* Periodically stop to shoot */
+            if (demo->shoot_cooldown <= 0.0f) {
+                demo->state = BADGER_SHOOT;
+                demo->state_timer = 0.0f;
+                demo->muzzle_flash_timer = 8;  /* 8 frames of flash */
+                rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, 2);
+                demo->shoot_cooldown = 1.2f + (float)((engine->timing.frame_count * 7) % 10) * 0.1f;
+            }
+
+            /* Ensure walk anim is playing */
+            if (demo->sprites.instances[demo->badger_sprite_id].current_anim != 1) {
+                rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, 1);
+            }
+            break;
+
+        case BADGER_SHOOT:
+            /* Hold shoot pose for 0.5 seconds */
+            if (demo->muzzle_flash_timer > 0)
+                demo->muzzle_flash_timer--;
+
+            if (demo->state_timer > 0.5f) {
+                demo->state = BADGER_IDLE;
+                demo->state_timer = 0.0f;
+                rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, 0);
+            }
+            break;
+
+        case BADGER_IDLE:
+            /* Brief idle pause after shooting */
+            if (demo->state_timer > 0.6f) {
+                demo->state = BADGER_WALK;
+                demo->state_timer = 0.0f;
+                rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, 1);
+            }
+            break;
+        }
+
+        /* Set flip based on direction */
+        demo->sprites.instances[demo->badger_sprite_id].flip_x =
+            (demo->patrol_dir < 0.0f) ? 1 : 0;
+    }
+
+    rac_sprite_update(&demo->sprites, dt);
 }
 
 /* ── Render ────────────────────────────────────────────────────────────── */
@@ -345,32 +427,104 @@ static void demo_render(rac_engine *engine)
         rac_render_mesh(rs, &meshes->meshes[mr->mesh_id], world, color);
     }
 
-    /* ── Draw honey badger as large sprite overlay ─────────────────── */
+    /* ── Draw ground strip: gradient bar along bottom ────────────── */
+    {
+        int ground_start = rs->fb->height * 78 / 100;  /* ground starts at 78% */
+        int w = rs->fb->width, h = rs->fb->height;
+        for (int y = ground_start; y < h; y++) {
+            int depth = y - ground_start;
+            int range = h - ground_start;
+            int t256 = (depth * 256) / range;
+            /* Dark ground: charcoal → darker */
+            uint8_t gr = (uint8_t)((45 * (256 - t256) + 20 * t256) >> 8);
+            uint8_t gg = (uint8_t)((50 * (256 - t256) + 22 * t256) >> 8);
+            uint8_t gb = (uint8_t)((55 * (256 - t256) + 25 * t256) >> 8);
+            for (int x = 0; x < w; x++) {
+                int idx = (y * w + x) * 3;
+                rs->fb->pixels[idx + 0] = gr;
+                rs->fb->pixels[idx + 1] = gg;
+                rs->fb->pixels[idx + 2] = gb;
+            }
+        }
+        /* Horizon line: subtle bright edge */
+        for (int x = 0; x < w; x++) {
+            int idx = (ground_start * w + x) * 3;
+            rs->fb->pixels[idx + 0] = 70;
+            rs->fb->pixels[idx + 1] = 75;
+            rs->fb->pixels[idx + 2] = 85;
+        }
+    }
+
+    /* ── Draw honey badger sprite ──────────────────────────────────── */
     if (demo->badger_sheet_id >= 0 && demo->badger_sprite_id >= 0) {
         rac_sprite_instance *si = &demo->sprites.instances[demo->badger_sprite_id];
         rac_sprite_sheet *sheet = &demo->sprites.sheets[demo->badger_sheet_id];
 
-        /* Scale sprite to ~15% of screen height */
-        int target_h = rs->fb->height * 15 / 100;
-        int draw_scale = target_h / sheet->frame_h;
-        if (draw_scale < 1) draw_scale = 1;
+        /* Scale sprite to fill ~30% of screen height.
+         * Round up so sprite is never tiny. */
+        int target_h = rs->fb->height * 30 / 100;
+        int draw_scale = (target_h + sheet->frame_h - 1) / sheet->frame_h;
+        if (draw_scale < 2) draw_scale = 2;
 
-        float t = (float)engine->timing.total_time;
-
-        /* Patrol across lower portion of screen */
-        rac_vec2 patrol = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 1.2f);
-        int walk_range = rs->fb->width / 3;
+        /* Position from patrol state */
         int center_x = rs->fb->width / 2;
-        int draw_x = center_x + (int)(patrol.y * (float)walk_range) - (sheet->frame_w * draw_scale) / 2;
-        int draw_y = rs->fb->height - sheet->frame_h * draw_scale - rs->fb->height / 20;
+        int walk_range = rs->fb->width / 3;
+        int sprite_w = sheet->frame_w * draw_scale;
+        int sprite_h = sheet->frame_h * draw_scale;
+        int draw_x = center_x + (int)(demo->patrol_x * (float)walk_range) - sprite_w / 2;
+        int draw_y = rs->fb->height - sprite_h - rs->fb->height / 30;
 
-        /* Bob via rac_rotate */
-        rac_vec2 bob = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 5.0f);
-        draw_y += (int)(bob.y * (float)(rs->fb->height / 80));
+        /* Walk bob (only when walking) */
+        if (demo->state == BADGER_WALK) {
+            float t = (float)engine->timing.total_time;
+            rac_vec2 bob = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 6.0f);
+            draw_y += (int)(bob.y * (float)(rs->fb->height / 120));
+        }
 
-        int flip = (patrol.x < 0.0f) ? 1 : 0;
+        int flip = demo->sprites.instances[demo->badger_sprite_id].flip_x;
         rac_sprite_draw_2d(rs->fb, sheet, si->current_frame,
                            draw_x, draw_y, draw_scale, flip);
+
+        /* ── Muzzle flash effect when shooting ─────────────────────── */
+        if (demo->muzzle_flash_timer > 0) {
+            int flash_intensity = demo->muzzle_flash_timer * 30;
+            if (flash_intensity > 255) flash_intensity = 255;
+
+            /* Flash position: in front of the gun */
+            int flash_cx, flash_cy;
+            if (flip) {
+                flash_cx = draw_x - sprite_w / 8;  /* left of sprite */
+            } else {
+                flash_cx = draw_x + sprite_w + sprite_w / 8;  /* right */
+            }
+            flash_cy = draw_y + sprite_h / 3;  /* gun height */
+
+            /* Draw concentric circles for flash (outer glow → core) */
+            int flash_r = sprite_w / 2;
+            for (int fy = -flash_r; fy <= flash_r; fy++) {
+                for (int fx = -flash_r; fx <= flash_r; fx++) {
+                    int px = flash_cx + fx, py = flash_cy + fy;
+                    if (px < 0 || px >= rs->fb->width || py < 0 || py >= rs->fb->height)
+                        continue;
+                    int dist_sq = fx * fx + fy * fy;
+                    int r_sq = flash_r * flash_r;
+                    if (dist_sq > r_sq) continue;
+
+                    /* Intensity falls off with distance */
+                    int falloff = 255 - (dist_sq * 255 / r_sq);
+                    int alpha = (falloff * flash_intensity) >> 8;
+
+                    int idx = (py * rs->fb->width + px) * 3;
+                    /* Additive blend: orange-yellow flash */
+                    int nr = rs->fb->pixels[idx+0] + ((255 * alpha) >> 8);
+                    int ng = rs->fb->pixels[idx+1] + ((180 * alpha) >> 8);
+                    int nb = rs->fb->pixels[idx+2] + ((50 * alpha) >> 8);
+                    rs->fb->pixels[idx+0] = (uint8_t)(nr > 255 ? 255 : nr);
+                    rs->fb->pixels[idx+1] = (uint8_t)(ng > 255 ? 255 : ng);
+                    rs->fb->pixels[idx+2] = (uint8_t)(nb > 255 ? 255 : nb);
+                }
+            }
+        }
     }
 
     demo->total_pixels += rs->pixels_drawn;

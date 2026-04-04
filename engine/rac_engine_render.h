@@ -29,6 +29,11 @@ rac_framebuffer *rac_framebuffer_create(int width, int height);
 void rac_framebuffer_destroy(rac_framebuffer *fb);
 void rac_framebuffer_clear(rac_framebuffer *fb, uint8_t r, uint8_t g, uint8_t b);
 
+/* Clear with vertical gradient (top color → bottom color) */
+void rac_framebuffer_clear_gradient(rac_framebuffer *fb,
+                                    uint8_t tr, uint8_t tg, uint8_t tb,
+                                    uint8_t br, uint8_t bg, uint8_t bb);
+
 /* Write to PPM file */
 int rac_framebuffer_write_ppm(const rac_framebuffer *fb, const char *path);
 
