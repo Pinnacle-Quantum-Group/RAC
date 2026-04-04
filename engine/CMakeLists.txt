@@ -51,6 +51,7 @@ set(RAC_ENGINE_SOURCES
     rac_engine_render.c
     rac_engine_audio.c
     rac_engine_input.c
+    rac_engine_sprite.c
 )
 
 add_library(rac_engine STATIC ${RAC_ENGINE_SOURCES})

@@ -54,6 +54,11 @@ typedef struct {
     float move_speed;
     float look_sensitivity;
 
+    /* Sprite system */
+    rac_sprite_registry sprites;
+    int badger_sprite_id;
+    int badger_sheet_id;
+
     /* Projectile tracking */
     int projectile_count;
 
@@ -236,6 +241,42 @@ static void demo_init(rac_engine *engine)
     /* Soft body disabled */
 #endif
 
+    /* ── Sprite character: Top-Hat Honey Badger ──────────────────── */
+    rac_sprite_registry_init(&demo->sprites);
+
+    /* Try to load sprite sheet from file, fall back to embedded placeholder */
+    demo->badger_sheet_id = rac_sprite_load_sheet(&demo->sprites,
+        "assets/character_sheet.raw");
+    if (demo->badger_sheet_id < 0) {
+        /* Try relative to executable */
+        demo->badger_sheet_id = rac_sprite_load_sheet(&demo->sprites,
+            "../assets/character_sheet.raw");
+    }
+
+    if (demo->badger_sheet_id >= 0) {
+        /* Create sprite instance in the scene */
+        demo->badger_sprite_id = rac_sprite_create(&demo->sprites,
+            demo->badger_sheet_id, rac_phys_v3(0.0f, 1.5f, 2.0f), 1.5f);
+
+        if (demo->badger_sprite_id >= 0) {
+            /* Define animations: idle(0-3), walk(4-7), shoot(8-11) */
+            int idle_anim = rac_sprite_add_anim(&demo->sprites,
+                demo->badger_sprite_id, 0, 4, 6.0f, 1);
+            rac_sprite_add_anim(&demo->sprites,
+                demo->badger_sprite_id, 4, 4, 8.0f, 1);
+            rac_sprite_add_anim(&demo->sprites,
+                demo->badger_sprite_id, 8, 4, 10.0f, 0);
+
+            /* Start with idle animation */
+            rac_sprite_play_anim(&demo->sprites, demo->badger_sprite_id, idle_anim);
+
+            printf("[Demo] Honey Badger sprite loaded: sheet=%d, sprite=%d\n",
+                   demo->badger_sheet_id, demo->badger_sprite_id);
+        }
+    } else {
+        printf("[Demo] No sprite sheet found (run sprite_pipeline.py to generate)\n");
+    }
+
     /* ── Audio ─────────────────────────────────────────────────────── */
     demo->ambient_clip = rac_audio_gen_sine(audio, 220.0f, 2.0f, 0.1f);
     demo->impact_clip = rac_audio_gen_noise(audio, 0.2f, 0.5f);
@@ -308,6 +349,19 @@ static void demo_update(rac_engine *engine, float dt)
 
     if (rac_input_key_pressed(input, RAC_KEY_ESCAPE))
         rac_engine_quit(engine);
+
+    /* Update sprite animations */
+    rac_sprite_update(&demo->sprites, dt);
+
+    /* Animate the badger: gentle side-to-side patrol */
+    if (demo->badger_sprite_id >= 0) {
+        float t = (float)engine->timing.total_time;
+        rac_vec2 patrol = rac_rotate((rac_vec2){1.0f, 0.0f}, t * 0.8f);
+        demo->sprites.instances[demo->badger_sprite_id].position =
+            rac_phys_v3(patrol.y * 2.0f, 1.5f, 2.0f);
+        /* Flip sprite based on movement direction */
+        demo->sprites.instances[demo->badger_sprite_id].flip_x = (patrol.x < 0.0f);
+    }
 
     /* ── Animate boxes: wave pattern + spinning ───────────────────── */
     /* Update transforms directly (bypassing scene graph dirty propagation
@@ -420,6 +474,9 @@ static void demo_render(rac_engine *engine)
         }
     }
 
+    /* Render sprites (honey badger character) */
+    rac_sprite_render(&demo->sprites, rs);
+
     /* Accumulate stats */
     demo->total_pixels += rs->pixels_drawn;
     demo->total_tris_drawn += rs->triangles_drawn;
@@ -434,6 +491,7 @@ static void demo_cleanup(rac_engine *engine)
     if (demo->fluid) rac_phys_particles_destroy(demo->fluid);
     if (demo->fluid_grid) rac_phys_spatial_hash_destroy(demo->fluid_grid);
     if (demo->softbody) rac_phys_softbody_destroy(demo->softbody);
+    rac_sprite_registry_cleanup(&demo->sprites);
     free(demo);
     printf("[Demo] Cleanup complete\n");
 }
