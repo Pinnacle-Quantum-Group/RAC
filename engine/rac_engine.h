@@ -19,5 +19,6 @@
 #include "rac_engine_render.h"
 #include "rac_engine_audio.h"
 #include "rac_engine_input.h"
+#include "rac_engine_sprite.h"
 
 #endif /* RAC_ENGINE_H */
