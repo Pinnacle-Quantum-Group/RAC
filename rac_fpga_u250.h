@@ -108,6 +108,104 @@ int rac_fpga_dispatch(int fd, int engine_id, rac_op_type op,
                       float x, float y, float theta,
                       float *result_x, float *result_y, float *result_aux);
 
+/* ── FIL Tomasulo Dispatch Interface ─────────────────────────────────────────
+ *
+ * Geometric out-of-order execution via DSP48E2 cascade columns.
+ * Port of FIL/research/FILEngine/fil_engine.c to VHDL.
+ * VHDL implementation: FIL/fil_rac/rtl/fil_tomasulo.vhd
+ *
+ * Architecture: 4 DSP cascade columns (1 per SLR on U250), phi-cell
+ * reservation stations with GlueCert dependency tracking, four-phase
+ * execution (Issue/Broadcast/Execute/Commit), holonomy return path.
+ */
+
+/* AXI-Stream work input packing (128-bit tdata):
+ *   [31:0]    x_vec   (Q16.16)
+ *   [63:32]   y_vec   (Q16.16)
+ *   [95:64]   angle   (Q16.16)
+ *   [103:96]  work_id (8-bit tag)
+ *   [127:104] reserved
+ *
+ * tuser[11:0]:
+ *   [3:0]   edge_mask
+ *   [7:4]   twist_mask
+ *   [9:8]   col       (cascade column 0-3)
+ *   [11:10] entry     (entry point 0-3)
+ */
+
+#define RAC_FIL_NUM_COLS       4
+#define RAC_FIL_NUM_ENTRIES    4
+#define RAC_FIL_MAX_PHI_CELLS  16
+#define RAC_FIL_MAX_GLUE_CERTS 32
+
+/* Phi-cell edge identifiers (matches VHDL FIL_EDGE_*) */
+#define RAC_FIL_EDGE_LEFT   0
+#define RAC_FIL_EDGE_RIGHT  1
+#define RAC_FIL_EDGE_UP     2
+#define RAC_FIL_EDGE_DOWN   3
+
+/* Dispatch phase encoding (from phase_out[2:0]) */
+#define RAC_FIL_PHASE_IDLE         0
+#define RAC_FIL_PHASE_A            1  /* Interior (Issue) */
+#define RAC_FIL_PHASE_B_PACK       2  /* Pack halos */
+#define RAC_FIL_PHASE_B_IMPORT     3  /* Import halos (Broadcast) */
+#define RAC_FIL_PHASE_C            4  /* Boundary (Execute) */
+#define RAC_FIL_PHASE_D            5  /* Commit (Write Result) */
+#define RAC_FIL_PHASE_HOLONOMY     6  /* Holonomy return */
+#define RAC_FIL_PHASE_DONE         7  /* Epoch complete */
+
+/*
+ * rac_fil_issue: Submit a work item to the Tomasulo dispatch fabric.
+ *
+ * work_id:    8-bit tag returned with commit result
+ * x, y:       operand vector (float32 → Q16.16)
+ * angle:      rotation angle (float32 → Q16.16)
+ * col:        target cascade column (0..3)
+ * entry:      entry point within column (0..3)
+ * edge_mask:  exposed edges bitmask (bit 0=L, 1=R, 2=U, 3=D)
+ * twist_mask: Mobius twist flags per edge
+ *
+ * Returns: 0 on accept, -1 if backpressured (retry later).
+ */
+int rac_fil_issue(int fd, uint8_t work_id,
+                  float x, float y, float angle,
+                  int col, int entry,
+                  uint8_t edge_mask, uint8_t twist_mask);
+
+/*
+ * rac_fil_load_cert: Load a GlueCert dependency entry.
+ *
+ * index:   cert table slot (0..31)
+ * cell_a:  destination phi-cell (0..15)
+ * cell_b:  source phi-cell (0..15)
+ * edge_a:  destination edge (RAC_FIL_EDGE_*)
+ * edge_b:  source edge (RAC_FIL_EDGE_*)
+ * orient:  0=forward, 1=reversed
+ * twist:   0=identity, 1=negate (Mobius seam)
+ */
+int rac_fil_load_cert(int fd, int index,
+                      int cell_a, int cell_b,
+                      int edge_a, int edge_b,
+                      int orient, int twist);
+
+/*
+ * rac_fil_wait_commit: Block until a commit result is available.
+ *
+ * work_id:     returned work tag
+ * accum:       accumulated result (Q16.16 → float32)
+ * twist_count: holonomy twist count
+ *
+ * Returns: 0 on success, -1 on timeout.
+ */
+int rac_fil_wait_commit(int fd, uint8_t *work_id,
+                        float *accum, uint16_t *twist_count);
+
+/*
+ * rac_fil_get_phase: Read current dispatch phase.
+ * Returns: RAC_FIL_PHASE_* value.
+ */
+int rac_fil_get_phase(int fd);
+
 #ifdef __cplusplus
 }
 #endif
