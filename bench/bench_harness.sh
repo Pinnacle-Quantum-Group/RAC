@@ -226,22 +226,37 @@ run_llama() {
   [[ "$SKIP_LLAMA" -eq 1 ]] && return 0
   ARGS=()
   [[ "$AUTO_BUILD" -eq 1 ]] && ARGS+=(--auto-build)
-  LLAMA_JSON=$(bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" 2>/dev/null) || {
+  # Capture the script's stdout (the JSON line) but let stderr through so
+  # diagnostics (CSV-parse warnings, build errors, debug dumps) are visible.
+  # Using a tmpfile redirect keeps stderr live while isolating stdout.
+  local stdout_file
+  stdout_file=$(mktemp)
+  if bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" >"$stdout_file"; then
+    LLAMA_JSON=$(cat "$stdout_file")
+  else
     echo "  [WARN] llama.cpp run failed; skipping" >&2
-    bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" >&2 || true
-    return 1
-  }
+    LLAMA_JSON=""
+  fi
+  rm -f "$stdout_file"
 }
 
 run_tiny() {
   [[ "$SKIP_TINY" -eq 1 ]] && return 0
   ARGS=(--layer "$LAYER")
   [[ "$AUTO_INSTALL" -eq 1 ]] && ARGS+=(--auto-install)
-  TINY_JSON=$(python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" 2>/dev/null) || {
+  # Same pattern as run_llama: keep stderr streaming so the user sees
+  # device-selection / install / ImportError messages live.
+  local stdout_file
+  stdout_file=$(mktemp)
+  if python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" >"$stdout_file"; then
+    TINY_JSON=$(cat "$stdout_file")
+  else
     echo "  [WARN] tinygrad run failed; skipping" >&2
-    python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" >&2 || true
+    TINY_JSON=""
+    rm -f "$stdout_file"
     return 1
-  }
+  fi
+  rm -f "$stdout_file"
 }
 
 echo "  ── RAC ──────────────────────────────────" >&2; run_rac   || true
