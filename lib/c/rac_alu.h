@@ -188,9 +188,28 @@ void     rac_alu_outer(const rac_vec2 *a, const rac_vec2 *b,
                        float *C, int m, int n);
 
 /* Hyperbolic CORDIC: reference via the same ALU. Accuracy is lower than
- * libm — provided for architectural completeness / hardware modeling. */
+ * libm — provided for architectural completeness / hardware modeling.
+ *
+ * rac_alu_exp handles arbitrary float32 input via argument reduction
+ *   exp(x) = 2^k · exp(r)  where r ∈ [-ln(2)/2, ln(2)/2]
+ * keeping the hyperbolic CORDIC inside its convergence domain (|r| < 1.12). */
 float    rac_alu_exp(float x);
 float    rac_alu_tanh(float x);
+
+/* ── AVX2 batch path (optional — compiled only if -mavx2 -mfma) ──────────── */
+/*
+ * These operate on AoS arrays of rac_vec2. When compiled with AVX2+FMA they
+ * process 8 independent CORDICs per iteration in parallel, sharing the
+ * same atan/scale table broadcasts. On a host without AVX2 they fall back
+ * to the scalar straight-line path transparently.
+ *
+ * rac_alu_has_avx2() returns 1 if the AVX2 fast path was compiled in AND
+ * the host CPU supports AVX2+FMA at runtime.
+ */
+int      rac_alu_has_avx2(void);
+void     rac_alu_rotate_batch(const rac_vec2 *v, const float *theta,
+                              rac_vec2 *out, int n);
+float    rac_alu_inner_batch(const rac_vec2 *a, const rac_vec2 *b, int n);
 
 /* ── Inspection / introspection ──────────────────────────────────────────── */
 

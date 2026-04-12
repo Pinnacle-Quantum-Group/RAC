@@ -12,6 +12,20 @@
 #include "rac_alu.h"
 #include <math.h>
 #include <stddef.h>
+#include <string.h>
+
+#if defined(__AVX2__) && defined(__FMA__)
+  #include <immintrin.h>
+  #define RAC_ALU_HAVE_AVX2 1
+#else
+  #define RAC_ALU_HAVE_AVX2 0
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define RAC_ALU_FORCE_INLINE static inline __attribute__((always_inline))
+#else
+  #define RAC_ALU_FORCE_INLINE static inline
+#endif
 
 /* ── CORDIC lookup tables (copied here so this TU is self-contained) ─────── */
 
@@ -198,53 +212,60 @@ int rac_alu_micro_step(rac_alu_state *s) {
     return 0;
 }
 
+/* Branchless sign: d = copysign(1, v). Compiles to a single andnps+orps pair
+ * on x86 (sign-bit extraction + OR with 1.0). */
+RAC_ALU_FORCE_INLINE float _alu_dir_rot(float z) { return copysignf(1.0f, z); }
+RAC_ALU_FORCE_INLINE float _alu_dir_vec(float y) { return copysignf(1.0f, -y); }
+
 /* Specialized straight-line loops for each mode. The mode switch inside
  * rac_alu_micro_step is hoisted out of the loop — the compiler then fully
- * unrolls the CORDIC sequence since the table reads become constant loads. */
-static inline void _alu_run_circ_rot(rac_alu_state *s, int iters) {
+ * unrolls the CORDIC sequence since the table reads become constant loads.
+ * d is computed branchlessly via copysign to avoid per-iter conditional
+ * jumps; `d * scale` folds into one FMA per coordinate. */
+RAC_ALU_FORCE_INLINE void _alu_run_circ_rot(rac_alu_state *s, int iters) {
     float x = s->x, y = s->y, z = s->z;
     for (int i = 0; i < iters; i++) {
-        float d     = (z >= 0.0f) ? 1.0f : -1.0f;
-        float scale = _alu_circ_scale[i];
-        float xn    = x - d * y * scale;
-        float yn    = y + d * x * scale;
-        z -= d * _alu_atan_table[i];
+        float d     = _alu_dir_rot(z);
+        float ds    = d * _alu_circ_scale[i];
+        float xn    = x - ds * y;          /* fnmadd */
+        float yn    = y + ds * x;          /* fmadd  */
+        z -= d * _alu_atan_table[i];       /* fnmadd */
         x = xn; y = yn;
     }
     s->x = x; s->y = y; s->z = z;
-    s->d = (z >= 0.0f) ? 1.0f : -1.0f;
+    s->d = _alu_dir_rot(z);
     s->iter  = iters;
     s->chain += iters;
 }
 
-static inline void _alu_run_circ_vec(rac_alu_state *s, int iters) {
+RAC_ALU_FORCE_INLINE void _alu_run_circ_vec(rac_alu_state *s, int iters) {
     float x = s->x, y = s->y, z = s->z;
     for (int i = 0; i < iters; i++) {
-        float d     = (y <  0.0f) ? 1.0f : -1.0f;
-        float scale = _alu_circ_scale[i];
-        float xn    = x - d * y * scale;
-        float yn    = y + d * x * scale;
+        float d     = _alu_dir_vec(y);
+        float ds    = d * _alu_circ_scale[i];
+        float xn    = x - ds * y;
+        float yn    = y + ds * x;
         z -= d * _alu_atan_table[i];
         x = xn; y = yn;
     }
     s->x = x; s->y = y; s->z = z;
-    s->d = (y < 0.0f) ? 1.0f : -1.0f;
+    s->d = _alu_dir_vec(y);
     s->iter  = iters;
     s->chain += iters;
 }
 
-static inline void _alu_run_hyp_rot(rac_alu_state *s, int iters) {
+RAC_ALU_FORCE_INLINE void _alu_run_hyp_rot(rac_alu_state *s, int iters) {
     float x = s->x, y = s->y, z = s->z;
     for (int i = 0; i < iters; i++) {
-        float d     = (z >= 0.0f) ? 1.0f : -1.0f;
-        float scale = _alu_hyp_scale[i];
-        float xn    = x + d * y * scale;
-        float yn    = y + d * x * scale;
+        float d     = _alu_dir_rot(z);
+        float ds    = d * _alu_hyp_scale[i];
+        float xn    = x + ds * y;          /* hyperbolic: + not - */
+        float yn    = y + ds * x;
         z -= d * _alu_atanh_table[_alu_hyp_iter_map[i] - 1];
         x = xn; y = yn;
     }
     s->x = x; s->y = y; s->z = z;
-    s->d = (z >= 0.0f) ? 1.0f : -1.0f;
+    s->d = _alu_dir_rot(z);
     s->iter  = iters;
     s->chain += iters;
 }
@@ -368,14 +389,23 @@ float rac_alu_project(rac_vec2 v, float theta) {
 }
 
 void rac_alu_polar(rac_vec2 v, float *mag, float *angle) {
+    /* CORDIC vectoring only converges for v.x > 0 (right half-plane).
+     * For v.x < 0 we rotate v by π first (flip both components) and
+     * correct the output angle by ±π. Free in hardware: sign inverters. */
+    float z_offset = 0.0f;
+    if (v.x < 0.0f) {
+        /* Determine offset sign from the ORIGINAL v.y before flipping. */
+        z_offset = (v.y >= 0.0f) ? RAC_ALU_PI : -RAC_ALU_PI;
+        v.x = -v.x; v.y = -v.y;
+    }
     rac_alu_state s;
     rac_alu_reset(&s);
     rac_alu_load(&s, v.x, v.y, 0.0f);
     rac_alu_set_mode(&s, RAC_ALU_MODE_CIRCULAR, RAC_ALU_DIR_VECTORING);
     rac_alu_run(&s, RAC_ALU_ITERS);
-    /* Vectoring drives y→0, x = K * sqrt(x0^2+y0^2), z = atan2(y0,x0). */
+    /* Vectoring drives y→0, x = K · sqrt(x0²+y0²), z = atan2(y0,x0). */
     if (mag)   *mag   = s.x * RAC_ALU_K_INV;
-    if (angle) *angle = s.z;
+    if (angle) *angle = s.z + z_offset;
 }
 
 float rac_alu_norm(rac_vec2 v) {
@@ -470,22 +500,37 @@ void rac_alu_outer(const rac_vec2 *a, const rac_vec2 *b,
 }
 
 float rac_alu_exp(float x) {
-    /* e^x = cosh(x) + sinh(x), computed via hyperbolic CORDIC with
-     *   x0 = 1, y0 = 0, z0 = x
-     * After the sequence, x' = K_hyp · cosh(x), y' = K_hyp · sinh(x),
-     * where K_hyp ≈ 0.82816 is the hyperbolic CORDIC gain (< 1, unlike
-     * circular CORDIC whose gain is > 1). So we DIVIDE by K_hyp to
-     * recover cosh/sinh. The macro RAC_ALU_K_HYP_INV holds K_hyp itself
-     * (the name is inherited from rac_cpu.h for consistency).          */
+    /* Hyperbolic CORDIC converges only for |z| ≲ 1.12. For arbitrary x
+     * we reduce the argument:
+     *    k  = round(x / ln2)
+     *    r  = x - k * ln2           ∈ [-ln2/2, ln2/2] ⊂ [-0.347, 0.347]
+     *    e^x = 2^k · e^r
+     * 2^k is a direct float32 exponent manipulation (no multiply),
+     * and e^r stays well inside the CORDIC convergence domain. */
+    const float LN2     = 0.69314718056f;
+    const float INV_LN2 = 1.44269504089f;
+    int k  = (int)(x * INV_LN2 + (x >= 0 ? 0.5f : -0.5f));
+    float r = x - (float)k * LN2;
+
+    /* e^r = cosh(r) + sinh(r) via hyperbolic CORDIC with x0=1, y0=0, z=r.
+     * After the sequence, x' = K_hyp · cosh(r), y' = K_hyp · sinh(r),
+     * where K_hyp ≈ 0.82816. Divide by K_hyp to recover cosh/sinh. */
     rac_alu_state s;
     rac_alu_reset(&s);
-    rac_alu_load(&s, 1.0f, 0.0f, x);
+    rac_alu_load(&s, 1.0f, 0.0f, r);
     rac_alu_set_mode(&s, RAC_ALU_MODE_HYPERBOLIC, RAC_ALU_DIR_ROTATION);
     rac_alu_run(&s, RAC_ALU_ITERS);
     const float inv_K_hyp = 1.0f / RAC_ALU_K_HYP_INV;
-    float cosh_x = s.x * inv_K_hyp;
-    float sinh_x = s.y * inv_K_hyp;
-    return cosh_x + sinh_x;
+    float er = (s.x + s.y) * inv_K_hyp;
+
+    /* Apply 2^k via direct float32 exponent bit manipulation.
+     * ldexpf would work, but the inline form avoids a libc call. */
+    union { float f; int i; } u;
+    int   bias_k = k + 127;
+    if (bias_k <   0) return 0.0f;                          /* underflow */
+    if (bias_k > 254) return er * INFINITY;                 /* overflow  */
+    u.i = bias_k << 23;
+    return er * u.f;
 }
 
 float rac_alu_tanh(float x) {
@@ -497,6 +542,248 @@ float rac_alu_tanh(float x) {
     /* tanh = sinh/cosh = y/x (K_hyp cancels). */
     if (s.x == 0.0f) return 0.0f;
     return s.y / s.x;
+}
+
+/* ── AVX2 batch path ═════════════════════════════════════════════════════ */
+/*
+ * 8-wide parallel CORDIC. Each CORDIC iteration becomes 3 FMAs on YMM
+ * registers (24 FLOPs) operating on 8 independent rotations at once.
+ * The atan/scale constants are broadcast once per iteration from the
+ * lookup tables, so all 8 lanes share the same control sequence — this
+ * is exactly how a hardware batch-CORDIC engine would be wired.
+ *
+ * Sign decision uses the sign-bit extraction trick:
+ *   d = copysign(1, z) = (z & 0x80000000) | 1.0f
+ * No branches, no blends — pure bitwise ops.
+ */
+
+#if RAC_ALU_HAVE_AVX2
+
+RAC_ALU_FORCE_INLINE __m256 _alu_sign_avx2(__m256 v) {
+    /* d = copysign(1.0, v) = (v & sign_mask) | 1.0 */
+    __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    __m256 one       = _mm256_set1_ps( 1.0f);
+    __m256 sign      = _mm256_and_ps(v, sign_mask);
+    return _mm256_or_ps(sign, one);
+}
+
+/* Core 8-wide circular-rotation CORDIC. Operates on SoA x/y/z YMMs in
+ * place. Caller is responsible for K_INV pre-scaling and quadrant fold. */
+RAC_ALU_FORCE_INLINE void _alu_avx2_cordic_rot(__m256 *x, __m256 *y, __m256 *z) {
+    __m256 xr = *x, yr = *y, zr = *z;
+    for (int i = 0; i < RAC_ALU_ITERS; i++) {
+        __m256 d     = _alu_sign_avx2(zr);
+        __m256 scale = _mm256_set1_ps(_alu_circ_scale[i]);
+        __m256 atan  = _mm256_set1_ps(_alu_atan_table[i]);
+        __m256 ds    = _mm256_mul_ps(d, scale);
+        /* xn = x - ds * y,  yn = y + ds * x,  zn = z - d * atan */
+        __m256 xn    = _mm256_fnmadd_ps(ds, yr, xr);
+        __m256 yn    = _mm256_fmadd_ps (ds, xr, yr);
+        zr           = _mm256_fnmadd_ps(d, atan, zr);
+        xr = xn; yr = yn;
+    }
+    *x = xr; *y = yr; *z = zr;
+}
+
+/* Core 8-wide circular-vectoring CORDIC. Drives y→0; z ends up at atan2(y0,x0). */
+RAC_ALU_FORCE_INLINE void _alu_avx2_cordic_vec(__m256 *x, __m256 *y, __m256 *z) {
+    __m256 xr = *x, yr = *y, zr = *z;
+    for (int i = 0; i < RAC_ALU_ITERS; i++) {
+        /* Direction opposite sign of y: d = copysign(1, -y) = -copysign(1,y) */
+        __m256 neg_y = _mm256_sub_ps(_mm256_setzero_ps(), yr);
+        __m256 d     = _alu_sign_avx2(neg_y);
+        __m256 scale = _mm256_set1_ps(_alu_circ_scale[i]);
+        __m256 atan  = _mm256_set1_ps(_alu_atan_table[i]);
+        __m256 ds    = _mm256_mul_ps(d, scale);
+        __m256 xn    = _mm256_fnmadd_ps(ds, yr, xr);
+        __m256 yn    = _mm256_fmadd_ps (ds, xr, yr);
+        zr           = _mm256_fnmadd_ps(d, atan, zr);
+        xr = xn; yr = yn;
+    }
+    *x = xr; *y = yr; *z = zr;
+}
+
+/* Load 8 rac_vec2 from AoS into SoA x, y YMMs.
+ * Input layout (16 floats):
+ *   [v0.x v0.y v1.x v1.y v2.x v2.y v3.x v3.y | v4.x v4.y v5.x v5.y v6.x v6.y v7.x v7.y]
+ * Desired:
+ *   xs = [v0.x v1.x v2.x v3.x v4.x v5.x v6.x v7.x]
+ *   ys = [v0.y v1.y v2.y v3.y v4.y v5.y v6.y v7.y]
+ */
+RAC_ALU_FORCE_INLINE void _alu_load_aos8(const rac_vec2 *v, __m256 *xs, __m256 *ys) {
+    __m256 a = _mm256_loadu_ps((const float *)(v + 0));   /* v0..v3 */
+    __m256 b = _mm256_loadu_ps((const float *)(v + 4));   /* v4..v7 */
+    /* Deinterleave via unpacklo/hi of 128-bit halves, then permute. */
+    __m256 ab_lo = _mm256_permute2f128_ps(a, b, 0x20);    /* v0..v1 v4..v5 */
+    __m256 ab_hi = _mm256_permute2f128_ps(a, b, 0x31);    /* v2..v3 v6..v7 */
+    *xs = _mm256_shuffle_ps(ab_lo, ab_hi, 0x88);          /* even lanes (x) */
+    *ys = _mm256_shuffle_ps(ab_lo, ab_hi, 0xDD);          /* odd  lanes (y) */
+}
+
+/* Store SoA xs, ys back to 8 AoS rac_vec2. */
+RAC_ALU_FORCE_INLINE void _alu_store_aos8(rac_vec2 *out, __m256 xs, __m256 ys) {
+    __m256 lo = _mm256_unpacklo_ps(xs, ys);   /* x0 y0 x1 y1 x4 y4 x5 y5 */
+    __m256 hi = _mm256_unpackhi_ps(xs, ys);   /* x2 y2 x3 y3 x6 y6 x7 y7 */
+    __m256 p0 = _mm256_permute2f128_ps(lo, hi, 0x20);   /* v0..v3 */
+    __m256 p1 = _mm256_permute2f128_ps(lo, hi, 0x31);   /* v4..v7 */
+    _mm256_storeu_ps((float *)(out + 0), p0);
+    _mm256_storeu_ps((float *)(out + 4), p1);
+}
+
+int rac_alu_has_avx2(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return 1;  /* compiled in, assume runtime support */
+#endif
+}
+
+static void _alu_rotate_batch_avx2(const rac_vec2 *v, const float *theta,
+                                   rac_vec2 *out, int n) {
+    const __m256 kinv = _mm256_set1_ps(RAC_ALU_K_INV);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 xs, ys;
+        _alu_load_aos8(v + i, &xs, &ys);
+        __m256 zs = _mm256_loadu_ps(theta + i);
+        /* Quadrant fold: if |θ| > π/2, flip (x,y) and shift θ by ±π.
+         * Work in lanes with masks/blends. */
+        const __m256 pi        = _mm256_set1_ps(RAC_ALU_PI);
+        const __m256 half_pi   = _mm256_set1_ps(0.5f * RAC_ALU_PI);
+        const __m256 two_pi    = _mm256_set1_ps(2.0f * RAC_ALU_PI);
+        const __m256 neg_half  = _mm256_set1_ps(-0.5f * RAC_ALU_PI);
+        const __m256 neg_pi    = _mm256_set1_ps(-RAC_ALU_PI);
+        /* Reduce z to (-π, π]. A single sub/add per extreme covers
+         * |θ| ≤ 3π; for larger angles caller should pre-reduce. */
+        __m256 gt_pi  = _mm256_cmp_ps(zs,  pi,     _CMP_GT_OQ);
+        __m256 lt_npi = _mm256_cmp_ps(zs,  neg_pi, _CMP_LT_OQ);
+        zs = _mm256_blendv_ps(zs, _mm256_sub_ps(zs, two_pi), gt_pi);
+        zs = _mm256_blendv_ps(zs, _mm256_add_ps(zs, two_pi), lt_npi);
+        /* Fold to (-π/2, π/2]. */
+        __m256 gt_half = _mm256_cmp_ps(zs, half_pi,  _CMP_GT_OQ);
+        __m256 lt_nh   = _mm256_cmp_ps(zs, neg_half, _CMP_LT_OQ);
+        __m256 flip    = _mm256_or_ps(gt_half, lt_nh);
+        /* Flip sign of x,y where flip == mask. */
+        __m256 sign = _mm256_and_ps(flip, _mm256_set1_ps(-0.0f));
+        xs = _mm256_xor_ps(xs, sign);
+        ys = _mm256_xor_ps(ys, sign);
+        zs = _mm256_blendv_ps(zs, _mm256_sub_ps(zs, pi), gt_half);
+        zs = _mm256_blendv_ps(zs, _mm256_add_ps(zs, pi), lt_nh);
+
+        /* Pre-scale by K_INV so output magnitude == input magnitude. */
+        xs = _mm256_mul_ps(xs, kinv);
+        ys = _mm256_mul_ps(ys, kinv);
+
+        _alu_avx2_cordic_rot(&xs, &ys, &zs);
+        _alu_store_aos8(out + i, xs, ys);
+    }
+    /* Scalar tail */
+    for (; i < n; i++) {
+        out[i] = rac_alu_rotate(v[i], theta[i]);
+    }
+}
+
+/* AVX2 inner product: per-element does (rac_polar(b) + rotate(a, -ab)).x * |b|
+ * with 8 lanes processed in parallel. Vectoring pass gives {|b|, ab};
+ * rotation pass then gives the projection. Both CORDICs share iteration
+ * table broadcasts. Horizontal reduction at the end. */
+static float _alu_inner_batch_avx2(const rac_vec2 *a, const rac_vec2 *b, int n) {
+    const __m256 kinv = _mm256_set1_ps(RAC_ALU_K_INV);
+    __m256 sum = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 bx, by, ax, ay;
+        _alu_load_aos8(b + i, &bx, &by);
+        _alu_load_aos8(a + i, &ax, &ay);
+
+        /* Half-plane pre-fold for vectoring: if bx < 0, flip (bx,by) and
+         * add ±π to the output angle. ±π chosen by the ORIGINAL sign of by. */
+        const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+        __m256 bx_neg = _mm256_cmp_ps(bx, _mm256_setzero_ps(), _CMP_LT_OQ);
+        __m256 by_neg = _mm256_cmp_ps(by, _mm256_setzero_ps(), _CMP_LT_OQ);
+        __m256 flip_mask = _mm256_and_ps(bx_neg, sign_bit);
+        __m256 bx_f = _mm256_xor_ps(bx, flip_mask);
+        __m256 by_f = _mm256_xor_ps(by, flip_mask);
+        /* z_offset = bx_neg ? (by_neg ? -π : +π) : 0 */
+        __m256 pi_pos = _mm256_set1_ps( RAC_ALU_PI);
+        __m256 pi_neg = _mm256_set1_ps(-RAC_ALU_PI);
+        __m256 offs   = _mm256_blendv_ps(pi_pos, pi_neg, by_neg);
+        offs          = _mm256_and_ps(offs, bx_neg);
+
+        /* Vectoring pass on pre-folded (bx_f, by_f). */
+        __m256 vx = bx_f, vy = by_f, vz = _mm256_setzero_ps();
+        _alu_avx2_cordic_vec(&vx, &vy, &vz);
+        __m256 mb = _mm256_mul_ps(vx, kinv);            /* |b| */
+        __m256 ab = _mm256_add_ps(vz, offs);            /* angle of b */
+
+        /* Rotation pass: rotate a by -ab (dot product with direction of b).
+         * Quadrant fold -ab. */
+        __m256 theta = _mm256_sub_ps(_mm256_setzero_ps(), ab);
+        const __m256 pi       = _mm256_set1_ps(RAC_ALU_PI);
+        const __m256 half_pi  = _mm256_set1_ps(0.5f * RAC_ALU_PI);
+        const __m256 neg_half = _mm256_set1_ps(-0.5f * RAC_ALU_PI);
+        __m256 gt_half = _mm256_cmp_ps(theta, half_pi,  _CMP_GT_OQ);
+        __m256 lt_nh   = _mm256_cmp_ps(theta, neg_half, _CMP_LT_OQ);
+        __m256 flip    = _mm256_or_ps(gt_half, lt_nh);
+        __m256 sign    = _mm256_and_ps(flip, _mm256_set1_ps(-0.0f));
+        ax = _mm256_xor_ps(ax, sign);
+        ay = _mm256_xor_ps(ay, sign);
+        theta = _mm256_blendv_ps(theta, _mm256_sub_ps(theta, pi), gt_half);
+        theta = _mm256_blendv_ps(theta, _mm256_add_ps(theta, pi), lt_nh);
+        ax = _mm256_mul_ps(ax, kinv);
+        ay = _mm256_mul_ps(ay, kinv);
+
+        _alu_avx2_cordic_rot(&ax, &ay, &theta);
+        /* ax now holds rotate(a, -ab).x = a · b_hat; contribute ax · |b|. */
+        sum = _mm256_fmadd_ps(ax, mb, sum);
+    }
+    /* Horizontal reduction. */
+    __m128 lo = _mm256_castps256_ps128(sum);
+    __m128 hi = _mm256_extractf128_ps(sum, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+    float total;
+    _mm_store_ss(&total, s1);
+    /* Scalar tail */
+    for (; i < n; i++) {
+        float mb, ab;
+        rac_alu_polar(b[i], &mb, &ab);
+        rac_vec2 av = a[i];
+        float t = -ab;
+        _alu_quadrant_fold(&av, &t);
+        rac_alu_state s;
+        rac_alu_reset(&s);
+        rac_alu_load(&s, av.x * RAC_ALU_K_INV, av.y * RAC_ALU_K_INV, t);
+        rac_alu_set_mode(&s, RAC_ALU_MODE_CIRCULAR, RAC_ALU_DIR_ROTATION);
+        rac_alu_run(&s, RAC_ALU_ITERS);
+        total += s.x * mb;
+    }
+    return total;
+}
+
+#else  /* !RAC_ALU_HAVE_AVX2 */
+
+int rac_alu_has_avx2(void) { return 0; }
+
+#endif
+
+void rac_alu_rotate_batch(const rac_vec2 *v, const float *theta,
+                          rac_vec2 *out, int n) {
+#if RAC_ALU_HAVE_AVX2
+    if (rac_alu_has_avx2()) {
+        _alu_rotate_batch_avx2(v, theta, out, n);
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) out[i] = rac_alu_rotate(v[i], theta[i]);
+}
+
+float rac_alu_inner_batch(const rac_vec2 *a, const rac_vec2 *b, int n) {
+#if RAC_ALU_HAVE_AVX2
+    if (rac_alu_has_avx2()) return _alu_inner_batch_avx2(a, b, n);
+#endif
+    return rac_alu_inner(a, b, n);
 }
 
 /* ── Introspection ───────────────────────────────────────────────────────── */

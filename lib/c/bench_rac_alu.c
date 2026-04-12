@@ -18,7 +18,7 @@
  *   cc -O3 -march=native -I. bench_rac_alu.c rac_alu.c rac_cpu.c -lm -o bench
  */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200112L
 #include "rac_alu.h"
 #include "rac_cpu.h"
 #include <stdio.h>
@@ -253,6 +253,95 @@ int main(int argc, char **argv) {
         }
         s_alu = now_sec() - t0; SINK(acc);
         report_pair("tanh (libm vs ALU)", s_lib, N_EXP, s_alu, N_EXP);
+    }
+
+    /* ── 7. AVX2 batch rotate — 8-wide parallel CORDIC ─────────────── */
+    banner("7. Batch rotate — AVX2 8-wide vs scalar ALU");
+    {
+        const int N = 1 << 16;
+        const int REPS = 200;
+        rac_vec2 *v     = aligned_alloc(64, N * sizeof(rac_vec2));
+        float    *theta = aligned_alloc(64, N * sizeof(float));
+        rac_vec2 *out   = aligned_alloc(64, N * sizeof(rac_vec2));
+        if (!v || !theta || !out) { fprintf(stderr, "alloc failed\n"); return 1; }
+        for (int i = 0; i < N; i++) {
+            v[i].x = 1.0f;  v[i].y = 0.0f;
+            theta[i] = (float)(i & 127) * 0.01f;
+        }
+
+        printf("  AVX2 compiled in + runtime supported: %d\n", rac_alu_has_avx2());
+
+        /* Scalar-per-element baseline */
+        double t0 = now_sec();
+        float acc = 0.0f;
+        for (int r = 0; r < REPS; r++) {
+            for (int i = 0; i < N; i++) {
+                rac_vec2 o = rac_alu_rotate(v[i], theta[i]);
+                acc += o.x + o.y;
+            }
+        }
+        double s_scalar = now_sec() - t0; SINK(acc);
+
+        /* Batch AVX2 path */
+        t0 = now_sec();
+        acc = 0.0f;
+        for (int r = 0; r < REPS; r++) {
+            rac_alu_rotate_batch(v, theta, out, N);
+            acc += out[0].x + out[N-1].y;
+        }
+        double s_batch = now_sec() - t0; SINK(acc);
+
+        long total = (long)N * (long)REPS;
+        report_pair("rotate_batch (per element)",
+                    s_scalar, total, s_batch, total);
+
+        free(v); free(theta); free(out);
+    }
+
+    /* ── 8. AVX2 batch inner product ───────────────────────────────── */
+    banner("8. Batch inner product — AVX2 vs scalar ALU");
+    {
+        const int N = 1 << 12;
+        const int REPS = 2000;
+        rac_vec2 *a = aligned_alloc(64, N * sizeof(rac_vec2));
+        rac_vec2 *b = aligned_alloc(64, N * sizeof(rac_vec2));
+        if (!a || !b) { fprintf(stderr, "alloc failed\n"); return 1; }
+        for (int i = 0; i < N; i++) {
+            a[i].x = (float)((i % 31) - 15) * 0.1f;
+            a[i].y = (float)((i % 17) - 8)  * 0.1f;
+            b[i].x = (float)((i % 23) - 11) * 0.1f;
+            b[i].y = (float)((i % 13) - 6)  * 0.1f;
+        }
+
+        double t0 = now_sec();
+        float acc = 0.0f;
+        for (int r = 0; r < REPS; r++) acc += rac_alu_inner(a, b, N);
+        double s_scalar = now_sec() - t0; SINK(acc);
+
+        t0 = now_sec();
+        acc = 0.0f;
+        for (int r = 0; r < REPS; r++) acc += rac_alu_inner_batch(a, b, N);
+        double s_batch = now_sec() - t0; SINK(acc);
+
+        long total = (long)N * (long)REPS;
+        report_pair("inner_batch (per element)",
+                    s_scalar, total, s_batch, total);
+
+        free(a); free(b);
+    }
+
+    /* ── 9. exp argument reduction accuracy ────────────────────────── */
+    banner("9. exp argument reduction — range & accuracy");
+    {
+        float xs[] = {-20.0f, -5.0f, -1.5f, -0.5f, 0.0f, 0.5f, 1.5f, 5.0f, 20.0f};
+        int  nx   = (int)(sizeof(xs)/sizeof(xs[0]));
+        printf("     x        libm expf       alu exp        rel err\n");
+        for (int i = 0; i < nx; i++) {
+            float lib = expf(xs[i]);
+            float alu = rac_alu_exp(xs[i]);
+            float err = (lib != 0.0f) ? fabsf(alu - lib) / fabsf(lib) : fabsf(alu - lib);
+            printf("  %+8.2f  %14.6g  %14.6g   %.2e\n", xs[i], lib, alu, err);
+        }
     }
 
     /* Keep the sinks from being optimised out. */

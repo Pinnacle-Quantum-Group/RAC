@@ -116,7 +116,9 @@ if(TARGET rac_avx2)
     target_link_libraries(test_rac_threads rac_avx2 m)
 endif()
 
-# RAC Adder + ALU BVT (no AVX2 dependency — self-contained)
+# RAC Adder + ALU BVT. rac_alu.c contains an AVX2+FMA fast path that
+# is compiled in automatically when -mavx2 -mfma are enabled via
+# -march=native (which rac_static uses).
 add_executable(test_rac_alu c/test_rac_alu.c)
 target_include_directories(test_rac_alu PRIVATE c/)
 target_link_libraries(test_rac_alu rac_static m)

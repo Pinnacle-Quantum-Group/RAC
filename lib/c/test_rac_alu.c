@@ -16,6 +16,7 @@
 #include "rac_alu.h"
 #include "rac_cpu.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
@@ -216,6 +217,66 @@ int main(void) {
     }
     printf("  mismatches across 31 angles: %d\n", mismatches);
     CHECK("no rotation mismatches in convergence range", mismatches == 0);
+
+    /* ── 12b. Extended-range exp via argument reduction ──────────────── */
+    HEADER("12b. Argument-reduced exp");
+    {
+        float xs[] = {-20.0f, -5.0f, -1.5f, -0.5f, 0.0f, 0.5f, 1.5f, 5.0f, 20.0f};
+        int fails = 0;
+        for (size_t i = 0; i < sizeof(xs)/sizeof(xs[0]); i++) {
+            float lib = expf(xs[i]);
+            float alu = rac_alu_exp(xs[i]);
+            float rel = (lib != 0.0f) ? fabsf(alu - lib) / fabsf(lib) : 0.0f;
+            if (rel > 0.05f) { fails++; printf("  x=%+6.2f rel=%.3e\n", xs[i], rel); }
+        }
+        CHECK("exp range [-20, 20] within 5%% relative error", fails == 0);
+    }
+
+    /* ── 12c. AVX2 batch rotate (skipped if not compiled in) ─────────── */
+    HEADER("12c. Batch rotate");
+    {
+        const int N = 64;
+        rac_vec2 v[64], out[64];
+        float theta[64];
+        for (int i = 0; i < N; i++) {
+            v[i] = (rac_vec2){1.0f, 0.0f};
+            theta[i] = (float)(i % 16) * 0.1f;
+        }
+        rac_alu_rotate_batch(v, theta, out, N);
+        int fails = 0;
+        for (int i = 0; i < N; i++) {
+            rac_vec2 ref = rac_alu_rotate(v[i], theta[i]);
+            if (fabsf(out[i].x - ref.x) > TOL_CIRC ||
+                fabsf(out[i].y - ref.y) > TOL_CIRC) fails++;
+        }
+        CHECK("batch rotate matches scalar per-element", fails == 0);
+        printf("  has_avx2 = %d\n", rac_alu_has_avx2());
+    }
+
+    /* ── 12d. AVX2 batch inner — full-quadrant input ─────────────────── */
+    HEADER("12d. Batch inner product (all quadrants)");
+    {
+        const int N = 1024;
+        rac_vec2 *a = (rac_vec2 *)malloc(N * sizeof(rac_vec2));
+        rac_vec2 *b = (rac_vec2 *)malloc(N * sizeof(rac_vec2));
+        float ref = 0.0f;
+        for (int i = 0; i < N; i++) {
+            a[i].x = (float)((i % 31) - 15) * 0.1f;
+            a[i].y = (float)((i % 17) - 8)  * 0.1f;
+            b[i].x = (float)((i % 23) - 11) * 0.1f;  /* spans negative x */
+            b[i].y = (float)((i % 13) - 6)  * 0.1f;
+            ref += a[i].x * b[i].x + a[i].y * b[i].y;
+        }
+        float scalar = rac_alu_inner(a, b, N);
+        float batch  = rac_alu_inner_batch(a, b, N);
+        printf("  N=%d naive=%.4f scalar_alu=%.4f batch_alu=%.4f\n",
+               N, ref, scalar, batch);
+        CHECK("scalar ALU inner matches naive dot within 1%%",
+              fabsf(scalar - ref) / fabsf(ref) < 0.01f);
+        CHECK("batch ALU inner matches naive dot within 1%%",
+              fabsf(batch - ref) / fabsf(ref) < 0.01f);
+        free(a); free(b);
+    }
 
     /* ── 13. Extended range via quadrant folding ─────────────────────── */
     HEADER("13. Quadrant folding (extended range)");
