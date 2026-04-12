@@ -57,8 +57,10 @@ def load_config(path):
 
 
 def ensure_tinygrad(auto_install: bool) -> None:
-    try:
-        import tinygrad  # noqa: F401
+    """Check tinygrad is installed without importing it (tinygrad reads
+    DEV env var at import time — see comment in main())."""
+    import importlib.util
+    if importlib.util.find_spec("tinygrad") is not None:
         return
     except ImportError:
         pass
@@ -93,6 +95,66 @@ def ensure_tinygrad(auto_install: bool) -> None:
     # flag is dropped so we don't re-trigger the bootstrap.
     new_argv = [str(venv_py), __file__] + [a for a in sys.argv[1:] if a != "--auto-install"]
     os.execv(str(venv_py), new_argv)
+
+
+def _available_backends_no_import():
+    """List ops_* backends the installed tinygrad ships — WITHOUT importing
+    tinygrad itself. Tinygrad reads the DEV env var at import time and caches
+    the decision, so we can't safely let it import before we've set DEV.
+
+    Uses importlib.util.find_spec, which locates the module on disk without
+    running its __init__. Falls back to filesystem walk if find_spec fails."""
+    import importlib.util
+    import pathlib
+
+    out = set()
+    # Locate the tinygrad package directory without importing tinygrad.
+    spec = importlib.util.find_spec("tinygrad")
+    if spec is None or not spec.submodule_search_locations:
+        return out
+    for pkg_root in spec.submodule_search_locations:
+        runtime = pathlib.Path(pkg_root) / "runtime"
+        if not runtime.is_dir():
+            continue
+        for child in runtime.iterdir():
+            name = child.name
+            if name.startswith("ops_") and name.endswith(".py"):
+                out.add(name[4:-3].upper())
+    return out
+
+
+def _pick_device(requested: str) -> str:
+    """
+    Map the YAML-requested device to one the installed tinygrad actually has.
+    Must be called BEFORE any 'import tinygrad' because tinygrad snapshots
+    the DEV env var at import time.
+
+      - 'CLANG' is the old CPU JIT; on tinygrad 0.11+ it was renamed to 'CPU'.
+      - 'HIP' / 'AMD' on a Navi 33 box is preferable to CPU if available.
+      - Fall back to 'CPU' or 'PYTHON' as last resorts.
+    """
+    avail = _available_backends_no_import()
+    if not avail:
+        return requested.upper()
+
+    requested_up = requested.upper()
+    # Honor explicit request when possible.
+    if requested_up in avail:
+        return requested_up
+
+    # CLANG → CPU rename on 0.11+.
+    if requested_up == "CLANG" and "CPU" in avail:
+        print("  [info] tinygrad renamed CLANG -> CPU; using CPU backend", file=sys.stderr)
+        return "CPU"
+
+    # Prefer GPU over CPU for larger models if we can detect one.
+    for preferred in ("HIP", "AMD", "CUDA", "NV", "METAL", "CPU", "CLANG", "PYTHON"):
+        if preferred in avail:
+            print(f"  [info] requested '{requested}' unavailable; using '{preferred}' (avail: {sorted(avail)})",
+                  file=sys.stderr)
+            return preferred
+
+    return requested_up  # let tinygrad raise its own error
 
 
 def fetch_weights(model_id: str) -> pathlib.Path:
@@ -236,9 +298,19 @@ def main():
 
     # Apply env knobs from config
     # (Minimal: OMP_NUM_THREADS + device)
-    os.environ.setdefault("OMP_NUM_THREADS", "16")
+    os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 16))
+    # TINYGRAD_CLANG_PARALLEL was the old flag for the CLANG backend;
+    # the equivalent on 0.11+ is CPU_PARALLEL. Set both, harmless.
     os.environ.setdefault("TINYGRAD_CLANG_PARALLEL", "1")
-    os.environ["DEV"] = cfg["device"]
+    os.environ.setdefault("CPU_PARALLEL", "1")
+
+    # Install tinygrad if missing. Note: ensure_tinygrad imports tinygrad
+    # to probe its presence, but tinygrad caches the DEV env var at that
+    # first import. So we set DEV *before* calling ensure_tinygrad, using
+    # the no-import backend probe that reads the filesystem directly.
+    probe_dev = _pick_device(cfg["device"])
+    os.environ["DEV"] = probe_dev
+    cfg["device"] = probe_dev
 
     ensure_tinygrad(args.auto_install)
     from tinygrad import Tensor, Device

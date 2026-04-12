@@ -116,29 +116,70 @@ if ! "$BIN" -m "$GGUF_PATH" \
   exit 5
 fi
 
-# Parse the CSV: columns of interest are "t/s" (tokens/sec) for pp (prefill)
-# and tg (decode). llama-bench 2024+ emits these under "test,t/s" headers.
-# We defensively parse any CSV with these labels.
+# Parse the CSV. llama-bench schemas seen in the wild:
+#   pre-2024:  columns include "test" + "t/s"
+#   2024+:     columns "test" + "avg_ts" or "tokens_per_second"
+#   recent:    separate "n_prompt" / "n_gen" columns, "test" may be empty
+# We probe each option and fall back through them.
 parse_metric() {
   local test_name="$1"
-  python3 -c "
+  local prefill="$2"
+  local decode="$3"
+  python3 - "$TMP" "$test_name" "$prefill" "$decode" <<'PY'
 import csv, sys
+path, test_name, prefill, decode = sys.argv[1:]
+prefill, decode = int(prefill), int(decode)
 best = None
-for row in csv.DictReader(open('$TMP')):
-    name = row.get('test','')
-    tok  = row.get('t/s') or row.get('tokens_per_second')
-    if not tok: continue
-    if '$test_name' in name:
-        try:
-            v = float(tok)
-            if best is None or v > best: best = v
-        except: pass
+
+def try_parse(row, keys):
+    for k in keys:
+        v = row.get(k)
+        if v in (None, "", "—"): continue
+        try: return float(v)
+        except ValueError: continue
+    return None
+
+tps_keys = ("avg_ts", "t/s", "tokens_per_second", "avg_tps")
+
+with open(path) as f:
+    rows = list(csv.DictReader(f))
+
+for row in rows:
+    # Classic form: test="pp128" or "tg128"
+    name = row.get("test", "") or ""
+    if test_name and test_name in name:
+        v = try_parse(row, tps_keys)
+        if v is not None and (best is None or v > best): best = v
+        continue
+    # New form: n_prompt / n_gen columns.
+    try:
+        np_ = int(row.get("n_prompt") or 0)
+        ng_ = int(row.get("n_gen") or 0)
+    except ValueError:
+        np_ = ng_ = 0
+    if test_name.startswith("pp") and np_ == prefill and ng_ == 0:
+        v = try_parse(row, tps_keys)
+        if v is not None and (best is None or v > best): best = v
+    elif test_name.startswith("tg") and ng_ == decode and np_ == 0:
+        v = try_parse(row, tps_keys)
+        if v is not None and (best is None or v > best): best = v
+
 print(best if best is not None else 0.0)
-"
+PY
 }
 
-PP_TPS=$(parse_metric "pp${PREFILL}")
-TG_TPS=$(parse_metric "tg${DECODE}")
+PP_TPS=$(parse_metric "pp${PREFILL}" "$PREFILL" "$DECODE")
+TG_TPS=$(parse_metric "tg${DECODE}"  "$PREFILL" "$DECODE")
+
+# Diagnostic: if both metrics came back zero the schema doesn't match.
+# Print a snippet of the raw CSV so users can see what llama-bench gave us.
+if awk "BEGIN{exit !($PP_TPS==0 && $TG_TPS==0)}"; then
+  echo "  [WARN] llama-bench CSV parse returned 0 for both metrics." >&2
+  echo "  [DEBUG] raw llama-bench output follows (first 20 lines):" >&2
+  head -20 "$TMP" | sed 's/^/    /' >&2
+  echo "  [HINT] if your llama-bench emits different columns, share the"      >&2
+  echo "         output above so the parser can be extended." >&2
+fi
 
 # Per-layer derived values
 if [[ "$N_LAYERS" -gt 0 ]]; then

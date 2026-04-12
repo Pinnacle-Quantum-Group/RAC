@@ -13,8 +13,13 @@ n_layers_divisor: 22
 prefill_tokens: 128
 decode_iters:   100
 
-# Backend: CLANG (CPU JIT, fastest CPU), LLVM, PYTHON (debug), CUDA, HIP
-device: CLANG
+# Backend selection (run_tinygrad.py probes available ones and falls back).
+#   Prefer    GPU: HIP (AMD), CUDA/NV (NVIDIA), METAL (Apple)
+#   CPU JIT:       CPU  (tinygrad 0.11+)  /  CLANG (tinygrad <=0.10)
+#   debug:         PYTHON
+# 'CPU' is the modern name; if you set CLANG on a 0.11+ install we auto-map
+# it to CPU. Set 'HIP' or 'CUDA' to pull the GPU in for A/B vs RAC.
+device: CPU
 
 # Precision
 dtype: float32        # float32 for apples-to-apples with RAC
