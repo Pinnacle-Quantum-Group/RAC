@@ -949,7 +949,7 @@ class RACRoPE(nn.Module):
         self.register_buffer('sin_cache', angles.sin().to(dtype=dtype, device=device), persistent=False)
 
     @staticmethod
-    def _apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def _apply_rotation(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         # x: [..., seq, head_dim], cos/sin: [seq, head_dim/2]
         # Rearrange into (even, odd) pairs, rotate, re-interleave.
         x1 = x[..., 0::2]
@@ -976,7 +976,7 @@ class RACRoPE(nn.Module):
         else:
             cos = self.cos_cache[positions]
             sin = self.sin_cache[positions]
-        return self._apply(q, cos, sin), self._apply(k, cos, sin)
+        return self._apply_rotation(q, cos, sin), self._apply_rotation(k, cos, sin)
 
     def extra_repr(self):
         return (f'head_dim={self.head_dim}, max_seq_len={self.max_seq_len}, '
