@@ -57,11 +57,11 @@ def load_config(path):
 
 
 def ensure_tinygrad(auto_install: bool) -> None:
-    try:
-        import tinygrad  # noqa: F401
+    """Check tinygrad is installed without importing it (tinygrad reads
+    DEV env var at import time — see comment in main())."""
+    import importlib.util
+    if importlib.util.find_spec("tinygrad") is not None:
         return
-    except ImportError:
-        pass
     if auto_install:
         print("  installing tinygrad via pip...", file=sys.stderr)
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "tinygrad"])
@@ -75,28 +75,43 @@ def ensure_tinygrad(auto_install: bool) -> None:
     sys.exit(2)
 
 
-def _available_backends():
-    """List the ops_* backends the installed tinygrad actually ships.
-    Older tinygrad had ops_clang; newer versions renamed it to ops_cpu.
-    Needed for graceful fallback when the yaml config says CLANG."""
-    try:
-        import pkgutil, tinygrad.runtime
-        return {m.name.replace("ops_", "").upper()
-                for m in pkgutil.iter_modules(tinygrad.runtime.__path__)
-                if m.name.startswith("ops_")}
-    except Exception:
-        return set()
+def _available_backends_no_import():
+    """List ops_* backends the installed tinygrad ships — WITHOUT importing
+    tinygrad itself. Tinygrad reads the DEV env var at import time and caches
+    the decision, so we can't safely let it import before we've set DEV.
+
+    Uses importlib.util.find_spec, which locates the module on disk without
+    running its __init__. Falls back to filesystem walk if find_spec fails."""
+    import importlib.util
+    import pathlib
+
+    out = set()
+    # Locate the tinygrad package directory without importing tinygrad.
+    spec = importlib.util.find_spec("tinygrad")
+    if spec is None or not spec.submodule_search_locations:
+        return out
+    for pkg_root in spec.submodule_search_locations:
+        runtime = pathlib.Path(pkg_root) / "runtime"
+        if not runtime.is_dir():
+            continue
+        for child in runtime.iterdir():
+            name = child.name
+            if name.startswith("ops_") and name.endswith(".py"):
+                out.add(name[4:-3].upper())
+    return out
 
 
 def _pick_device(requested: str) -> str:
     """
     Map the YAML-requested device to one the installed tinygrad actually has.
+    Must be called BEFORE any 'import tinygrad' because tinygrad snapshots
+    the DEV env var at import time.
 
       - 'CLANG' is the old CPU JIT; on tinygrad 0.11+ it was renamed to 'CPU'.
       - 'HIP' / 'AMD' on a Navi 33 box is preferable to CPU if available.
       - Fall back to 'CPU' or 'PYTHON' as last resorts.
     """
-    avail = _available_backends()
+    avail = _available_backends_no_import()
     if not avail:
         return requested.upper()
 
@@ -241,10 +256,18 @@ def main():
     os.environ.setdefault("TINYGRAD_CLANG_PARALLEL", "1")
     os.environ.setdefault("CPU_PARALLEL", "1")
 
+    # Install tinygrad if missing. Note: ensure_tinygrad imports tinygrad
+    # to probe its presence, but tinygrad caches the DEV env var at that
+    # first import. So we set DEV *before* calling ensure_tinygrad, using
+    # the no-import backend probe that reads the filesystem directly.
+    probe_dev = _pick_device(cfg["device"])
+    os.environ["DEV"] = probe_dev
+    cfg["device"] = probe_dev
+
     ensure_tinygrad(args.auto_install)
 
-    # Only after tinygrad is importable can we pick a backend that
-    # actually exists in this install.
+    # Re-probe after install in case auto-install was a no-op previously
+    # and the initial _pick_device returned a default. No-op if already set.
     dev = _pick_device(cfg["device"])
     os.environ["DEV"] = dev
     cfg["device"] = dev
