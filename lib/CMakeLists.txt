@@ -135,13 +135,26 @@ target_link_libraries(bench_rac_alu rac_static m)
 # RAC single-layer transformer inference bench (vs llama.cpp / tinygrad)
 # Includes a minimal safetensors reader so --safetensors=PATH can load real
 # HF weights (fetched via bench/fetch_model.py).
+#
+# Links against rac_avx2 when available so the AVX2 SGEMM path is actually
+# used; otherwise falls back to rac_static. Either way is -march=native
+# and OpenMP-enabled. Without AVX2, bench GFLOPS is ~8x lower (scalar FP).
 add_executable(bench_rac_transformer
     ${CMAKE_SOURCE_DIR}/../bench/bench_rac_transformer.c
     ${CMAKE_SOURCE_DIR}/../bench/safetensors_reader.c)
 target_include_directories(bench_rac_transformer PRIVATE
     c/
     ${CMAKE_SOURCE_DIR}/../bench)
-target_link_libraries(bench_rac_transformer rac_static m)
+target_compile_options(bench_rac_transformer PRIVATE
+    -O3 -march=native -Wall)
+if(TARGET rac_avx2)
+    target_link_libraries(bench_rac_transformer rac_avx2 m)
+    target_compile_options(bench_rac_transformer PRIVATE -mavx2 -mfma)
+    message(STATUS "RAC bench: bench_rac_transformer -> AVX2 path")
+else()
+    target_link_libraries(bench_rac_transformer rac_static m)
+    message(STATUS "RAC bench: bench_rac_transformer -> scalar path (no AVX2)")
+endif()
 if(OpenMP_C_FOUND)
     target_link_libraries(bench_rac_transformer OpenMP::OpenMP_C)
 endif()

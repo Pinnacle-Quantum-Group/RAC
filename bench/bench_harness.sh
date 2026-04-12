@@ -58,6 +58,91 @@ if [[ -z "$BIN_DIR" ]]; then
 fi
 RAC_BIN="${BIN_DIR}/bench_rac_transformer"
 
+_build_rac_bench() {
+  # Build bench_rac_transformer + librac_avx2 via the top-level CMake
+  # project. Uses ../lib/build as the out-of-tree build dir. Idempotent.
+  local build_dir="${HERE}/../lib/build"
+  echo "  [auto-build] configuring RAC bench in $build_dir" >&2
+  mkdir -p "$build_dir"
+  (cd "$build_dir" && cmake ../ -DCMAKE_BUILD_TYPE=Release -DRAC_ENGINE=OFF \
+     2>&1 | sed 's/^/    /' >&2) || { echo "  [ERR] cmake configure failed" >&2; return 1; }
+  (cd "$build_dir" && cmake --build . --target bench_rac_transformer \
+     -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | sed 's/^/    /' >&2) || {
+       echo "  [ERR] build failed" >&2; return 1;
+     }
+  if [[ -x "$build_dir/bench_rac_transformer" ]]; then
+    BIN_DIR="$build_dir"
+    RAC_BIN="$build_dir/bench_rac_transformer"
+    echo "  [auto-build] bench_rac_transformer ready at $RAC_BIN" >&2
+    return 0
+  fi
+  echo "  [ERR] expected binary not produced" >&2
+  return 1
+}
+
+# If the bench binary is missing and --auto-build was requested, build it.
+if [[ ! -x "$RAC_BIN" && "$AUTO_BUILD" -eq 1 ]]; then
+  _build_rac_bench || true
+fi
+
+# ── PEP 668-safe Python deps ───────────────────────────────────────────
+# Debian / Ubuntu 23.04+ ship externally-managed Python. `pip install` on
+# the system interpreter errors out. When --auto-install is set we
+# provision a private venv under ~/.cache/rac_bench/venv and front-load
+# its bin on PATH so everything downstream (fetch_model.py, tinygrad,
+# huggingface_hub) uses it automatically.
+BENCH_VENV="${HOME}/.cache/rac_bench/venv"
+
+_ensure_venv() {
+  if [[ -d "$BENCH_VENV" && -x "$BENCH_VENV/bin/python3" ]]; then
+    return 0
+  fi
+  echo "  [auto-install] creating bench venv at $BENCH_VENV" >&2
+  python3 -m venv "$BENCH_VENV" 2>&1 | sed 's/^/    /' >&2 || {
+    echo "  [WARN] python3 -m venv failed; is python3-venv installed? (apt install python3-venv)" >&2
+    return 1
+  }
+  "$BENCH_VENV/bin/python3" -m pip install --quiet --upgrade pip setuptools wheel \
+    2>&1 | sed 's/^/    /' >&2 || true
+}
+
+_bench_pip_install() {
+  # $1..: package names. Tries system pip first; on PEP 668 failure falls
+  # back to the bench venv. Idempotent — skips if import succeeds.
+  local pkg
+  for pkg in "$@"; do
+    local mod="$pkg"
+    case "$pkg" in
+      huggingface_hub|huggingface-hub) mod=huggingface_hub ;;
+      *) mod="${pkg//-/_}" ;;
+    esac
+    if python3 -c "import $mod" 2>/dev/null; then
+      continue
+    fi
+    # System attempt (will fail silently on PEP 668)
+    if pip install --quiet "$pkg" 2>/dev/null; then
+      echo "  [auto-install] pip installed $pkg (system)" >&2
+      continue
+    fi
+    # Venv fallback
+    _ensure_venv || return 1
+    if "$BENCH_VENV/bin/pip" install --quiet "$pkg" 2>&1 | sed 's/^/    /' >&2; then
+      echo "  [auto-install] installed $pkg into $BENCH_VENV" >&2
+    else
+      echo "  [WARN] failed to install $pkg — continuing without it" >&2
+    fi
+  done
+}
+
+if [[ "$AUTO_INSTALL" -eq 1 ]]; then
+  _bench_pip_install huggingface_hub
+  # If the venv exists, front-load it so subsequent python3 calls pick it up.
+  if [[ -x "$BENCH_VENV/bin/python3" ]]; then
+    export PATH="$BENCH_VENV/bin:$PATH"
+    export VIRTUAL_ENV="$BENCH_VENV"
+  fi
+fi
+
 # ── Fetch weights once (both RAC and tinygrad pull the same files) ─────
 # If --auto-install was requested, let fetch_model.py + run_tinygrad.py
 # bootstrap a venv under $HF_HOME/rac_bench/venv (bypasses PEP 668 on
@@ -79,9 +164,25 @@ TINY_JSON=""
 run_rac() {
   [[ "$SKIP_RAC" -eq 1 ]] && return 0
   if [[ ! -x "$RAC_BIN" ]]; then
-    echo "  [WARN] RAC bench binary not found (set --bin-dir=DIR or build first)" >&2
+    echo "  [WARN] RAC bench binary not found. Re-run with --auto-build, or:" >&2
+    echo "         cd lib && mkdir -p build && cd build &&" >&2
+    echo "         cmake .. -DCMAKE_BUILD_TYPE=Release -DRAC_ENGINE=OFF &&" >&2
+    echo "         cmake --build . --target bench_rac_transformer -j\$(nproc)" >&2
     return 1
   fi
+  # Quick sanity: ldd should show libgomp (OpenMP) on a proper build.
+  # If it doesn't, the -fopenmp / -march=native flags weren't used and
+  # the bench will under-report RAC's CPU performance by 10-50x.
+  if command -v ldd >/dev/null 2>&1; then
+    if ! ldd "$RAC_BIN" 2>/dev/null | grep -q libgomp; then
+      echo "  [WARN] $RAC_BIN is not linked against libgomp — OpenMP pragmas are no-ops." >&2
+      echo "         This under-reports RAC perf. Rebuild via:" >&2
+      echo "         $0 --auto-build   (or rm -rf lib/build && rebuild with cmake)" >&2
+    fi
+  fi
+  : "${OMP_NUM_THREADS:=$(nproc 2>/dev/null || echo 1)}"
+  export OMP_NUM_THREADS
+  echo "  [info] OMP_NUM_THREADS=$OMP_NUM_THREADS" >&2
   # The C bench prints a human-readable block; parse the three lines we need.
   OUT=$("$RAC_BIN" --safetensors "$SAFET" --layer "$LAYER" \
                    --prefill-iters 20 --decode-iters 100 2>/dev/null)
