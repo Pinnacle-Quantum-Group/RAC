@@ -181,14 +181,17 @@ if awk "BEGIN{exit !($PP_TPS==0 && $TG_TPS==0)}"; then
   echo "         output above so the parser can be extended." >&2
 fi
 
-# Per-layer derived values
-if [[ "$N_LAYERS" -gt 0 ]]; then
-  PP_TPS_LAYER=$(awk "BEGIN{printf \"%.2f\", $PP_TPS * $N_LAYERS}")
-  TG_TPS_LAYER=$(awk "BEGIN{printf \"%.2f\", $TG_TPS * $N_LAYERS}")
-  TG_MS_LAYER=$(awk "BEGIN{printf \"%.4f\", 1000.0 / ($TG_TPS * $N_LAYERS)}")
+# Derive a genuine per-layer latency from the measured full-model throughput.
+# Assumption: layer cost distributes roughly evenly across the 22 layers (fine
+# for transformers modulo the final norm + lm_head overhead). Everything else
+# we report is the *measured* full-model throughput — no multiplication fiction.
+PREFILL_MS_MODEL=$(awk "BEGIN{printf \"%.3f\", ($PP_TPS > 0) ? 1000.0 / $PP_TPS : 0}")
+DECODE_MS_MODEL=$(awk "BEGIN{printf \"%.3f\", ($TG_TPS > 0) ? 1000.0 / $TG_TPS : 0}")
+if [[ "$N_LAYERS" -gt 0 ]] && awk "BEGIN{exit !($PP_TPS>0 && $TG_TPS>0)}"; then
+  PREFILL_MS_PER_LAYER=$(awk "BEGIN{printf \"%.4f\", 1000.0 / $PP_TPS / $N_LAYERS}")
+  DECODE_MS_PER_LAYER=$(awk "BEGIN{printf \"%.4f\", 1000.0 / $TG_TPS / $N_LAYERS}")
 else
-  PP_TPS_LAYER="$PP_TPS"; TG_TPS_LAYER="$TG_TPS"
-  TG_MS_LAYER=$(awk "BEGIN{printf \"%.4f\", 1000.0 / $TG_TPS}")
+  PREFILL_MS_PER_LAYER=0; DECODE_MS_PER_LAYER=0
 fi
 
 cat <<JSON
@@ -198,9 +201,12 @@ cat <<JSON
  "threads": $THREADS,
  "prefill_T": $PREFILL,
  "decode_N": $DECODE,
- "prefill_tok_s_model": $PP_TPS,
- "decode_tok_s_model":  $TG_TPS,
- "prefill_tok_s_per_layer": $PP_TPS_LAYER,
- "decode_tok_s_per_layer":  $TG_TPS_LAYER,
- "decode_ms_per_layer":     $TG_MS_LAYER}
+ "n_layers": $N_LAYERS,
+ "scope": "full_model",
+ "prefill_tok_s_model":  $PP_TPS,
+ "decode_tok_s_model":   $TG_TPS,
+ "prefill_ms_per_token": $PREFILL_MS_MODEL,
+ "decode_ms_per_token":  $DECODE_MS_MODEL,
+ "prefill_ms_per_layer_derived": $PREFILL_MS_PER_LAYER,
+ "decode_ms_per_layer_derived":  $DECODE_MS_PER_LAYER}
 JSON

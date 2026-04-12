@@ -53,10 +53,12 @@ typedef struct {
     int n_kv_heads;      /* for GQA; equal to n_heads for MHA */
     int d_head;
     int d_ff;
+    int n_layers;        /* number of decoder layers in --full-model mode */
     int prefill_T;
     int prefill_iters;
     int decode_iters;
-    int layer_idx;       /* which layer to load from safetensors */
+    int layer_idx;       /* which layer to load from safetensors (single-layer mode) */
+    int full_model;      /* 0 = single-layer bench, 1 = whole stack + KV cache */
     const char *safetensors_path;
     const char *config_name;
 } tx_cfg;
@@ -64,10 +66,10 @@ typedef struct {
 static void cfg_apply_preset(tx_cfg *c, const char *name) {
     if (!strcmp(name, "tiny")) {
         c->d_model = 512; c->n_heads = 8; c->n_kv_heads = 8;
-        c->d_ff = 1536;
+        c->d_ff = 1536; c->n_layers = 4;
     } else if (!strcmp(name, "tinyllama")) {
         c->d_model = 2048; c->n_heads = 32; c->n_kv_heads = 4;  /* GQA */
-        c->d_ff = 5632;
+        c->d_ff = 5632; c->n_layers = 22;
     } else {
         fprintf(stderr, "unknown preset '%s' (use 'tiny' or 'tinyllama')\n", name);
         exit(1);
@@ -310,6 +312,252 @@ static void decoder_forward(float *x, const tx_weights *w, tx_bufs *b,
     for (size_t i = 0; i < (size_t)T * d; i++) x[i] += b->norm[i];
 }
 
+/* ── Full-model: multi-layer weights + KV cache ────────────────────────── */
+/*
+ * Full-model path: load all n_layers decoder blocks, run prefill across
+ * every layer, then a KV-cache-aware decode loop. This is the number that
+ * compares apples-to-apples with llama-bench's "full-model tok/s" — it's
+ * the wall time for one token end-to-end through the whole stack, not a
+ * single layer in isolation.
+ *
+ * KV cache layout per layer:
+ *   K[T_max, n_kv_heads, d_head], V[T_max, n_kv_heads, d_head]
+ *   row-major, stride = n_kv_heads * d_head per timestep.
+ */
+
+typedef struct {
+    float **K;         /* per-layer [T_max * nkv * d_head] */
+    float **V;
+    int n_layers;
+    int T_max;
+    int cur_len;       /* positions filled so far, grows from 0 */
+} kv_cache;
+
+static kv_cache *kv_alloc(int n_layers, int T_max, int n_kv_heads, int d_head) {
+    kv_cache *kv = (kv_cache *)calloc(1, sizeof(kv_cache));
+    if (!kv) { fprintf(stderr, "kv_alloc: oom\n"); exit(1); }
+    kv->n_layers = n_layers;
+    kv->T_max    = T_max;
+    kv->cur_len  = 0;
+    kv->K = (float **)calloc(n_layers, sizeof(float *));
+    kv->V = (float **)calloc(n_layers, sizeof(float *));
+    size_t per_layer = (size_t)T_max * n_kv_heads * d_head;
+    for (int L = 0; L < n_layers; L++) {
+        kv->K[L] = xalloc(per_layer);
+        kv->V[L] = xalloc(per_layer);
+    }
+    return kv;
+}
+
+static void kv_reset(kv_cache *kv) { if (kv) kv->cur_len = 0; }
+
+static void kv_free(kv_cache *kv) {
+    if (!kv) return;
+    for (int L = 0; L < kv->n_layers; L++) { free(kv->K[L]); free(kv->V[L]); }
+    free(kv->K); free(kv->V); free(kv);
+}
+
+/*
+ * Causal attention with strided K/V access into the KV cache.
+ * Reads K[j * stride + kv_h * d_head + h] and V[...] directly — no copy.
+ * T_q = query length (new tokens this step), T_kv = cache total length.
+ * q_start_pos = absolute position of the first query token.
+ */
+static void attention_head_causal(
+    const float *q_contig,      /* [T_q, d_head] */
+    const float *k_cache, const float *v_cache,
+    int kv_h, int nkv, int d_head,
+    float *out, float *scratch,
+    int T_q, int T_kv, int q_start_pos)
+{
+    const float scale = 1.0f / sqrtf((float)d_head);
+    int stride = nkv * d_head;
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < T_q; i++) {
+        int abs_i = q_start_pos + i;
+        float *row = scratch + (size_t)i * T_kv;
+        for (int j = 0; j < T_kv; j++) {
+            if (j > abs_i) { row[j] = -1e30f; continue; }
+            const float *k_row = k_cache + (size_t)j * stride + (size_t)kv_h * d_head;
+            const float *q_row = q_contig + (size_t)i * d_head;
+            float s = 0.0f;
+            for (int h = 0; h < d_head; h++) s += q_row[h] * k_row[h];
+            row[j] = s * scale;
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < T_q; i++) rac_softmax(scratch + (size_t)i * T_kv,
+                                               scratch + (size_t)i * T_kv, T_kv);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < T_q; i++) {
+        float *orow = out + (size_t)i * d_head;
+        for (int h = 0; h < d_head; h++) orow[h] = 0.0f;
+        for (int j = 0; j < T_kv; j++) {
+            float s = scratch[(size_t)i * T_kv + j];
+            const float *v_row = v_cache + (size_t)j * stride + (size_t)kv_h * d_head;
+            for (int h = 0; h < d_head; h++) orow[h] += s * v_row[h];
+        }
+    }
+}
+
+/*
+ * Cache-aware decoder forward. Computes Q for T_new tokens, writes new
+ * K/V straight into the KV cache at position kv->cur_len, runs causal
+ * attention over the full cache [0, cur_len + T_new). Does NOT advance
+ * cur_len — the caller does that after all layers finish this step so
+ * every layer sees the same cache extent.
+ */
+static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
+                                const tx_cfg *c, int T_new,
+                                kv_cache *kv, int layer_idx) {
+    rac_config cfg = rac_default_config();
+    int d  = c->d_model, dh = c->d_head;
+    int nq = c->n_heads, nkv = c->n_kv_heads;
+    int gqa_repeat = nq / nkv;
+    int start = kv->cur_len;
+    int total = start + T_new;
+
+    rmsnorm(x, w->rms_att, b->norm, T_new, d);
+    rac_fused_linear(b->norm, w->W_q, NULL, b->Q, T_new, d, d, RAC_ACT_NONE, &cfg);
+
+    /* Write K/V directly into the cache at the new slots. */
+    float *K_slot = kv->K[layer_idx] + (size_t)start * nkv * dh;
+    float *V_slot = kv->V[layer_idx] + (size_t)start * nkv * dh;
+    rac_fused_linear(b->norm, w->W_k, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE, &cfg);
+    rac_fused_linear(b->norm, w->W_v, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE, &cfg);
+
+    /* Per query head attention over the full cache. */
+    for (int h = 0; h < nq; h++) {
+        int kv_h = h / gqa_repeat;
+        for (int t = 0; t < T_new; t++) {
+            for (int i = 0; i < dh; i++) {
+                b->qc[t*dh + i] = b->Q[(size_t)t * d + h * dh + i];
+            }
+        }
+        attention_head_causal(b->qc, kv->K[layer_idx], kv->V[layer_idx],
+                              kv_h, nkv, dh,
+                              b->oc, b->scratch,
+                              T_new, total, start);
+        for (int t = 0; t < T_new; t++) {
+            for (int i = 0; i < dh; i++) {
+                b->att_out[(size_t)t * d + h * dh + i] = b->oc[t*dh + i];
+            }
+        }
+    }
+
+    rac_fused_linear(b->att_out, w->W_o, NULL, b->norm, T_new, d, d, RAC_ACT_NONE, &cfg);
+    for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
+
+    /* FFN (SwiGLU) — unchanged from decoder_forward. */
+    rmsnorm(x, w->rms_ffn, b->ffn_in, T_new, d);
+    rac_fused_linear(b->ffn_in, w->W_g, NULL, b->ffn_g, T_new, c->d_ff, d, RAC_ACT_SILU, &cfg);
+    rac_fused_linear(b->ffn_in, w->W_u, NULL, b->ffn_u, T_new, c->d_ff, d, RAC_ACT_NONE, &cfg);
+    for (size_t i = 0; i < (size_t)T_new * c->d_ff; i++) b->ffn_g[i] *= b->ffn_u[i];
+    rac_fused_linear(b->ffn_g, w->W_d, NULL, b->norm, T_new, d, c->d_ff, RAC_ACT_NONE, &cfg);
+    for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
+}
+
+/* Full-stack forward over all layers. Advances kv->cur_len at the end. */
+static void full_model_forward(float *x, tx_weights *layers, int n_layers,
+                                tx_bufs *b, const tx_cfg *c, int T_new,
+                                kv_cache *kv) {
+    for (int L = 0; L < n_layers; L++) {
+        decoder_forward_kv(x, &layers[L], b, c, T_new, kv, L);
+    }
+    kv->cur_len += T_new;
+}
+
+/* Load all N decoder layers from a Llama-style safetensors checkpoint. */
+static int init_weights_safetensors_full(tx_weights *layers, tx_cfg *c,
+                                          const char *path) {
+    /* Re-open once per layer is wasteful but the single-layer path already
+     * did that. Here we stash the file handle and reuse it. */
+    char err[256];
+    st_file *f = st_open(path, err);
+    if (!f) { fprintf(stderr, "safetensors open failed: %s\n", err); return -1; }
+
+    size_t d  = c->d_model;
+    size_t dk = (size_t)c->n_kv_heads * c->d_head;
+    char buf[ST_MAX_NAME];
+
+    for (int L = 0; L < c->n_layers; L++) {
+        tx_weights *w = &layers[L];
+        w->W_q = xalloc(d * d);
+        w->W_k = xalloc(d * dk);
+        w->W_v = xalloc(d * dk);
+        w->W_o = xalloc(d * d);
+        w->W_g = xalloc((size_t)c->d_ff * d);
+        w->W_u = xalloc((size_t)c->d_ff * d);
+        w->W_d = xalloc((size_t)d * c->d_ff);
+        w->rms_att = xalloc(d);
+        w->rms_ffn = xalloc(d);
+
+        #define LOAD_L(name, ptr, expect_numel) do {                                \
+            snprintf(buf, sizeof(buf), "model.layers.%d." name, L);                \
+            const st_tensor *t = st_find(f, buf);                                  \
+            if (!t) { fprintf(stderr, "missing tensor: %s\n", buf); st_close(f); return -1; } \
+            size_t nel = st_numel(t);                                              \
+            if (nel != (size_t)(expect_numel)) {                                   \
+                fprintf(stderr, "%s shape mismatch: got %zu expected %zu\n",       \
+                        buf, nel, (size_t)(expect_numel));                         \
+                st_close(f); return -1;                                            \
+            }                                                                      \
+            if (st_to_f32(f, t, ptr) != 0) {                                       \
+                fprintf(stderr, "dtype not supported for %s (%s)\n", buf,          \
+                        st_dtype_name(t->dtype));                                  \
+                st_close(f); return -1;                                            \
+            }                                                                      \
+        } while (0)
+
+        LOAD_L("self_attn.q_proj.weight", w->W_q, d * d);
+        LOAD_L("self_attn.k_proj.weight", w->W_k, d * dk);
+        LOAD_L("self_attn.v_proj.weight", w->W_v, d * dk);
+        LOAD_L("self_attn.o_proj.weight", w->W_o, d * d);
+        LOAD_L("mlp.gate_proj.weight",    w->W_g, (size_t)c->d_ff * d);
+        LOAD_L("mlp.up_proj.weight",      w->W_u, (size_t)c->d_ff * d);
+        LOAD_L("mlp.down_proj.weight",    w->W_d, (size_t)d * c->d_ff);
+        LOAD_L("input_layernorm.weight",          w->rms_att, d);
+        LOAD_L("post_attention_layernorm.weight", w->rms_ffn, d);
+        #undef LOAD_L
+    }
+    printf("  loaded %d layers from %s\n", c->n_layers, path);
+    st_close(f);
+    return 0;
+}
+
+static void init_weights_synthetic_full(tx_weights *layers, const tx_cfg *c) {
+    for (int L = 0; L < c->n_layers; L++) {
+        init_weights_synthetic(&layers[L], c);
+    }
+}
+
+/* Resize bufs to support T_q and T_kv bounds. For --full-model we need
+ * scratch of size max(T_q) * max(T_kv). Safest: alloc at prefill_T for Q,
+ * and T_max = prefill_T + decode_iters for K/V. */
+static void bufs_alloc_for_full_model(tx_bufs *b, const tx_cfg *c,
+                                       int T_q_max, int T_kv_max) {
+    size_t d = c->d_model;
+    b->norm    = xalloc((size_t)T_q_max * d);
+    b->Q       = xalloc((size_t)T_q_max * d);
+    b->K       = NULL;   /* KV cache owns the real K / V storage */
+    b->V       = NULL;
+    b->att_out = xalloc((size_t)T_q_max * d);
+    b->scratch = xalloc((size_t)T_q_max * T_kv_max);
+    b->ffn_in  = xalloc((size_t)T_q_max * d);
+    b->ffn_g   = xalloc((size_t)T_q_max * c->d_ff);
+    b->ffn_u   = xalloc((size_t)T_q_max * c->d_ff);
+    b->qc      = xalloc((size_t)T_q_max * c->d_head);
+    b->kc      = NULL;
+    b->vc      = NULL;
+    b->oc      = xalloc((size_t)T_q_max * c->d_head);
+}
+static void bufs_free_full_model(tx_bufs *b) {
+    free(b->norm); free(b->Q); free(b->att_out);
+    free(b->scratch); free(b->ffn_in); free(b->ffn_g); free(b->ffn_u);
+    free(b->qc); free(b->oc);
+}
+
 /* ── CLI ───────────────────────────────────────────────────────────────── */
 
 static void usage(const char *argv0) {
@@ -318,17 +566,118 @@ static void usage(const char *argv0) {
         "  --config {tiny|tinyllama}    model shape preset (default: tiny)\n"
         "  --safetensors PATH           load layer weights from HF checkpoint\n"
         "                                 (implies --config tinyllama)\n"
-        "  --layer N                    which layer to load (default: 0)\n"
+        "  --layer N                    which layer to load (single-layer mode)\n"
+        "  --full-model                 run ALL decoder layers + KV cache\n"
+        "                                 (apples-to-apples with llama-bench)\n"
         "  --prefill N                  prefill T tokens (default: 128)\n"
         "  --prefill-iters N            # prefill passes (default: 30)\n"
         "  --decode-iters N             # decode passes (default: 100)\n"
         "  -h, --help                   this help\n"
         "\n"
+        "Modes\n"
+        "  Default:        time a single decoder layer in isolation. Useful\n"
+        "                  for microbenchmarks + kernel tuning.\n"
+        "  --full-model:   time a forward pass through every layer with a\n"
+        "                  KV cache between decode steps. This is the metric\n"
+        "                  that compares directly to llama-bench's\n"
+        "                  full-model tok/s — no \"divide by n_layers\"\n"
+        "                  fiction on either side.\n"
+        "\n"
         "Fetch weights via:\n"
         "  MODEL_DIR=$(python3 bench/fetch_model.py \\\n"
         "                --model TinyLlama/TinyLlama-1.1B-Chat-v1.0)\n"
-        "  %s --safetensors \"$MODEL_DIR/model.safetensors\"\n",
+        "  %s --safetensors \"$MODEL_DIR/model.safetensors\" --full-model\n",
         argv0, argv0);
+}
+
+static int run_full_model(tx_cfg *c) {
+    /* Allocate and populate weights for all layers. */
+    tx_weights *layers = (tx_weights *)calloc(c->n_layers, sizeof(tx_weights));
+    if (!layers) { fprintf(stderr, "layer alloc failed\n"); return 2; }
+    if (c->safetensors_path) {
+        if (init_weights_safetensors_full(layers, c, c->safetensors_path) != 0) {
+            free(layers); return 2;
+        }
+    } else {
+        init_weights_synthetic_full(layers, c);
+    }
+
+    int T_prompt = c->prefill_T;
+    int T_max    = T_prompt + c->decode_iters + 16;  /* headroom for warmup */
+
+    tx_bufs b;
+    bufs_alloc_for_full_model(&b, c, /*T_q_max=*/T_prompt, /*T_kv_max=*/T_max);
+    kv_cache *kv = kv_alloc(c->n_layers, T_max, c->n_kv_heads, c->d_head);
+
+    /* Residual stream buffer sized for the larger of the two passes. */
+    float *x_prompt = xalloc((size_t)T_prompt * c->d_model);
+    float *x_decode = xalloc((size_t)c->d_model);
+
+    /* ── Warmup: one prefill pass end-to-end. ────────────────────────── */
+    for (size_t i = 0; i < (size_t)T_prompt * c->d_model; i++)
+        x_prompt[i] = rand_xavier(c->d_model);
+    kv_reset(kv);
+    full_model_forward(x_prompt, layers, c->n_layers, &b, c, T_prompt, kv);
+
+    /* ── Prefill benchmark: full stack, T prompt tokens, per iteration. ── */
+    double t0 = now_sec();
+    for (int it = 0; it < c->prefill_iters; it++) {
+        for (size_t i = 0; i < (size_t)T_prompt * c->d_model; i++)
+            x_prompt[i] = rand_xavier(c->d_model);
+        kv_reset(kv);
+        full_model_forward(x_prompt, layers, c->n_layers, &b, c, T_prompt, kv);
+    }
+    double s_pre = now_sec() - t0;
+    double ms_pre  = s_pre * 1000.0 / c->prefill_iters;
+    double tps_pre = (T_prompt * c->prefill_iters) / s_pre;
+
+    /* ── Decode benchmark: KV-cache already filled by the last prefill.  */
+    /*     Time N single-token forward passes that append to the cache.   */
+    /*     The cache is reset once, prefill warms it to length T_prompt,  */
+    /*     then we measure pure decode throughput.                        */
+    kv_reset(kv);
+    for (size_t i = 0; i < (size_t)T_prompt * c->d_model; i++)
+        x_prompt[i] = rand_xavier(c->d_model);
+    full_model_forward(x_prompt, layers, c->n_layers, &b, c, T_prompt, kv);
+
+    t0 = now_sec();
+    for (int it = 0; it < c->decode_iters; it++) {
+        for (int i = 0; i < c->d_model; i++) x_decode[i] = rand_xavier(c->d_model);
+        full_model_forward(x_decode, layers, c->n_layers, &b, c, 1, kv);
+        if (kv->cur_len + 1 >= kv->T_max) break;   /* safety */
+    }
+    double s_dec = now_sec() - t0;
+    double ms_dec = s_dec * 1000.0 / c->decode_iters;
+    double tps_dec = c->decode_iters / s_dec;
+
+    /* ── GFLOPS accounting ───────────────────────────────────────────── */
+    double flops_per_tok_per_layer =
+          2.0 * c->d_model * c->d_model                    /* Q */
+        + 2.0 * c->d_model * (c->n_kv_heads * c->d_head)   /* K */
+        + 2.0 * c->d_model * (c->n_kv_heads * c->d_head)   /* V */
+        + 2.0 * c->d_model * c->d_model                    /* O */
+        + 3.0 * 2.0 * c->d_model * c->d_ff;                /* FFN */
+    /* Attention compute varies by step — use prompt T as upper bound. */
+    double flops_per_tok = flops_per_tok_per_layer * c->n_layers;
+    double gflops_pre = flops_per_tok * T_prompt * c->prefill_iters / s_pre / 1e9;
+    double gflops_dec = flops_per_tok * c->decode_iters / s_dec / 1e9;
+
+    printf("\n── RAC results (full-model, %d layers, KV cache) ──────────\n",
+           c->n_layers);
+    printf("  prefill T=%d:   %7.2f ms/token   %8.2f tok/s   %7.1f GFLOPS\n",
+           T_prompt, ms_pre / T_prompt, tps_pre, gflops_pre);
+    printf("  decode  T=1:    %7.2f ms/token   %8.2f tok/s   %7.1f GFLOPS\n",
+           ms_dec, tps_dec, gflops_dec);
+    printf("  (these compare directly to llama-bench pp128/tg128 "
+           "full-model tok/s — no divide-by-layers)\n");
+
+    /* Clean up. */
+    for (int L = 0; L < c->n_layers; L++) free_weights(&layers[L]);
+    free(layers);
+    bufs_free_full_model(&b);
+    kv_free(kv);
+    free(x_prompt); free(x_decode);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -345,6 +694,7 @@ int main(int argc, char **argv) {
             c.safetensors_path = argv[++i];
             cfg_apply_preset(&c, "tinyllama");
         }
+        else if (!strcmp(argv[i], "--full-model"))                 c.full_model    = 1;
         else if (!strcmp(argv[i], "--layer") && i+1 < argc)        c.layer_idx     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefill") && i+1 < argc)      c.prefill_T     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefill-iters") && i+1 < argc)c.prefill_iters = atoi(argv[++i]);
@@ -353,15 +703,23 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
     }
 
-    printf("RAC single-layer transformer inference bench\n");
-    printf("  config=%s  d_model=%d  n_heads=%d  n_kv_heads=%d  d_head=%d  d_ff=%d\n"
-           "  prefill_T=%d  prefill_iters=%d  decode_iters=%d\n",
+    printf("RAC %stransformer inference bench\n",
+           c.full_model ? "FULL-MODEL " : "single-layer ");
+    printf("  config=%s  d_model=%d  n_heads=%d  n_kv_heads=%d  d_head=%d  d_ff=%d"
+           "  n_layers=%d\n  prefill_T=%d  prefill_iters=%d  decode_iters=%d\n",
            c.config_name, c.d_model, c.n_heads, c.n_kv_heads, c.d_head, c.d_ff,
-           c.prefill_T, c.prefill_iters, c.decode_iters);
+           c.n_layers, c.prefill_T, c.prefill_iters, c.decode_iters);
     if (c.safetensors_path) {
-        printf("  weights: layer %d from %s\n", c.layer_idx, c.safetensors_path);
+        if (c.full_model)
+            printf("  weights: all %d layers from %s\n", c.n_layers, c.safetensors_path);
+        else
+            printf("  weights: layer %d from %s\n", c.layer_idx, c.safetensors_path);
     } else {
         printf("  weights: synthetic xavier (deterministic, seed=0xC0FFEE)\n");
+    }
+
+    if (c.full_model) {
+        return run_full_model(&c);
     }
 
     tx_weights w = {0};
