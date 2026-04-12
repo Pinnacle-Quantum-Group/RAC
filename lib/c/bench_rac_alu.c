@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200112L
 #include "rac_alu.h"
 #include "rac_ucode.h"
+#include "rac_xrac.h"
 #include "rac_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -448,12 +449,18 @@ int main(int argc, char **argv) {
         free(a); free(b);
     }
 
-    /* ── 13. Microcode interpreter vs direct ALU ───────────────────── */
-    banner("13. Microcode interpreter (ISS) vs direct ALU call");
+    /* ── 13. Four-path perf: direct ALU / microcode / Xrac ISS / hw-proj ─ */
+    banner("13. Execution-layer perf: ALU / microcode / Xrac ISS");
     {
-        const int N = 800000;
+        const int N = 400000;
 
-        /* Direct ALU: rac_alu_rotate */
+        /* Pre-translate the rotate ROM to RV32+Xrac once so we're
+         * measuring ISS execution, not translation. Append EBREAK. */
+        uint32_t imem[32];
+        int nw = rac_xrac_translate_rom(rac_ucode_rom_rotate, 19, imem, 31);
+        imem[nw++] = rac_xrac_enc_ebreak();
+
+        /* Path A: direct rac_alu_rotate */
         double t0 = now_sec();
         float acc = 0.0f;
         for (int i = 0; i < N; i++) {
@@ -461,9 +468,9 @@ int main(int argc, char **argv) {
                                         (float)(i & 127) * 0.01f);
             acc += r.x + r.y;
         }
-        double s_direct = now_sec() - t0; SINK(acc);
+        double s_alu = now_sec() - t0; SINK(acc);
 
-        /* Microcode path: set up ALU, run the 19-instruction rotate ROM. */
+        /* Path B: microcode interpreter on rotate ROM */
         t0 = now_sec();
         acc = 0.0f;
         for (int i = 0; i < N; i++) {
@@ -474,12 +481,43 @@ int main(int argc, char **argv) {
             (void)rac_ucore_execute(&s, rac_ucode_rom_rotate, 19);
             acc += s.x + s.y;
         }
-        double s_ucode = now_sec() - t0; SINK(acc);
+        double s_uc = now_sec() - t0; SINK(acc);
 
-        report_pair("rotate: ALU vs microcode",
-                    s_direct, N, s_ucode, N);
-        printf("  (microcode overhead = interpreter decode; on synthesized\n");
-        printf("   Xrac hardware the ROM *is* the state machine — zero overhead.)\n");
+        /* Path C: RV32 + Xrac ISS running the translated rotate ROM */
+        t0 = now_sec();
+        acc = 0.0f;
+        for (int i = 0; i < N; i++) {
+            rac_xrac_cpu cpu;
+            rac_xrac_init(&cpu, imem, (size_t)nw);
+            rac_alu_load(&cpu.alu,
+                         1.0f * RAC_ALU_K_INV, 0.0f * RAC_ALU_K_INV,
+                         (float)(i & 127) * 0.01f);
+            (void)rac_xrac_run(&cpu, 64);
+            acc += cpu.alu.x + cpu.alu.y;
+        }
+        double s_iss = now_sec() - t0; SINK(acc);
+
+        double ns_alu = s_alu * 1e9 / N;
+        double ns_uc  = s_uc  * 1e9 / N;
+        double ns_iss = s_iss * 1e9 / N;
+        printf("  path                    ns/op    Mops/s    slowdown vs ALU\n");
+        printf("  ─────────────────────── ──────── ───────── ────────────────\n");
+        printf("  A. direct ALU           %7.2f   %7.2f   1.00x (baseline)\n",
+               ns_alu, 1e3 / ns_alu);
+        printf("  B. microcode ISS        %7.2f   %7.2f   %.2fx\n",
+               ns_uc,  1e3 / ns_uc,  ns_uc  / ns_alu);
+        printf("  C. RV32+Xrac ISS        %7.2f   %7.2f   %.2fx\n",
+               ns_iss, 1e3 / ns_iss, ns_iss / ns_alu);
+        printf("\n");
+        printf("  Layer breakdown:\n");
+        printf("    A → B: %+.1f ns   (microcode fetch/decode tax)\n",
+               ns_uc - ns_alu);
+        printf("    B → C: %+.1f ns   (RV32 opcode-0x0B dispatch tax)\n",
+               ns_iss - ns_uc);
+        printf("\n");
+        printf("  On synthesized Xrac hardware both tax layers vanish —\n");
+        printf("  the ROM IS the state machine, and the opcode-0x0B decoder\n");
+        printf("  is combinational. Target: (A baseline) / (16 CORDIC stages).\n");
     }
 
     /* ── 9. exp argument reduction accuracy ────────────────────────── */
