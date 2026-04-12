@@ -20,6 +20,49 @@ float rac_fma(float a, float b, float acc) {
     return fmaf(proj, mag_b, acc);                    /* RAC: project + accumulate */
 }
 
+/*
+ * Tunable-precision CORDIC multiply-accumulate.
+ *
+ *   iters >= 24  → fast path: single sign-XOR FMA (identical to rac_fma).
+ *                  Zero overhead vs the fixed kernel.
+ *   iters <  24  → genuine N-iteration CORDIC linear multiply.
+ *                  Each iter is one shift-add (fmaf + subtract); total work
+ *                  scales linearly with iters. Precision ≈ iters bits.
+ *                  This is the curve a dedicated RAC ASIC walks natively.
+ *
+ * On GPU, `iters` is warp-uniform per launch so the top-level branch is
+ * predicted and incurs no divergence.
+ */
+__device__ __forceinline__
+float rac_fma_iters(float a, float b, float acc, int iters) {
+    if (iters >= 24) {
+        unsigned int ai = __float_as_uint(a);
+        unsigned int bi = __float_as_uint(b);
+        unsigned int sign_b = bi & 0x80000000u;
+        float proj = __uint_as_float(ai ^ sign_b);
+        float mag_b = __uint_as_float(bi & 0x7FFFFFFFu);
+        return fmaf(proj, mag_b, acc);
+    }
+    if (a == 0.0f || b == 0.0f) return acc;
+
+    /* Decompose b = m * 2^e, |m| in [0.5, 1). CORDIC runs on m in that range. */
+    int e;
+    float m = frexpf(b, &e);
+
+    /* CORDIC linear rotation mode: after N iters, y ≈ a * m. */
+    float x = a;
+    float y = 0.0f;
+    float z = m;
+    float scale = 0.5f;
+    for (int i = 0; i < iters; i++) {
+        float d = (z >= 0.0f) ? 1.0f : -1.0f;
+        y = fmaf(d * scale, x, y);
+        z -= d * scale;
+        scale *= 0.5f;
+    }
+    return acc + ldexpf(y, e);
+}
+
 /* ── Tile parameters ──────────────────────────────────────────────────── */
 
 #define TILE_S 16
@@ -44,7 +87,7 @@ void rac_matmul_small_k(
     const float* __restrict__ B,
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[TILE_S][TILE_S];
     __shared__ float sB[TILE_S][TILE_S];
@@ -62,7 +105,7 @@ void rac_matmul_small_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
+            acc = rac_fma_iters(sA[threadIdx.y][i], sB[i][threadIdx.x], acc, iters);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -82,7 +125,7 @@ void rac_matmul_micro_nn_k(
     const float* __restrict__ B,
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[BK][BM];
     __shared__ float sB[BK][BN];
@@ -128,7 +171,7 @@ void rac_matmul_micro_nn_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -158,7 +201,7 @@ void rac_matmul_micro8_nn_k(
     const float* __restrict__ B,
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA8[BK8][BM8];
     __shared__ float sB8[BK8][BN8];
@@ -204,7 +247,7 @@ void rac_matmul_micro8_nn_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -234,7 +277,7 @@ void rac_matmul_small_nt_k(
     const float* __restrict__ B,   /* [N, K] row-major, used transposed */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[TILE_S][TILE_S];
     __shared__ float sB[TILE_S][TILE_S];
@@ -252,7 +295,7 @@ void rac_matmul_small_nt_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
+            acc = rac_fma_iters(sA[threadIdx.y][i], sB[i][threadIdx.x], acc, iters);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -272,7 +315,7 @@ void rac_matmul_micro_nt_k(
     const float* __restrict__ B,   /* [N, K] row-major, used transposed */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[BK][BM];
     __shared__ float sB[BK][BN];
@@ -318,7 +361,7 @@ void rac_matmul_micro_nt_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -348,7 +391,7 @@ void rac_matmul_micro8_nt_k(
     const float* __restrict__ B,   /* [N, K] row-major, used transposed */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA8[BK8][BM8];
     __shared__ float sB8[BK8][BN8];
@@ -394,7 +437,7 @@ void rac_matmul_micro8_nt_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -424,7 +467,7 @@ void rac_matmul_small_tn_k(
     const float* __restrict__ B,   /* [K, N] */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[TILE_S][TILE_S];
     __shared__ float sB[TILE_S][TILE_S];
@@ -442,7 +485,7 @@ void rac_matmul_small_tn_k(
 
         #pragma unroll
         for (int i = 0; i < TILE_S; i++)
-            acc = rac_fma(sA[threadIdx.y][i], sB[i][threadIdx.x], acc);  /* RAC: rotation replaces multiply */
+            acc = rac_fma_iters(sA[threadIdx.y][i], sB[i][threadIdx.x], acc, iters);  /* RAC: rotation replaces multiply */
         __syncthreads();
     }
 
@@ -462,7 +505,7 @@ void rac_matmul_micro_tn_k(
     const float* __restrict__ B,   /* [K, N] */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA[BK][BM];
     __shared__ float sB[BK][BN];
@@ -508,7 +551,7 @@ void rac_matmul_micro_tn_k(
             for (int i = 0; i < TM; i++)
                 #pragma unroll
                 for (int j = 0; j < TN; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -538,7 +581,7 @@ void rac_matmul_micro8_tn_k(
     const float* __restrict__ B,   /* [K, N] */
     float*       __restrict__ C,
     int M, int N, int K,
-    float alpha, float beta)
+    float alpha, float beta, int iters)
 {
     __shared__ float sA8[BK8][BM8];
     __shared__ float sB8[BK8][BN8];
@@ -584,7 +627,7 @@ void rac_matmul_micro8_tn_k(
             for (int i = 0; i < TM8; i++)
                 #pragma unroll
                 for (int j = 0; j < TN8; j++)
-                    acc[i][j] = rac_fma(a_reg[i], b_reg[j], acc[i][j]);  /* RAC: rotation replaces multiply */
+                    acc[i][j] = rac_fma_iters(a_reg[i], b_reg[j], acc[i][j], iters);  /* RAC: rotation replaces multiply */
         }
         __syncthreads();
     }
@@ -610,24 +653,88 @@ void rac_matmul_micro8_tn_k(
 
 extern "C" {
 
+/* Internal launchers take explicit `iters`. The legacy rac_launch_* wrappers
+ * below default iters=24 (the fast sign-XOR path) for backward compat with
+ * any caller that hasn't been updated. Callers that want the tunable knob
+ * use rac_launch_*_iters directly. */
+
+static inline int _clamp_iters(int iters) {
+    if (iters < 1) return 1;
+    if (iters > 24) return 24;
+    return iters;
+}
+
+void rac_launch_nn_iters(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, float alpha, float beta,
+    int iters, hipStream_t stream)
+{
+    iters = _clamp_iters(iters);
+    if ((long long)M * N < 4096) {
+        dim3 block(TILE_S, TILE_S);
+        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
+        rac_matmul_small_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else if (M >= 128 && N >= 128 && K >= 128) {
+        dim3 block(BN8/TN8, BM8/TM8);
+        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
+        rac_matmul_micro8_nn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else {
+        dim3 block(BN/TN, BM/TM);
+        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
+        rac_matmul_micro_nn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    }
+}
+
+void rac_launch_nt_iters(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, float alpha, float beta,
+    int iters, hipStream_t stream)
+{
+    iters = _clamp_iters(iters);
+    if ((long long)M * N < 4096) {
+        dim3 block(TILE_S, TILE_S);
+        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
+        rac_matmul_small_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else if (M >= 128 && N >= 128 && K >= 128) {
+        dim3 block(BN8/TN8, BM8/TM8);
+        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
+        rac_matmul_micro8_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else {
+        dim3 block(BN/TN, BM/TM);
+        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
+        rac_matmul_micro_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    }
+}
+
+void rac_launch_tn_iters(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, float alpha, float beta,
+    int iters, hipStream_t stream)
+{
+    iters = _clamp_iters(iters);
+    if ((long long)M * N < 4096) {
+        dim3 block(TILE_S, TILE_S);
+        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
+        rac_matmul_small_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else if (M >= 128 && N >= 128 && K >= 128) {
+        dim3 block(BN8/TN8, BM8/TM8);
+        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
+        rac_matmul_micro8_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    } else {
+        dim3 block(BN/TN, BM/TM);
+        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
+        rac_matmul_micro_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta, iters);
+    }
+}
+
+/* ── Legacy ABI: default to iters=24 (fast sign-XOR path) ──────────────── */
+
 void rac_launch_nn(
     const float* A, const float* B, float* C,
     int M, int N, int K, float alpha, float beta,
     hipStream_t stream)
 {
-    if ((long long)M * N < 4096) {
-        dim3 block(TILE_S, TILE_S);
-        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
-        rac_matmul_small_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else if (M >= 128 && N >= 128 && K >= 128) {
-        dim3 block(BN8/TN8, BM8/TM8);
-        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
-        rac_matmul_micro8_nn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else {
-        dim3 block(BN/TN, BM/TM);
-        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
-        rac_matmul_micro_nn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    }
+    rac_launch_nn_iters(A, B, C, M, N, K, alpha, beta, 24, stream);
 }
 
 void rac_launch_nt(
@@ -635,19 +742,7 @@ void rac_launch_nt(
     int M, int N, int K, float alpha, float beta,
     hipStream_t stream)
 {
-    if ((long long)M * N < 4096) {
-        dim3 block(TILE_S, TILE_S);
-        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
-        rac_matmul_small_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else if (M >= 128 && N >= 128 && K >= 128) {
-        dim3 block(BN8/TN8, BM8/TM8);
-        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
-        rac_matmul_micro8_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else {
-        dim3 block(BN/TN, BM/TM);
-        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
-        rac_matmul_micro_nt_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    }
+    rac_launch_nt_iters(A, B, C, M, N, K, alpha, beta, 24, stream);
 }
 
 void rac_launch_tn(
@@ -655,19 +750,7 @@ void rac_launch_tn(
     int M, int N, int K, float alpha, float beta,
     hipStream_t stream)
 {
-    if ((long long)M * N < 4096) {
-        dim3 block(TILE_S, TILE_S);
-        dim3 grid((N + TILE_S-1)/TILE_S, (M + TILE_S-1)/TILE_S);
-        rac_matmul_small_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else if (M >= 128 && N >= 128 && K >= 128) {
-        dim3 block(BN8/TN8, BM8/TM8);
-        dim3 grid((N + BN8-1)/BN8, (M + BM8-1)/BM8);
-        rac_matmul_micro8_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    } else {
-        dim3 block(BN/TN, BM/TM);
-        dim3 grid((N + BN-1)/BN, (M + BM-1)/BM);
-        rac_matmul_micro_tn_k<<<grid, block, 0, stream>>>(A, B, C, M, N, K, alpha, beta);
-    }
+    rac_launch_tn_iters(A, B, C, M, N, K, alpha, beta, 24, stream);
 }
 
 } /* extern "C" */
