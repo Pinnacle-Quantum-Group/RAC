@@ -99,7 +99,21 @@ else
   issue "install tinygrad:  python3 bench/run_tinygrad.py --auto-install   (auto-venv on PEP 668)"
 fi
 
-# ── 4. huggingface_hub ─────────────────────────────────────────────────
+# ── 3.5. PyTorch + rac_torch (for GPU-path of bench_three_paths.py) ────
+TORCH_STATUS=""
+if python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null | grep -q True; then
+  TORCH_VER=$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null)
+  if python3 -c 'import rac_torch; assert rac_torch._rac_available()' 2>/dev/null; then
+    TORCH_STATUS="$TORCH_VER + rac_torch SFU kernels"
+  else
+    TORCH_STATUS="$TORCH_VER (rac_torch not built → torch.matmul fallback)"
+  fi
+fi
+if [[ -n "$TORCH_STATUS" ]]; then
+  row "PyTorch + GPU"       "✓" "$TORCH_STATUS"
+else
+  row "PyTorch + GPU"       "○" "skipped for bench_three_paths GPU column"
+fi
 HF_STATUS=""
 if python3 -c 'import huggingface_hub' 2>/dev/null; then
   HF_STATUS="system"

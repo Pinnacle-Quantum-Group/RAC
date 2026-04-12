@@ -73,6 +73,42 @@ TinyLlama uses 4 KV heads (GQA): 32 query heads share 4 key/value heads.
 | **prefill** | 128 (override `--prefill N`) | compute-bound GEMM | peak GFLOPS |
 | **decode** | 1 | memory-bound GEMV | token latency |
 
+### Three-path primitive bench (CPU ↔ GPU SFU ↔ GLU RTL)
+
+Every RAC primitive uses the same CORDIC algorithm. `bench_three_paths.py`
+measures each on all three substrates side-by-side:
+
+```bash
+python3 bench/bench_three_paths.py                 # default N=1M elements
+python3 bench/bench_three_paths.py --skip-gpu      # CPU + GLU only
+```
+
+Output:
+
+```
+  Op             CPU AVX2 CORDIC     GPU SFU path         GLU (ASIC proj)
+  ─────────────────────────────────────────────────────────────────────────
+  rac_rsqrt          ###  ns              ###  ns             0.62 ns
+  rac_exp            ###  ns              ###  ns             0.62 ns
+  rac_rope           ###  ns              ###  ns             0.62 ns
+  rac_sigmoid        ###  ns              ###  ns             0.62 ns
+
+  SGEMM  (512x512 @ 512x512, float32)
+    CPU AVX2+FMA CORDIC:        ##.## ms/call   ####.# GFLOPS
+    GPU rac_torch SFU:          ##.## ms/call   ####.# GFLOPS
+    GLU native CORDIC bank:     ##.## ms/call    600.0 GFLOPS  (432-engine projection)
+```
+
+- **CPU path** — `librac.so` built with `-mavx2 -mfma`; called via ctypes.
+  Shift-add dual-cell runs on AVX2 YMM lanes.
+- **GPU path** — if `torch.cuda.is_available()` and `rac_torch` is built,
+  the matmul row goes through `rac_torch.rac_matmul` (SFU-routed CORDIC);
+  scalar rows use `torch.rsqrt` / `torch.exp` / etc which are already
+  backed by the GPU's transcendental units.
+- **GLU path** — projected from `rtl/rac_cordic_core.v`: one CORDIC
+  result per clock per pipelined engine at 200 MHz. `--bank-size N`
+  overrides the default 8-engine bank.
+
 ### Status check — what's missing?
 
 Before running anything, inspect the environment:
