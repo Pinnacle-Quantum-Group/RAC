@@ -24,6 +24,7 @@ import torch
 from rac_torch import (
     RACRoPE, RACRMSNorm, RACLayerNorm, RACLlamaBlock,
     rac_set_precision, rac_get_precision,
+    rac_set_mode, rac_get_mode,
 )
 
 
@@ -131,17 +132,33 @@ def main():
         params = sum(p.numel() for p in block.parameters())
         print(f"  B={B} T={T} D={D} H={H}:  {t:7.3f} ms   params={params/1e6:.2f}M")
 
-    # ── Tunable precision ─────────────────────────────────────────────
-    print("\n── Tunable-precision sweep (RACLlamaBlock step) ──")
+    # ── Compute-mode A/B ──────────────────────────────────────────────
+    # Three kernel paths: FAST (sign-XOR FMA, hardware multiplier),
+    # CORDIC (iterative rotation port from rac_cuda.cu), SHIFTADD
+    # (integer ALU only, no FP multiplier). Same matmul input, very
+    # different silicon utilization.
+    print("\n── Compute-mode A/B (RACLlamaBlock step, iters=16) ──")
     block = RACLlamaBlock(d_model=256, n_heads=8, ff_dim=1024, max_seq_len=128).to(device)
     x = torch.randn(2, 64, 256, device=device)
+    rac_set_precision(16)
+    for mode in ('fast', 'cordic', 'shiftadd'):
+        rac_set_mode(mode)
+        t = safe_bench(f"mode={mode}",
+                        lambda: block(x, is_causal=True), args.iters, device)
+        if t is None: continue
+        print(f"  mode={mode:9s}  {t:7.3f} ms    (get={rac_get_mode()})")
+    rac_set_mode('fast')
+
+    # ── Tunable precision (mode=shiftadd shows the real cycle curve) ──
+    print("\n── Tunable-precision sweep (RACLlamaBlock, mode=shiftadd) ──")
+    rac_set_mode('shiftadd')
     for iters in [4, 8, 12, 16, 20, 24]:
         rac_set_precision(iters)
         t = safe_bench(f"iters={iters}",
                         lambda: block(x, is_causal=True), args.iters, device)
         if t is None: continue
         print(f"  iters={iters:2d}:  {t:7.3f} ms    (get={rac_get_precision()})")
-    rac_set_precision(16)
+    rac_set_precision(24); rac_set_mode('fast')
 
     print("\nperf harness done.")
 

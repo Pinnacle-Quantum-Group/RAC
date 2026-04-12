@@ -117,10 +117,11 @@ def _rac_has(op: str) -> bool:
     should fall back to the unfused path when a specific op is missing."""
     return _rac_available() and hasattr(_rac, op)
 
-# Does the compiled extension accept the tunable-precision `iters` kwarg?
-# Older .so builds don't. Probe once so we don't pay the TypeError cost on
-# every call.
+# Does the compiled extension accept the tunable-precision `iters` / `mode`
+# kwargs? Older .so builds don't. Probe once so we don't pay the TypeError
+# cost on every call.
 _RAC_ACCEPTS_ITERS = False
+_RAC_ACCEPTS_MODE  = False
 if _rac_available():
     try:
         _pa = torch.randn(4, 4, device='cuda', dtype=torch.float32)
@@ -128,6 +129,12 @@ if _rac_available():
         _ = _rac.matmul_forward(_pa, _pb, iters=24)
         torch.cuda.synchronize()
         _RAC_ACCEPTS_ITERS = True
+        try:
+            _ = _rac.matmul_forward(_pa, _pb, iters=24, mode=0)
+            torch.cuda.synchronize()
+            _RAC_ACCEPTS_MODE = True
+        except TypeError:
+            _RAC_ACCEPTS_MODE = False
         del _pa, _pb
     except TypeError:
         _RAC_ACCEPTS_ITERS = False
@@ -135,11 +142,12 @@ if _rac_available():
         _RAC_ACCEPTS_ITERS = False
 
 def _rac_kw(**kw):
-    """Build a kwargs dict for _rac calls, omitting iters if the extension
-    is too old to accept it."""
-    if _RAC_ACCEPTS_ITERS:
-        return kw
-    kw.pop('iters', None)
+    """Build a kwargs dict for _rac calls, dropping iters/mode if the
+    compiled extension is too old to accept them."""
+    if not _RAC_ACCEPTS_ITERS:
+        kw.pop('iters', None)
+    if not _RAC_ACCEPTS_MODE:
+        kw.pop('mode', None)
     return kw
 
 
@@ -171,7 +179,7 @@ class RACMatmulFunction(Function):
             # Pass per-call iters so the backward picks up the same value
             # used in forward and so the global knob is honored even if
             # set_cordic_iters isn't available in this build.
-            return _rac.matmul_forward(A, B, **_rac_kw(iters=_RAC_CORDIC_ITERS))
+            return _rac.matmul_forward(A, B, **_rac_kw(iters=_RAC_CORDIC_ITERS, mode=_RAC_CORDIC_MODE))
         return torch.matmul(A.float(), B.float()).to(A.dtype)
 
     @staticmethod
@@ -183,7 +191,7 @@ class RACMatmulFunction(Function):
             grads = _rac.matmul_backward(
                 grad_C.contiguous(), A, B,
                 ctx.needs_input_grad[0], ctx.needs_input_grad[1],
-                **_rac_kw(iters=_RAC_CORDIC_ITERS))
+                **_rac_kw(iters=_RAC_CORDIC_ITERS, mode=_RAC_CORDIC_MODE))
             if ctx.needs_input_grad[0]: grad_A = grads[0]
             if ctx.needs_input_grad[1]: grad_B = grads[1]
         else:
@@ -219,7 +227,7 @@ class RACLinearFunction(Function):
         if _rac_available() and input.is_cuda and input.dtype in (torch.float32, torch.float16, torch.bfloat16):
             bias_tensor = bias if bias is not None else torch.tensor([], device=input.device)
             return _rac.linear_forward(input, weight, bias_tensor,
-                                        **_rac_kw(iters=_RAC_CORDIC_ITERS))
+                                        **_rac_kw(iters=_RAC_CORDIC_ITERS, mode=_RAC_CORDIC_MODE))
 
         return F.linear(input.float(), weight.float(),
                         bias.float() if bias is not None else None).to(input.dtype)
@@ -232,7 +240,7 @@ class RACLinearFunction(Function):
         if _rac_available() and grad_output.is_cuda and grad_output.dtype in (torch.float32, torch.float16, torch.bfloat16):
             grads = _rac.linear_backward(
                 grad_output.contiguous(), input, weight, ctx.has_bias,
-                **_rac_kw(iters=_RAC_CORDIC_ITERS))
+                **_rac_kw(iters=_RAC_CORDIC_ITERS, mode=_RAC_CORDIC_MODE))
             if ctx.needs_input_grad[0]: grad_input  = grads[0]
             if ctx.needs_input_grad[1]: grad_weight = grads[1]
             if ctx.has_bias:            grad_bias   = grads[2]
@@ -992,14 +1000,77 @@ def benchmark_model(
 #   rac_set_precision(16)
 
 #
-# Default is 24 — that's the fast path (single sign-XOR FMA, hardware
-# multiplier engaged). Values below 24 select the shift-add path: no
-# hardware multiplier is used, the multiply is done in integer ALU via
-# conditional shift-adds. Slower on GPU (the multiplier is idle by
-# design), but the correct thing on a dedicated RAC ASIC.
+# Two orthogonal knobs:
+#
+#   RAC_CORDIC_ITERS (int, [1, 24], default 24)
+#     Iteration count. At mode=FAST this is ignored; at mode=CORDIC /
+#     SHIFTADD it controls the number of shift-add iterations per MAC.
+#
+#   RAC_CORDIC_MODE (str, default 'fast')
+#     'fast'      — sign-XOR + FMA. Hardware multiplier engaged. Production.
+#     'cordic'    — iterative CORDIC rotation (port of rac_cuda.cu).
+#                   * scale ops compile to FP multiplies on GPU; on a
+#                   RAC ASIC they're literal bit shifts.
+#     'shiftadd'  — pure integer shift-add multiply. No FP multiplier,
+#                   no FMA. Integer ALU only. Visible in rocprof as
+#                   VALUNativeInst rising, VALUFMAInst falling.
 _RAC_CORDIC_ITERS = int(os.environ.get('RAC_CORDIC_ITERS', '24'))
 
+MODE_FAST     = 0
+MODE_CORDIC   = 1
+MODE_SHIFTADD = 2
+
+_MODE_NAMES = {'fast': MODE_FAST, 'cordic': MODE_CORDIC, 'shiftadd': MODE_SHIFTADD,
+                0: MODE_FAST, 1: MODE_CORDIC, 2: MODE_SHIFTADD}
+
+def _resolve_mode(m):
+    if isinstance(m, int):
+        return m if m in (0, 1, 2) else MODE_FAST
+    if isinstance(m, str) and m.lower() in _MODE_NAMES:
+        return _MODE_NAMES[m.lower()]
+    raise ValueError(f"Unknown RAC mode: {m}. Use 'fast', 'cordic', or 'shiftadd'.")
+
+_RAC_CORDIC_MODE = _resolve_mode(os.environ.get('RAC_CORDIC_MODE', 'fast'))
+
 _warned_iters_unsupported = False
+_warned_mode_unsupported  = False
+
+def rac_set_mode(mode) -> None:
+    """
+    Select the compute path for RAC matmul / linear ops.
+
+      'fast'      — sign-XOR + single FMA per MAC. Hardware multiplier
+                    engaged. Production default.
+      'cordic'    — iterative CORDIC rotation (N = rac_get_precision()).
+                    Port of _rac_cordic_rotate_raw from rac_cuda.cu.
+                    On GPU the * scale ops compile to FP multiplies;
+                    on a RAC ASIC they're literal bit shifts.
+      'shiftadd'  — pure integer shift-add multiply. No FP multiplier,
+                    no FMA. Integer ALU only. Slower on GPU by design —
+                    that idle FMA unit is the pitch.
+
+    Accepts strings or rac_torch.MODE_FAST / MODE_CORDIC / MODE_SHIFTADD.
+    """
+    global _RAC_CORDIC_MODE, _warned_mode_unsupported
+    _RAC_CORDIC_MODE = _resolve_mode(mode)
+    if _RAC_AVAILABLE and hasattr(_rac, 'set_cordic_mode'):
+        try:
+            _rac.set_cordic_mode(_RAC_CORDIC_MODE)
+        except Exception:
+            pass
+    elif _RAC_AVAILABLE and not _RAC_ACCEPTS_MODE and not _warned_mode_unsupported:
+        warnings.warn(
+            "The loaded rac_cuda_ext does not support the mode selector — "
+            "rebuild with `bash build_hip.sh` (HIP) or `pip install -e .` "
+            "(CUDA) to pick up per-call mode. The Python-level mode is "
+            "recorded but the kernel will use its compile-time default.",
+            RuntimeWarning, stacklevel=2,
+        )
+        _warned_mode_unsupported = True
+
+def rac_get_mode() -> int:
+    """Return the current mode (0=FAST, 1=CORDIC, 2=SHIFTADD)."""
+    return _RAC_CORDIC_MODE
 
 def rac_set_precision(iters: int) -> None:
     """
@@ -1330,6 +1401,9 @@ def rac_info():
     print(f"  Kernel fusion:       matmul+bias+activation (FusedRACLinear)")
     print(f"  Transformer ops:     RACFusedQKV, RACFusedFFN, RACRoPE, RACRoPEAttention, RACLlamaBlock")
     print(f"  Norm ops:            RACRMSNorm, RACLayerNorm (CORDIC rsqrt)")
+    _mode_name = {0: 'fast', 1: 'cordic', 2: 'shiftadd'}.get(_RAC_CORDIC_MODE, '?')
     print(f"  CORDIC iters:        {_RAC_CORDIC_ITERS} (tunable via rac_set_precision)")
+    print(f"  Compute mode:        {_mode_name} (tunable via rac_set_mode)")
     print(f"  Ext accepts iters:   {_RAC_ACCEPTS_ITERS}")
+    print(f"  Ext accepts mode:    {_RAC_ACCEPTS_MODE}")
     print(f"  Adaptive threshold:  {_RAC_MIN_ELEMENTS} elements (RAC_MIN_ELEMENTS)")
