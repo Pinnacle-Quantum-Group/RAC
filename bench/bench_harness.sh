@@ -212,22 +212,30 @@ run_llama() {
   [[ "$SKIP_LLAMA" -eq 1 ]] && return 0
   ARGS=()
   [[ "$AUTO_BUILD" -eq 1 ]] && ARGS+=(--auto-build)
-  LLAMA_JSON=$(bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" 2>/dev/null) || {
-    echo "  [WARN] llama.cpp run failed; skipping" >&2
-    bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" >&2 || true
-    return 1
-  }
+  # Capture stdout (JSON) into a tempfile; let stderr flow to the user
+  # so they see GGUF download progress + llama-bench model-load output.
+  local out; out=$(mktemp)
+  if bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" > "$out"; then
+    LLAMA_JSON=$(cat "$out")
+  else
+    echo "  [WARN] llama.cpp run failed; see stderr above" >&2
+    LLAMA_JSON=""
+  fi
+  rm -f "$out"
 }
 
 run_tiny() {
   [[ "$SKIP_TINY" -eq 1 ]] && return 0
   ARGS=(--layer "$LAYER")
   [[ "$AUTO_INSTALL" -eq 1 ]] && ARGS+=(--auto-install)
-  TINY_JSON=$(python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" 2>/dev/null) || {
-    echo "  [WARN] tinygrad run failed; skipping" >&2
-    python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" >&2 || true
-    return 1
-  }
+  local out; out=$(mktemp)
+  if python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" > "$out"; then
+    TINY_JSON=$(cat "$out")
+  else
+    echo "  [WARN] tinygrad run failed; see stderr above" >&2
+    TINY_JSON=""
+  fi
+  rm -f "$out"
 }
 
 echo "  ── RAC ──────────────────────────────────" >&2; run_rac   || true
