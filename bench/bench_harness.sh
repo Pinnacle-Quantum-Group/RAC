@@ -196,25 +196,27 @@ run_rac() {
     echo "         cmake --build . --target bench_rac_transformer -j\$(nproc)" >&2
     return 1
   fi
-  # Quick sanity: ldd should show libgomp (OpenMP) on a proper build.
-  # If it doesn't, the -fopenmp / -march=native flags weren't used and
-  # the bench will under-report RAC's CPU performance by 10-50x.
   if command -v ldd >/dev/null 2>&1; then
     if ! ldd "$RAC_BIN" 2>/dev/null | grep -q libgomp; then
       echo "  [WARN] $RAC_BIN is not linked against libgomp — OpenMP pragmas are no-ops." >&2
-      echo "         This under-reports RAC perf. Rebuild via:" >&2
-      echo "         $0 --auto-build   (or rm -rf lib/build && rebuild with cmake)" >&2
     fi
   fi
   : "${OMP_NUM_THREADS:=$(nproc 2>/dev/null || echo 1)}"
   export OMP_NUM_THREADS
-  echo "  [info] OMP_NUM_THREADS=$OMP_NUM_THREADS" >&2
-  # The C bench prints a human-readable block; parse the three lines we need.
-  OUT=$("$RAC_BIN" --safetensors "$SAFET" --layer "$LAYER" \
-                   --prefill-iters 20 --decode-iters 100 2>/dev/null)
+  echo "  [info] OMP_NUM_THREADS=$OMP_NUM_THREADS  mode=full-model" >&2
+
+  # Run the FULL-MODEL bench (all 22 layers + KV cache). This gives numbers
+  # directly comparable to llama-bench's full-model tok/s — no n_layers
+  # multiplication anywhere. --layer is ignored in full-model mode.
+  OUT=$("$RAC_BIN" --safetensors "$SAFET" --full-model \
+                   --prefill-iters 5 --decode-iters 50 2>/dev/null)
   echo "$OUT" >&2
+
+  # Parse the full-model output format:
+  #   prefill T=128:   X.XX ms/token   Y.YY tok/s   Z.Z GFLOPS
+  #   decode  T=1:     X.XX ms/token   Y.YY tok/s   Z.Z GFLOPS
   local pre_ms pre_tps pre_gf dec_ms dec_tps dec_gf
-  pre_ms=$(echo "$OUT" | awk '/prefill T=/{print $(NF-5)}' | head -1)
+  pre_ms=$(echo "$OUT"  | awk '/prefill T=/{print $(NF-5)}' | head -1)
   pre_tps=$(echo "$OUT" | awk '/prefill T=/{print $(NF-3)}' | head -1)
   pre_gf=$(echo "$OUT"  | awk '/prefill T=/{print $(NF-1)}' | head -1)
   dec_ms=$(echo "$OUT"  | awk '/decode  T=1:/{print $(NF-5)}' | head -1)
@@ -223,13 +225,15 @@ run_rac() {
   RAC_JSON=$(cat <<JSON
 {"framework": "RAC",
  "model": "$MODEL_ID",
- "layer": $LAYER,
- "prefill_ms_per_layer":    ${pre_ms:-0},
- "prefill_tok_s_per_layer": ${pre_tps:-0},
- "prefill_gflops_per_layer":${pre_gf:-0},
- "decode_ms_per_layer":     ${dec_ms:-0},
- "decode_tok_s_per_layer":  ${dec_tps:-0},
- "decode_gflops_per_layer": ${dec_gf:-0}}
+ "quant": "F32",
+ "scope": "full_model",
+ "n_layers": 22,
+ "prefill_ms_per_token": ${pre_ms:-0},
+ "prefill_tok_s_model":  ${pre_tps:-0},
+ "prefill_gflops":       ${pre_gf:-0},
+ "decode_ms_per_token":  ${dec_ms:-0},
+ "decode_tok_s_model":   ${dec_tps:-0},
+ "decode_gflops":        ${dec_gf:-0}}
 JSON
 )
 }
@@ -293,29 +297,59 @@ def num(x, default="—"):
     try: return f"{float(x):.2f}"
     except: return default
 
-print("\n## TinyLlama-1.1B-Chat-v1.0 — single-layer inference\n")
-print("| framework | prefill tok/s/layer | prefill ms/layer | decode tok/s/layer | decode ms/layer |")
-print("|---|---|---|---|---|")
+def pp_tps(r):
+    """Full-model prefill tok/s, preferring measured over derived."""
+    return (r.get("prefill_tok_s_model")
+            or r.get("prefill_tok_s_per_layer")  # old RAC schema
+            or 0)
+
+def tg_tps(r):
+    return (r.get("decode_tok_s_model")
+            or r.get("decode_tok_s_per_layer")
+            or 0)
+
+print("\n## TinyLlama-1.1B-Chat-v1.0 — full-model inference\n")
+print("| framework | quant | threads | prefill tok/s | prefill ms/tok | decode tok/s | decode ms/tok |")
+print("|---|---|---|---|---|---|---|")
 for r in rows:
-    print("| {fw} | {pp_t} | {pp_ms} | {d_t} | {d_ms} |".format(
+    pp_t = pp_tps(r)
+    tg_t = tg_tps(r)
+    pp_ms = (1000.0 / pp_t) if pp_t else 0
+    tg_ms = (1000.0 / tg_t) if tg_t else 0
+    print("| {fw} | {q} | {t} | {pp_t} | {pp_ms} | {d_t} | {d_ms} |".format(
         fw    = r.get("framework","?"),
-        pp_t  = num(r.get("prefill_tok_s_per_layer")),
-        pp_ms = num(r.get("prefill_ms_per_layer")),
-        d_t   = num(r.get("decode_tok_s_per_layer")),
-        d_ms  = num(r.get("decode_ms_per_layer")),
+        q     = r.get("quant", "?"),
+        t     = r.get("threads", "—"),
+        pp_t  = num(pp_t),
+        pp_ms = num(pp_ms),
+        d_t   = num(tg_t),
+        d_ms  = num(tg_ms),
     ))
 
 # Ratio row vs RAC (if present)
 rac = next((r for r in rows if r.get("framework") == "RAC"), None)
 if rac is not None and len(rows) > 1:
-    print("\n**Ratios vs RAC (higher = framework is faster than RAC):**\n")
-    print("| framework | prefill× | decode× |")
-    print("|---|---|---|")
+    rac_pp = float(pp_tps(rac) or 1)
+    rac_tg = float(tg_tps(rac) or 1)
+    print("\n**Ratios vs RAC (higher = framework is faster than RAC at the same workload):**\n")
+    print("| framework | prefill× | decode× | quant |")
+    print("|---|---|---|---|")
     for r in rows:
         if r.get("framework") == "RAC": continue
         try:
-            pp = float(r.get("prefill_tok_s_per_layer", 0)) / float(rac.get("prefill_tok_s_per_layer", 1) or 1)
-            dd = float(r.get("decode_tok_s_per_layer", 0))  / float(rac.get("decode_tok_s_per_layer", 1) or 1)
-            print(f"| {r['framework']} | {pp:.2f}× | {dd:.2f}× |")
-        except: pass
+            pp = float(pp_tps(r) or 0) / rac_pp
+            dd = float(tg_tps(r) or 0) / rac_tg
+            print(f"| {r['framework']} | {pp:.2f}× | {dd:.2f}× | {r.get('quant','?')} |")
+        except Exception: pass
+
+# Footnote: make the workload boundaries explicit so nobody re-invents the
+# previous × n_layers lie.
+print("\n_**Notes on comparability:**_")
+print("- All numbers are **full-model** throughput (one token end-to-end through "
+      "the whole 22-layer TinyLlama stack), not per-layer estimates.")
+print("- RAC runs F32. llama.cpp's default Q8_0 uses 4x less memory bandwidth — "
+      "for a true apples-to-apples compare, feed llama-bench an F32 GGUF and "
+      "match OMP_NUM_THREADS.")
+print("- Decode numbers assume a warm KV cache (RAC reseeds the cache with a "
+      "T=128 prefill before timing decode; llama-bench does the same).")
 PY
