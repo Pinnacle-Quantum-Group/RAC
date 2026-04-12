@@ -75,6 +75,51 @@ def ensure_tinygrad(auto_install: bool) -> None:
     sys.exit(2)
 
 
+def _available_backends():
+    """List the ops_* backends the installed tinygrad actually ships.
+    Older tinygrad had ops_clang; newer versions renamed it to ops_cpu.
+    Needed for graceful fallback when the yaml config says CLANG."""
+    try:
+        import pkgutil, tinygrad.runtime
+        return {m.name.replace("ops_", "").upper()
+                for m in pkgutil.iter_modules(tinygrad.runtime.__path__)
+                if m.name.startswith("ops_")}
+    except Exception:
+        return set()
+
+
+def _pick_device(requested: str) -> str:
+    """
+    Map the YAML-requested device to one the installed tinygrad actually has.
+
+      - 'CLANG' is the old CPU JIT; on tinygrad 0.11+ it was renamed to 'CPU'.
+      - 'HIP' / 'AMD' on a Navi 33 box is preferable to CPU if available.
+      - Fall back to 'CPU' or 'PYTHON' as last resorts.
+    """
+    avail = _available_backends()
+    if not avail:
+        return requested.upper()
+
+    requested_up = requested.upper()
+    # Honor explicit request when possible.
+    if requested_up in avail:
+        return requested_up
+
+    # CLANG → CPU rename on 0.11+.
+    if requested_up == "CLANG" and "CPU" in avail:
+        print("  [info] tinygrad renamed CLANG -> CPU; using CPU backend", file=sys.stderr)
+        return "CPU"
+
+    # Prefer GPU over CPU for larger models if we can detect one.
+    for preferred in ("HIP", "AMD", "CUDA", "NV", "METAL", "CPU", "CLANG", "PYTHON"):
+        if preferred in avail:
+            print(f"  [info] requested '{requested}' unavailable; using '{preferred}' (avail: {sorted(avail)})",
+                  file=sys.stderr)
+            return preferred
+
+    return requested_up  # let tinygrad raise its own error
+
+
 def fetch_weights(model_id: str) -> pathlib.Path:
     """Use fetch_model.py to pull the safetensors file; return its path."""
     out = subprocess.check_output(
@@ -190,11 +235,20 @@ def main():
 
     # Apply env knobs from config
     # (Minimal: OMP_NUM_THREADS + device)
-    os.environ.setdefault("OMP_NUM_THREADS", "16")
+    os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 16))
+    # TINYGRAD_CLANG_PARALLEL was the old flag for the CLANG backend;
+    # the equivalent on 0.11+ is CPU_PARALLEL. Set both, harmless.
     os.environ.setdefault("TINYGRAD_CLANG_PARALLEL", "1")
-    os.environ["DEV"] = cfg["device"]
+    os.environ.setdefault("CPU_PARALLEL", "1")
 
     ensure_tinygrad(args.auto_install)
+
+    # Only after tinygrad is importable can we pick a backend that
+    # actually exists in this install.
+    dev = _pick_device(cfg["device"])
+    os.environ["DEV"] = dev
+    cfg["device"] = dev
+
     from tinygrad import Tensor
 
     weights = fetch_weights(cfg["hf_model_id"])
