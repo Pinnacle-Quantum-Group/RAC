@@ -20,6 +20,7 @@
 
 #define _POSIX_C_SOURCE 200112L
 #include "rac_alu.h"
+#include "rac_ucode.h"
 #include "rac_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -445,6 +446,40 @@ int main(int argc, char **argv) {
 #endif
 
         free(a); free(b);
+    }
+
+    /* ── 13. Microcode interpreter vs direct ALU ───────────────────── */
+    banner("13. Microcode interpreter (ISS) vs direct ALU call");
+    {
+        const int N = 800000;
+
+        /* Direct ALU: rac_alu_rotate */
+        double t0 = now_sec();
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++) {
+            rac_vec2 r = rac_alu_rotate((rac_vec2){1.0f, 0.0f},
+                                        (float)(i & 127) * 0.01f);
+            acc += r.x + r.y;
+        }
+        double s_direct = now_sec() - t0; SINK(acc);
+
+        /* Microcode path: set up ALU, run the 19-instruction rotate ROM. */
+        t0 = now_sec();
+        acc = 0.0f;
+        for (int i = 0; i < N; i++) {
+            rac_alu_state s;
+            rac_alu_reset(&s);
+            rac_alu_load(&s, 1.0f * RAC_ALU_K_INV, 0.0f * RAC_ALU_K_INV,
+                         (float)(i & 127) * 0.01f);
+            (void)rac_ucore_execute(&s, rac_ucode_rom_rotate, 19);
+            acc += s.x + s.y;
+        }
+        double s_ucode = now_sec() - t0; SINK(acc);
+
+        report_pair("rotate: ALU vs microcode",
+                    s_direct, N, s_ucode, N);
+        printf("  (microcode overhead = interpreter decode; on synthesized\n");
+        printf("   Xrac hardware the ROM *is* the state machine — zero overhead.)\n");
     }
 
     /* ── 9. exp argument reduction accuracy ────────────────────────── */
