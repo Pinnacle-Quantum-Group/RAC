@@ -41,6 +41,12 @@ for arg in "$@"; do
   esac
 done
 
+# Run configure.sh up front: auto-detect tools + update YAMLs with the
+# resolved llama-bench path / thread count. Silent JSON output.
+if [[ -x "${HERE}/configure.sh" ]]; then
+  "${HERE}/configure.sh" --quiet >/dev/null 2>&1 || true
+fi
+
 # Auto-detect the RAC bench binary (built via cmake in lib/build)
 if [[ -z "$BIN_DIR" ]]; then
   for cand in "${HERE}/../lib/build" "${HERE}/../build" "/tmp/rac_build"; do

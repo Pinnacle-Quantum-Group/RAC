@@ -73,12 +73,31 @@ TinyLlama uses 4 KV heads (GQA): 32 query heads share 4 key/value heads.
 | **prefill** | 128 (override `--prefill N`) | compute-bound GEMM | peak GFLOPS |
 | **decode** | 1 | memory-bound GEMV | token latency |
 
+### Status check — what's missing?
+
+Before running anything, inspect the environment:
+
+```bash
+./bench/configure.sh
+```
+
+Prints a table of every component (RAC binary, llama-bench, tinygrad,
+huggingface_hub, cached weights, thread count) with ✓ / ⚠ / ✗ and a
+one-liner for anything that's missing. Also rewrites
+`configs/llama_cpp.yaml` with the detected `llama-bench` path + thread
+count, so `run_llama_cpp.sh` picks them up automatically. Idempotent —
+safe to re-run.
+
 ### Running all three frameworks (one command)
 
 ```bash
 # On your box, from the repo root:
 ./bench/bench_harness.sh --auto-install --auto-build --layer 0
 ```
+
+`bench_harness.sh` internally runs `configure.sh --quiet` up front so
+paths stay current even if you've just installed `llama-bench` or
+cleared the cache.
 
 That command:
 1. Fetches TinyLlama weights into `~/.cache/rac_bench/` (via `fetch_model.py`)
