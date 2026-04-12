@@ -1,35 +1,26 @@
-# tinygrad comparison config (fill in to enable)
+# tinygrad comparison config — TinyLlama-1.1B-Chat-v1.0
 #
-# tinygrad runs stock HF weights in Python. Like llama.cpp, its natural
-# granularity is whole-model — so the comparison strategy is the same
-# two options (full model ÷ n_layers, or build a 1-layer config).
-#
-# The tinygrad examples/llama.py is the usual starting point. Pin to
-# a known-good commit (tinygrad moves fast).
+# run_tinygrad.py reads this and auto-pip-installs tinygrad if missing.
+# Uses tinygrad's CLANG (CPU JIT) backend for a fair CPU-vs-CPU compare
+# against RAC on the Ryzen 9 5950X.
 
-python: /usr/bin/python3
-tinygrad_path: /path/to/tinygrad
-tinygrad_commit: main     # or a specific SHA for reproducibility
-
-# OPTION A — full TinyLlama, divide by n_layers
 hf_model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Per-layer scaling divisor (same as llama.cpp config)
 n_layers_divisor: 22
 
-# OPTION B — custom 1-layer config (you'd build a small nn.Module inline)
-use_single_layer: false
-
-# Scenarios — match RAC bench
+# Scenarios
 prefill_tokens: 128
-decode_iters:   100        # number of single-token passes for steady-state
+decode_iters:   100
 
-# Device: CLANG (CPU JIT), LLVM, or CPU.
-# Use CLANG for a fair CPU-vs-CPU comparison with RAC on your Ryzen 9 5950X.
+# Backend: CLANG (CPU JIT, fastest CPU), LLVM, PYTHON (debug), CUDA, HIP
 device: CLANG
 
 # Precision
-dtype: float32             # or float16 — RAC is FP32 so FP32 is apples-to-apples
+dtype: float32        # float32 for apples-to-apples with RAC
 
-# Threading control in tinygrad is via env vars; set these before invoking
+# Threading env vars (applied via os.environ before tinygrad import)
 env:
   OMP_NUM_THREADS: 16
   TINYGRAD_CLANG_PARALLEL: 1
+  JIT: 1
