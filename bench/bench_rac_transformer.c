@@ -406,10 +406,11 @@ int main(int argc, char **argv) {
     printf("  decode  T=1:    %7.2f ms/layer   %8.1f tok/s   %7.1f GFLOPS\n",
            ms_dec, tps_dec, gflops_dec);
 
-    printf("\n── Framework comparison hooks ──────────────────────\n");
-    printf("  llama.cpp:  see bench/configs/llama_cpp.yaml  (fill in paths)\n");
-    printf("  tinygrad:   see bench/configs/tinygrad.yaml   (fill in paths)\n");
-    printf("  Fetch HF weights:  python3 bench/fetch_model.py --model REPO_ID\n");
+    printf("\n── Framework comparison ────────────────────────────\n");
+    printf("  To compare against llama.cpp + tinygrad on this hardware:\n");
+    printf("    ./bench/configure.sh                       # status check + auto-fill configs\n");
+    printf("    ./bench/bench_harness.sh --auto-install --auto-build\n");
+    printf("  See bench/README.md for per-framework invocation.\n");
 
     free_weights(&w);
     bufs_free(&b);

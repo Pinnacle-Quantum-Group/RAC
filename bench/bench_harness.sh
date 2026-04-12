@@ -41,6 +41,12 @@ for arg in "$@"; do
   esac
 done
 
+# Run configure.sh up front: auto-detect tools + update YAMLs with the
+# resolved llama-bench path / thread count. Silent JSON output.
+if [[ -x "${HERE}/configure.sh" ]]; then
+  "${HERE}/configure.sh" --quiet >/dev/null 2>&1 || true
+fi
+
 # Auto-detect the RAC bench binary (built via cmake in lib/build)
 if [[ -z "$BIN_DIR" ]]; then
   for cand in "${HERE}/../lib/build" "${HERE}/../build" "/tmp/rac_build"; do
@@ -53,6 +59,12 @@ fi
 RAC_BIN="${BIN_DIR}/bench_rac_transformer"
 
 # ── Fetch weights once (both RAC and tinygrad pull the same files) ─────
+# If --auto-install was requested, let fetch_model.py + run_tinygrad.py
+# bootstrap a venv under $HF_HOME/rac_bench/venv (bypasses PEP 668 on
+# Debian/Ubuntu 3.12+ system Python).
+if [[ "$AUTO_INSTALL" -eq 1 ]]; then
+  export HF_BOOTSTRAP_VENV=1
+fi
 MODEL_ID="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 echo "  fetching $MODEL_ID (idempotent, cached)..." >&2
 MODEL_DIR=$(python3 "${HERE}/fetch_model.py" --model "$MODEL_ID") || {

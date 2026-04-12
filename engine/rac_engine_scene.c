@@ -85,14 +85,9 @@ rac_phys_vec3 rac_mat4_transform_point(rac_mat4 m, rac_phys_vec3 p)
 
 rac_phys_vec3 rac_mat4_transform_dir(rac_mat4 m, rac_phys_vec3 d)
 {
-    /* Transform direction: M * [d, 0] — ignore translation */
-    rac_phys_vec3 out;
-    rac_vec2 dx = { d.x, d.y };
-
-    rac_vec2 r0 = { m.m[0][0], m.m[0][1] };
-    out.x = rac_dot(r0, dx) + m.m[0][2] * d.z;  /* can't avoid one here, but we use rac_project below */
-
-    /* Better: use rac_phys_mat3_mul_vec3 which is RAC-native */
+    /* Transform direction: the upper 3x3 block times d (ignoring translation).
+     * The RAC-native path is rac_phys_mat3_mul_vec3, so we just pack the
+     * 3x3 block and hand it over. */
     rac_phys_mat3 upper;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
@@ -263,9 +258,12 @@ int rac_scene_load(rac_ecs_world *ecs, rac_scene_graph *sg,
     for (uint32_t i = 0; i < hdr.num_entities; i++) {
         uint32_t id, mask;
         rac_transform_component tc;
-        fread(&id, sizeof(uint32_t), 1, f);
-        fread(&mask, sizeof(uint32_t), 1, f);
-        fread(&tc, sizeof(rac_transform_component), 1, f);
+        if (fread(&id,   sizeof(uint32_t),                 1, f) != 1 ||
+            fread(&mask, sizeof(uint32_t),                 1, f) != 1 ||
+            fread(&tc,   sizeof(rac_transform_component),  1, f) != 1) {
+            fclose(f);
+            return -3;          /* truncated or unreadable entity block */
+        }
 
         if (id < RAC_ECS_MAX_ENTITIES) {
             ecs->alive[id] = 1;
@@ -278,8 +276,11 @@ int rac_scene_load(rac_ecs_world *ecs, rac_scene_graph *sg,
 
     for (uint32_t i = 0; i < hdr.num_parent_links; i++) {
         uint32_t child, parent;
-        fread(&child, sizeof(uint32_t), 1, f);
-        fread(&parent, sizeof(uint32_t), 1, f);
+        if (fread(&child,  sizeof(uint32_t), 1, f) != 1 ||
+            fread(&parent, sizeof(uint32_t), 1, f) != 1) {
+            fclose(f);
+            return -4;          /* truncated or unreadable parent-link block */
+        }
         rac_scene_set_parent(sg, child, parent);
     }
 

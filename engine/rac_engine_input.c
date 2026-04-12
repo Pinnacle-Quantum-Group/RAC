@@ -77,7 +77,10 @@ void rac_input_poll(rac_input_system *input)
 
         if (c == 27) {
             rac_input_inject_key(input, RAC_KEY_ESCAPE, 1);
-        } else if (c < RAC_MAX_KEYS) {
+        } else {
+            /* c is unsigned char ∈ [0, 255]; RAC_MAX_KEYS == 256 so the
+             * old `c < RAC_MAX_KEYS` bounds check was a tautology. The
+             * type itself enforces the bound. */
             rac_input_inject_key(input, (rac_keycode)c, 1);
         }
     }

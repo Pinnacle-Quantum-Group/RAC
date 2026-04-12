@@ -121,8 +121,8 @@ static void test_wav_output(void)
     /* Verify RIFF header */
     FILE *f = fopen("/tmp/rac_test_audio.wav", "rb");
     CHECK(f != NULL, "file exists");
-    char riff[4];
-    fread(riff, 1, 4, f);
+    char riff[4] = {0};
+    CHECK(fread(riff, 1, 4, f) == 4, "RIFF header readable");
     CHECK(riff[0] == 'R' && riff[1] == 'I' && riff[2] == 'F' && riff[3] == 'F',
           "valid RIFF header");
     fclose(f);

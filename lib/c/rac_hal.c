@@ -94,15 +94,14 @@ static void _probe_x86(rac_hw_profile *p) {
         p->avx512_throttle = 1; /* Skylake throttles frequency on AVX-512 */
     }
 
-    /* Cache detection: try Intel leaf 4 first, then AMD leaf 0x8000001D */
-    int cache_found = 0;
+    /* Cache detection: try Intel leaf 4 first, then AMD leaf 0x8000001D.
+     * Success is tested later via (p->cache.l1d_size_kb == 0). */
 
     /* Intel: CPUID leaf 4 */
     for (int idx = 0; idx < 16; idx++) {
         __cpuid_count(4, idx, eax, ebx, ecx, edx);
         int type = eax & 0x1F;
         if (type == 0) break;
-        cache_found = 1;
 
         int level = (eax >> 5) & 0x7;
         int line_size = (ebx & 0xFFF) + 1;
@@ -128,7 +127,6 @@ static void _probe_x86(rac_hw_profile *p) {
             __cpuid_count(0x8000001D, idx, eax, ebx, ecx, edx);
             int type = eax & 0x1F;
             if (type == 0) break;
-            cache_found = 1;
 
             int level = (eax >> 5) & 0x7;
             int line_size = (ebx & 0xFFF) + 1;

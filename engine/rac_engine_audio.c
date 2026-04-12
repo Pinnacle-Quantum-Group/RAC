@@ -51,9 +51,12 @@ int rac_audio_load_wav(rac_audio_engine *audio, const char *path)
     /* Read RIFF header */
     char riff[4];
     uint32_t file_size, fmt_tag;
-    fread(riff, 1, 4, f);
-    fread(&file_size, 4, 1, f);
-    fread(&fmt_tag, 4, 1, f); /* "WAVE" */
+    if (fread(riff,       1, 4, f) != 4 ||
+        fread(&file_size, 4, 1, f) != 1 ||
+        fread(&fmt_tag,   4, 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
 
     if (riff[0] != 'R' || riff[1] != 'I' || riff[2] != 'F' || riff[3] != 'F') {
         fclose(f);
@@ -73,28 +76,37 @@ int rac_audio_load_wav(rac_audio_engine *audio, const char *path)
         if (fread(&chunk_size, 4, 1, f) != 1) break;
 
         if (chunk_id[0] == 'f' && chunk_id[1] == 'm' && chunk_id[2] == 't') {
-            fread(&audio_format, 2, 1, f);
-            fread(&num_channels, 2, 1, f);
-            fread(&sample_rate, 4, 1, f);
+            if (fread(&audio_format,    2, 1, f) != 1 ||
+                fread(&num_channels,    2, 1, f) != 1 ||
+                fread(&sample_rate,     4, 1, f) != 1) {
+                fclose(f); return -1;
+            }
             fseek(f, 6, SEEK_CUR); /* skip byte rate + block align */
-            fread(&bits_per_sample, 2, 1, f);
+            if (fread(&bits_per_sample, 2, 1, f) != 1) { fclose(f); return -1; }
             if (chunk_size > 16) fseek(f, chunk_size - 16, SEEK_CUR);
         } else if (chunk_id[0] == 'd' && chunk_id[1] == 'a' && chunk_id[2] == 't' && chunk_id[3] == 'a') {
             if (bits_per_sample == 16) {
                 num_samples = chunk_size / (2 * num_channels);
                 pcm_data = (int16_t *)malloc(num_samples * sizeof(int16_t));
+                if (!pcm_data) { fclose(f); return -1; }
                 if (num_channels == 1) {
-                    fread(pcm_data, 2, num_samples, f);
+                    if (fread(pcm_data, 2, num_samples, f) != (size_t)num_samples) {
+                        free(pcm_data); fclose(f); return -1;
+                    }
                 } else {
                     /* Downmix stereo to mono */
                     for (int i = 0; i < num_samples; i++) {
                         int16_t l, r;
-                        fread(&l, 2, 1, f);
-                        fread(&r, 2, 1, f);
+                        if (fread(&l, 2, 1, f) != 1 ||
+                            fread(&r, 2, 1, f) != 1) {
+                            free(pcm_data); fclose(f); return -1;
+                        }
                         pcm_data[i] = (int16_t)((l + r) / 2);
                         for (int ch = 2; ch < num_channels; ch++) {
                             int16_t dummy;
-                            fread(&dummy, 2, 1, f);
+                            if (fread(&dummy, 2, 1, f) != 1) {
+                                free(pcm_data); fclose(f); return -1;
+                            }
                         }
                     }
                 }
@@ -333,9 +345,11 @@ void rac_audio_mix(rac_audio_engine *audio)
         float l = left[i] * audio->master_volume;
         float r = right[i] * audio->master_volume;
 
-        /* Clamp */
-        if (l > 1.0f) l = 1.0f; if (l < -1.0f) l = -1.0f;
-        if (r > 1.0f) r = 1.0f; if (r < -1.0f) r = -1.0f;
+        /* Clamp to [-1, 1] */
+        if (l >  1.0f) l =  1.0f;
+        if (l < -1.0f) l = -1.0f;
+        if (r >  1.0f) r =  1.0f;
+        if (r < -1.0f) r = -1.0f;
 
         audio->output_buffer[i * 2 + 0] = (int16_t)(l * 32767.0f);
         audio->output_buffer[i * 2 + 1] = (int16_t)(r * 32767.0f);
