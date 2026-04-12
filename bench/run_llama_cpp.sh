@@ -39,11 +39,26 @@ yaml_get() {
 
 BIN=$(yaml_get binary "$CONFIG" "")
 GGUF_REPO=$(yaml_get gguf_repo "$CONFIG" "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF")
+PRECISION=$(yaml_get precision "$CONFIG" "f32")
+# Precision can also be overridden by the env var RAC_LLAMA_QUANT.
+PRECISION="${RAC_LLAMA_QUANT:-$PRECISION}"
+GGUF_FILE_Q8_0=$(yaml_get gguf_file_q8_0 "$CONFIG" "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
+GGUF_FILE_F32=$(yaml_get gguf_file_f32  "$CONFIG" "tinyllama-1.1b-chat-v1.0.F32.gguf")
 GGUF_FILE=$(yaml_get gguf_file "$CONFIG" "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
+# Pick filename by precision; fall back to generic gguf_file if both empty.
+case "$PRECISION" in
+  f32|F32|fp32)  GGUF_FILE="$GGUF_FILE_F32"; QUANT="F32" ;;
+  q8_0|Q8_0)     GGUF_FILE="$GGUF_FILE_Q8_0"; QUANT="Q8_0" ;;
+  *)             QUANT="$PRECISION" ;;  # pass-through for user-defined quants
+esac
 N_LAYERS=$(yaml_get n_layers_divisor "$CONFIG" "22")
 PREFILL=$(yaml_get prefill_tokens "$CONFIG" "128")
 DECODE=$(yaml_get decode_tokens "$CONFIG" "128")
-THREADS=$(yaml_get threads "$CONFIG" "16")
+THREADS_RAW=$(yaml_get threads "$CONFIG" "auto")
+case "$THREADS_RAW" in
+  auto|AUTO) THREADS="$(nproc 2>/dev/null || echo 16)" ;;
+  *)         THREADS="$THREADS_RAW" ;;
+esac
 REPEATS=$(yaml_get repeats "$CONFIG" "3")
 
 # ── Locate llama-bench ───────────────────────────────────────────────────
@@ -89,16 +104,61 @@ EOF
   fi
 fi
 
-# ── Fetch the GGUF (idempotent — fetch_model.py caches) ──────────────────
-echo "  fetching GGUF: ${GGUF_REPO}/${GGUF_FILE} (≈1.1 GB first time, cached after)..." >&2
-GGUF_PATH=$(python3 "${HERE}/fetch_model.py" \
-              --model "${GGUF_REPO}" --file "${GGUF_FILE}")
+# ── Fetch / produce the GGUF ─────────────────────────────────────────────
+# Q8_0 is a simple HuggingFace download from TheBloke.
+# F32 is not always published as GGUF — in that case we convert the
+# safetensors we already cached for the RAC bench using llama.cpp's
+# convert_hf_to_gguf.py. One-time ~8 GB conversion, cached afterwards.
+get_f32_gguf() {
+  # Try the HF download first (fast path).
+  local got
+  got=$(python3 "${HERE}/fetch_model.py" \
+          --model "${GGUF_REPO}" --file "${GGUF_FILE}" 2>/dev/null || true)
+  if [[ -s "$got" ]]; then printf '%s' "$got"; return 0; fi
+
+  # No pre-built F32 GGUF — convert from safetensors ourselves.
+  local src_dir cache_out convert_py
+  src_dir=$(python3 "${HERE}/fetch_model.py" \
+              --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" 2>&1 | tail -1)
+  cache_out="$(dirname "$src_dir")/tinyllama-f32.gguf"
+  if [[ -s "$cache_out" ]]; then printf '%s' "$cache_out"; return 0; fi
+
+  # Find convert_hf_to_gguf.py inside the auto-built llama.cpp clone.
+  for cand in /tmp/llama.cpp/convert_hf_to_gguf.py \
+              "$HOME/llama.cpp/convert_hf_to_gguf.py" \
+              /tmp/llama.cpp/convert-hf-to-gguf.py; do
+    [[ -f "$cand" ]] && convert_py="$cand" && break
+  done
+  if [[ -z "${convert_py:-}" ]]; then
+    echo "  [ERROR] F32 GGUF not on HF hub and convert_hf_to_gguf.py not found." >&2
+    echo "         Run with --auto-build so llama.cpp is cloned, or set" >&2
+    echo "         precision: q8_0 in configs/llama_cpp.yaml for a quick fallback." >&2
+    return 1
+  fi
+
+  echo "  [convert] producing F32 GGUF from safetensors ($src_dir) ..." >&2
+  echo "            (one-time, ~8 GB, cached at $cache_out)" >&2
+  if ! python3 "$convert_py" "$src_dir" \
+         --outtype f32 --outfile "$cache_out" >&2; then
+    echo "  [ERROR] convert_hf_to_gguf.py failed" >&2
+    return 1
+  fi
+  printf '%s' "$cache_out"
+}
+
+echo "  fetching GGUF: ${GGUF_REPO}/${GGUF_FILE} (precision=$PRECISION) ..." >&2
+if [[ "$PRECISION" == "f32" || "$PRECISION" == "F32" || "$PRECISION" == "fp32" ]]; then
+  GGUF_PATH=$(get_f32_gguf) || exit 4
+else
+  GGUF_PATH=$(python3 "${HERE}/fetch_model.py" \
+                --model "${GGUF_REPO}" --file "${GGUF_FILE}")
+fi
 if [[ ! -s "$GGUF_PATH" ]]; then
   echo "  [ERROR] fetched path empty: $GGUF_PATH" >&2; exit 4
 fi
 GGUF_SZ=$(stat -c%s "$GGUF_PATH" 2>/dev/null || stat -f%z "$GGUF_PATH" 2>/dev/null || echo 0)
-printf "  GGUF ready (%d MB) at %s\n" \
-       "$((GGUF_SZ / 1024 / 1024))" "$GGUF_PATH" >&2
+printf "  GGUF ready (%d MB, quant=%s) at %s\n" \
+       "$((GGUF_SZ / 1024 / 1024))" "$QUANT" "$GGUF_PATH" >&2
 
 # ── Run llama-bench ──────────────────────────────────────────────────────
 # llama-bench emits a CSV-like table on stdout + model-loading progress
@@ -197,7 +257,7 @@ fi
 cat <<JSON
 {"framework": "llama.cpp",
  "model": "$GGUF_REPO/$GGUF_FILE",
- "quant": "Q8_0",
+ "quant": "$QUANT",
  "threads": $THREADS,
  "prefill_T": $PREFILL,
  "decode_N": $DECODE,

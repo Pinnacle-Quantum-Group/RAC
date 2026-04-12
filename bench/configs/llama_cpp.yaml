@@ -8,22 +8,38 @@
 # Where to find llama-bench (leave blank → auto-detect)
 binary: ""
 
-# The GGUF repo + filename to pull. TheBloke publishes every common
-# quant; Q8_0 is the closest match to the RAC FP32 bench (near-lossless).
+# Precision selector:
+#   f32   — apples-to-apples with RAC's default F32 path (slower, HONEST)
+#   q8_0  — 8-bit quantization (much faster on decode, informational tier)
+#
+# When set to f32 and no f32 GGUF is cached, run_llama_cpp.sh invokes
+# llama.cpp's convert_hf_to_gguf.py --outtype f32 on the safetensors
+# checkpoint we already downloaded for the RAC bench. One-time ~8GB
+# conversion; cached thereafter. Set RAC_LLAMA_QUANT=q8_0 env or edit
+# this file to q8_0 to pull the pre-quantized GGUF instead.
+precision: f32
+
+# GGUF filenames for each precision tier. These paths are resolved
+# relative to the fetched repo cache. The safetensors source for F32
+# conversion is always TinyLlama/TinyLlama-1.1B-Chat-v1.0 (HF Hub).
 gguf_repo: TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
-gguf_file: tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+gguf_file_q8_0: tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+gguf_file_f32:  tinyllama-1.1b-chat-v1.0.F32.gguf
+
+# Legacy single-filename field (kept for backward compat; ignored when
+# 'precision' is set above). Harness picks gguf_file_<precision>.
+gguf_file: tinyllama-1.1b-chat-v1.0.F32.gguf
 
 # Per-layer scaling — TinyLlama-1.1B has 22 decoder layers.
-# Bench reports total throughput; dividing by this gives per-layer numbers
-# comparable to the single-layer RAC bench.
 n_layers_divisor: 22
 
 # Scenarios — match bench_rac_transformer
 prefill_tokens: 128
-decode_tokens:  128       # llama-bench -n; 1-token latency = total / n
+decode_tokens:  128
 
-# Threads (match OMP_NUM_THREADS used for the RAC bench)
-threads: 16
+# Threads — 'auto' uses nproc to match RAC's OMP_NUM_THREADS.
+# Integer value overrides. For fair F32 vs F32 use 'auto'.
+threads: auto
 
 # Repeats (llama-bench reports median)
 repeats: 3
