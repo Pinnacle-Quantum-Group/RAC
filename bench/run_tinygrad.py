@@ -113,9 +113,21 @@ def build_layer(cfg, weights_path, layer_idx):
     """
     Build a tinygrad Tensor-level decoder layer reading real weights.
     Returns a callable `forward(x)` that runs the whole block.
+
+    tinygrad gotcha: safe_load() returns tensors whose device is the
+    DISK-backed safetensors file. Any kernel that mixes DISK and the
+    compute device (CLANG, CUDA, etc.) fails with
+      RuntimeError: all buffers must be on the same device
+    So we explicitly .to(Device.DEFAULT).realize() every weight, which
+    reads the bytes off disk once and materializes a buffer on CLANG.
     """
-    from tinygrad import Tensor
+    from tinygrad import Tensor, Device
+    from tinygrad.dtype import dtypes
     from tinygrad.nn.state import safe_load
+
+    # Pin default device BEFORE any Tensor op. Inputs created later
+    # will inherit this; weights get .to()'d to it explicitly below.
+    Device.DEFAULT = cfg["device"]
 
     state = safe_load(str(weights_path))
 
@@ -135,19 +147,33 @@ def build_layer(cfg, weights_path, layer_idx):
     if missing:
         raise RuntimeError(f"missing tensors: {missing}")
 
-    # Dtype casting happens in tinygrad automatically on first op;
-    # we'll keep everything in the configured precision.
-    dtype_map = {"float32": "float", "float16": "half", "bfloat16": "bfloat16"}
-    tg_dtype = dtype_map.get(cfg["dtype"], "float")
+    # Pick target dtype
+    if cfg["dtype"] == "float16":
+        target_dt = dtypes.float16
+    elif cfg["dtype"] == "bfloat16":
+        target_dt = dtypes.bfloat16
+    else:
+        target_dt = dtypes.float32
 
-    W = {k: state[n].cast(tg_dtype) for k, n in names.items()}
+    # Load + move-to-device + cast + realize for every weight.
+    # .realize() forces the actual DISK read and allocates a CLANG buffer;
+    # without it, the weight stays symbolic on DISK and the forward-pass
+    # kernel fails the cross-device check.
+    W = {}
+    print(f"  loading {len(names)} tensors to {Device.DEFAULT}...",
+          file=sys.stderr)
+    for k, name in names.items():
+        t = state[name]                           # DISK
+        t = t.to(Device.DEFAULT)                  # move to compute device
+        t = t.cast(target_dt)                     # dtype promote
+        t = t.contiguous().realize()              # allocate + read
+        W[k] = t
 
     # TinyLlama-1.1B dims
     d       = 2048
     n_heads = 32
     n_kv    = 4
     d_head  = 64
-    d_ff    = 5632
 
     def rmsnorm(x, gamma, eps=1e-5):
         var = (x * x).mean(axis=-1, keepdim=True)
@@ -167,19 +193,19 @@ def build_layer(cfg, weights_path, layer_idx):
 
         # GQA: repeat k/v groups
         rep = n_heads // n_kv
-        k = k.repeat_interleave(rep, dim=0)  # [nq, T, dh]
+        k = k.repeat_interleave(rep, dim=0)
         v = v.repeat_interleave(rep, dim=0)
 
-        scores = (q @ k.permute(0, 2, 1)) * (1.0 / (d_head ** 0.5))   # [nq, T, T]
+        scores = (q @ k.permute(0, 2, 1)) * (1.0 / (d_head ** 0.5))
 
-        # Causal mask
+        # Causal mask (additive: 0 on keep, -1e9 on mask)
         if T > 1:
-            mask = Tensor.ones(T, T).tril() - Tensor.ones(T, T)
-            scores = scores + mask * 1e9    # below-diagonal is 0, above = -inf-ish
+            mask = (Tensor.ones(T, T).tril() - Tensor.ones(T, T))
+            scores = scores + mask * 1e9
 
         attn = scores.softmax(axis=-1)
         out  = attn @ v                                               # [nq, T, dh]
-        out  = out.permute(1, 0, 2).reshape(T, d)                     # [T, d]
+        out  = out.permute(1, 0, 2).reshape(T, d)
         out  = out @ W["o"].T
         x    = x + out
 
@@ -215,7 +241,8 @@ def main():
     os.environ["DEV"] = cfg["device"]
 
     ensure_tinygrad(args.auto_install)
-    from tinygrad import Tensor
+    from tinygrad import Tensor, Device
+    from tinygrad.dtype import dtypes
 
     weights = fetch_weights(cfg["hf_model_id"])
     layer = build_layer(cfg, weights, args.layer)
@@ -223,9 +250,11 @@ def main():
     T = cfg["prefill_tokens"]
     d_model = 2048
 
-    # Build inputs
-    x_prefill = Tensor.rand(T, d_model).cast("float" if cfg["dtype"] == "float32" else "half")
-    x_decode  = Tensor.rand(1, d_model).cast("float" if cfg["dtype"] == "float32" else "half")
+    # Match the weight dtype (build_layer already set Device.DEFAULT).
+    in_dt = {"float16": dtypes.float16,
+             "bfloat16": dtypes.bfloat16}.get(cfg["dtype"], dtypes.float32)
+    x_prefill = Tensor.rand(T, d_model).cast(in_dt).realize()
+    x_decode  = Tensor.rand(1, d_model).cast(in_dt).realize()
 
     # Warmup
     _ = layer(x_prefill).realize()
