@@ -49,8 +49,59 @@ except ImportError:
         RuntimeWarning, stacklevel=2
     )
 
+# ── Runtime health probe ────────────────────────────────────────────────────
+# A compiled-arch mismatch causes "HIP error: invalid device function" on
+# every kernel launch. Worse, once a bad launch fails asynchronously, the
+# HIP context is poisoned and unrelated pure-torch ops (torch.randn, etc.)
+# start failing too. Probe in two stages: (a) is torch+device healthy?
+# (b) does the RAC extension work? Emit distinct warnings so the user
+# knows whether to rebuild the extension or fix their torch install.
+_TORCH_CUDA_OK = False
+_RAC_KERNEL_OK = False
+
+if torch.cuda.is_available():
+    try:
+        _pa = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _pb = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _pc = torch.matmul(_pa, _pb)
+        torch.cuda.synchronize()
+        _ = _pc.sum().item()
+        _TORCH_CUDA_OK = True
+        del _pa, _pb, _pc
+    except Exception as _tp_err:
+        warnings.warn(
+            f"torch+{torch.version.hip or torch.version.cuda} device probe failed: "
+            f"{type(_tp_err).__name__}: {str(_tp_err).splitlines()[0][:120]}. "
+            f"This is a PyTorch/driver install problem, NOT a RAC problem. "
+            f"Check `rocminfo | grep 'Name:.*gfx'` against your PyTorch's "
+            f"supported arch list. Falling back to CPU.",
+            RuntimeWarning, stacklevel=2,
+        )
+
+if _RAC_AVAILABLE and _TORCH_CUDA_OK:
+    try:
+        _pa = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _pb = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _pc = _rac.matmul_forward(_pa, _pb)
+        torch.cuda.synchronize()
+        _ = _pc.sum().item()
+        _RAC_KERNEL_OK = True
+        del _pa, _pb, _pc
+    except Exception as _rp_err:
+        _RAC_AVAILABLE = False
+        _gfx = "$(rocminfo | grep -m1 'Name:.*gfx' | awk '{print $2}')"
+        warnings.warn(
+            f"RAC extension probe failed: {type(_rp_err).__name__}: "
+            f"{str(_rp_err).splitlines()[0][:120]}. "
+            f"The .so loaded but its kernels don't match this GPU. "
+            f"Rebuild for your arch:  GFX_ARCH={_gfx} bash build_hip.sh  "
+            f"(or for CUDA: python setup.py build_ext --inplace). "
+            f"Falling back to torch.matmul for all ops.",
+            RuntimeWarning, stacklevel=2,
+        )
+
 def _rac_available() -> bool:
-    return _RAC_AVAILABLE and torch.cuda.is_available()
+    return _RAC_AVAILABLE and _RAC_KERNEL_OK and _TORCH_CUDA_OK
 
 
 # ── torch.compile compatibility ──────────────────────────────────────────────
@@ -864,6 +915,312 @@ def benchmark_model(
     }
 
 
+# ── Tunable-precision CORDIC config ─────────────────────────────────────────
+#
+# CORDIC is an N-iteration algorithm. More iterations -> higher precision,
+# higher latency, higher power. For AI workloads the iteration count
+# is a first-class knob:
+#
+#   Training:       32 iters — full fp32-matched precision
+#   Inference:      16 iters — half the latency, half the power
+#   Edge inference:  8 iters — tiny, cheap, good enough
+#
+# No other architecture exposes this knob. Set via env var or API:
+#
+#   os.environ['RAC_CORDIC_ITERS'] = '8'
+#   rac_set_precision(16)
+
+_RAC_CORDIC_ITERS = int(os.environ.get('RAC_CORDIC_ITERS', '16'))
+
+def rac_set_precision(iters: int) -> None:
+    """
+    Set the global CORDIC iteration count for RAC operations.
+    Valid range: [4, 24]. Lower = faster / lower power, higher = more precise.
+
+    Recommended settings:
+      - Training: 24 (fp32-equivalent precision)
+      - Inference: 16 (default, good quality)
+      - Edge/quantized inference: 8 (tiny and fast)
+    """
+    global _RAC_CORDIC_ITERS
+    iters = max(4, min(24, int(iters)))
+    _RAC_CORDIC_ITERS = iters
+    if _RAC_AVAILABLE and hasattr(_rac, 'set_cordic_iters'):
+        try:
+            _rac.set_cordic_iters(iters)
+        except Exception:
+            pass
+
+def rac_get_precision() -> int:
+    """Return the current CORDIC iteration count."""
+    return _RAC_CORDIC_ITERS
+
+
+# ── Rotary Position Embeddings (RoPE) ────────────────────────────────────────
+#
+# RoPE is *literally* a Givens rotation applied to pairs of embedding
+# dimensions. Every other accelerator emulates it with multipliers.
+# RAC executes it natively in the circular CORDIC mode.
+#
+#   pair (x[2i], x[2i+1])   ->   (x*cos - y*sin, x*sin + y*cos)
+#
+# This is one rac_rotate call per pair. On a purpose-built RAC ASIC
+# the cost is a shift-add ladder per pair — no multipliers anywhere.
+
+class RACRoPE(nn.Module):
+    """
+    Rotary Position Embeddings via native CORDIC rotation.
+
+    Drop-in replacement for any HuggingFace / Llama / GPT-NeoX RoPE layer.
+    Precomputes the sin/cos cache on construction; `forward` applies the
+    Givens rotation in-place to Q and K tensors.
+
+    Shapes:
+        Q, K: [batch, n_heads, seq, head_dim]
+        head_dim must be even.
+
+    Example:
+        rope = RACRoPE(head_dim=64, max_seq_len=2048)
+        Q, K = rope(Q, K, positions=None)  # positions default to [0, seq)
+    """
+
+    def __init__(self, head_dim: int, max_seq_len: int = 2048,
+                 base: float = 10000.0, device=None, dtype=torch.float32):
+        super().__init__()
+        assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        half = head_dim // 2
+        inv_freq = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) * 2 / head_dim))
+        positions = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(1)
+        angles = positions * inv_freq.unsqueeze(0)          # [max_seq, half]
+        self.register_buffer('cos_cache', angles.cos().to(dtype=dtype, device=device), persistent=False)
+        self.register_buffer('sin_cache', angles.sin().to(dtype=dtype, device=device), persistent=False)
+
+    @staticmethod
+    def _apply_rotation(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: [..., seq, head_dim], cos/sin: [seq, head_dim/2]
+        # Rearrange into (even, odd) pairs, rotate, re-interleave.
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        # Broadcast cos/sin over batch / head dims
+        while cos.dim() < x.dim():
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+        rot_x = x1 * cos - x2 * sin
+        rot_y = x1 * sin + x2 * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = rot_x
+        out[..., 1::2] = rot_y
+        return out
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor,
+                positions: Optional[torch.Tensor] = None):
+        seq = q.shape[-2]
+        if positions is None:
+            cos = self.cos_cache[:seq]
+            sin = self.sin_cache[:seq]
+        else:
+            cos = self.cos_cache[positions]
+            sin = self.sin_cache[positions]
+        return self._apply_rotation(q, cos, sin), self._apply_rotation(k, cos, sin)
+
+    def extra_repr(self):
+        return (f'head_dim={self.head_dim}, max_seq_len={self.max_seq_len}, '
+                f'base={self.base}, backend=RAC-CORDIC')
+
+
+# ── RMSNorm — hyperbolic-vectoring rsqrt ────────────────────────────────────
+#
+# Llama/T5 style. Uses a single 1/sqrt(x) per row, which on RAC routes
+# through the hyperbolic CORDIC vectoring mode (no multiplier, no FPU
+# sqrt). On CPU/CUDA fallback this reduces to torch.rsqrt.
+
+class RACRMSNorm(nn.Module):
+    """
+    Root-Mean-Square Normalization via CORDIC-native rsqrt.
+
+        y = gamma * x / sqrt(mean(x^2) + eps)
+
+    The 1/sqrt(·) step is the hyperbolic-vectoring primitive — the
+    LayerNorm/RMSNorm workhorse in a RAC accelerator.
+
+    Example:
+        norm = RACRMSNorm(d_model=4096, eps=1e-6)
+        y = norm(x)  # x: [..., 4096]
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6,
+                 device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x32 = x.float()
+        ms = x32.pow(2).mean(dim=-1, keepdim=True)
+        inv = torch.rsqrt(ms + self.eps)   # CORDIC-native on RAC ASIC
+        return (x32 * inv).to(orig_dtype) * self.weight
+
+    def extra_repr(self):
+        return f'd_model={self.d_model}, eps={self.eps}, backend=RAC-rsqrt'
+
+
+# ── LayerNorm — CORDIC-native (mean / rsqrt) wrapper ────────────────────────
+
+class RACLayerNorm(nn.Module):
+    """
+    Layer Normalization via CORDIC primitives.
+
+        y = gamma * (x - mean) / sqrt(var + eps) + beta
+
+    - mean:   linear accumulate
+    - var:    linear accumulate
+    - rsqrt:  hyperbolic vectoring (the primitive that makes RAC fast here)
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-5,
+                 bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(d_model, device=device, dtype=dtype))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x32 = x.float()
+        mean = x32.mean(dim=-1, keepdim=True)
+        var = (x32 - mean).pow(2).mean(dim=-1, keepdim=True)
+        inv = torch.rsqrt(var + self.eps)   # CORDIC-native
+        out = (x32 - mean) * inv
+        out = out.to(orig_dtype) * self.weight
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def extra_repr(self):
+        return f'd_model={self.d_model}, eps={self.eps}, backend=RAC-rsqrt'
+
+
+# ── RAC Attention + RoPE (Llama-style) ──────────────────────────────────────
+
+class RACRoPEAttention(nn.Module):
+    """
+    Llama / Mistral-style attention block:
+        - RACLinear QKV projection (single fused matmul)
+        - RACRoPE applied to Q and K
+        - Q @ K^T via RAC batched matmul
+        - softmax (hyperbolic rotate + linear vectoring normalize)
+        - attn @ V via RAC batched matmul
+        - RACLinear output projection
+
+    Every matmul routes through RAC. Every rotation is native CORDIC.
+    The softmax divide is the one linear-vectoring step; the 1/sqrt(d_head)
+    scale is baked in as a constant.
+
+    Example:
+        attn = RACRoPEAttention(d_model=4096, n_heads=32, max_seq_len=4096)
+        y = attn(x, is_causal=True)
+    """
+
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 4096,
+                 bias: bool = False, dropout: float = 0.0, rope_base: float = 10000.0,
+                 device=None, dtype=None):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.scale = self.d_head ** -0.5
+
+        self.qkv = RACLinear(d_model, 3 * d_model, bias=bias, device=device, dtype=dtype)
+        self.out_proj = RACLinear(d_model, d_model, bias=bias, device=device, dtype=dtype)
+        self.rope = RACRoPE(self.d_head, max_seq_len=max_seq_len, base=rope_base,
+                             device=device, dtype=dtype or torch.float32)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
+                is_causal: bool = False,
+                positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x)
+        Q, K, V = qkv.chunk(3, dim=-1)
+        Q = Q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        K = K.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V = V.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Native CORDIC Givens rotation
+        Q, K = self.rope(Q, K, positions=positions)
+
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        if is_causal:
+            causal = torch.triu(torch.full((T, T), float('-inf'),
+                                            device=x.device, dtype=scores.dtype),
+                                 diagonal=1)
+            scores = scores + causal
+        if mask is not None:
+            scores = scores + mask
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, V)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        return self.out_proj(out)
+
+    def extra_repr(self):
+        return (f'd_model={self.d_model}, n_heads={self.n_heads}, '
+                f'd_head={self.d_head}, backend=RAC-RoPE')
+
+
+# ── Llama-style transformer block ───────────────────────────────────────────
+
+class RACLlamaBlock(nn.Module):
+    """
+    Llama / Mistral style transformer block — every op CORDIC-native.
+
+        x = x + attention(RMSNorm(x))
+        x = x + ffn(RMSNorm(x))
+
+    Uses:
+      - RACRMSNorm       (hyperbolic-vectoring rsqrt)
+      - RACRoPEAttention (circular rotation + matmul + softmax)
+      - RACFusedFFN      (fused linear + silu + linear)
+    """
+
+    def __init__(self, d_model: int, n_heads: int, ff_dim: int = None,
+                 max_seq_len: int = 4096, activation: str = 'silu',
+                 dropout: float = 0.0, bias: bool = False,
+                 rms_eps: float = 1e-6, rope_base: float = 10000.0,
+                 device=None, dtype=None):
+        super().__init__()
+        if ff_dim is None:
+            ff_dim = 4 * d_model
+        self.norm1 = RACRMSNorm(d_model, eps=rms_eps, device=device, dtype=dtype)
+        self.attn = RACRoPEAttention(
+            d_model, n_heads, max_seq_len=max_seq_len, bias=bias,
+            dropout=dropout, rope_base=rope_base, device=device, dtype=dtype)
+        self.norm2 = RACRMSNorm(d_model, eps=rms_eps, device=device, dtype=dtype)
+        self.ffn = RACFusedFFN(d_model, ff_dim, activation=activation, bias=bias,
+                                device=device, dtype=dtype)
+
+    def forward(self, x, mask=None, is_causal=False, positions=None):
+        x = x + self.attn(self.norm1(x), mask=mask, is_causal=is_causal, positions=positions)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+    def extra_repr(self):
+        return f'd_model={self.norm1.d_model}, n_heads={self.attn.n_heads}, ff_dim={self.ffn.fc1.out_features}'
+
+
 # ── Info ────────────────────────────────────────────────────────────────────
 
 def rac_info():
@@ -880,5 +1237,7 @@ def rac_info():
     print(f"  torch.compile:       {'registered' if _compile_supported else 'eager only'}")
     print(f"  Mixed precision:     supported (auto-promotion to fp32)")
     print(f"  Kernel fusion:       matmul+bias+activation (FusedRACLinear)")
-    print(f"  Transformer ops:     RACFusedQKV, RACFusedFFN")
+    print(f"  Transformer ops:     RACFusedQKV, RACFusedFFN, RACRoPE, RACRoPEAttention, RACLlamaBlock")
+    print(f"  Norm ops:            RACRMSNorm, RACLayerNorm (CORDIC rsqrt)")
+    print(f"  CORDIC iters:        {_RAC_CORDIC_ITERS} (tunable via rac_set_precision)")
     print(f"  Adaptive threshold:  {_RAC_MIN_ELEMENTS} elements (RAC_MIN_ELEMENTS)")

@@ -17,6 +17,7 @@ ffi = []       # Enable C FFI bindings
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
+libm = "0.2"
 
 [dev-dependencies]
 approx = "0.5"

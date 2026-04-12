@@ -396,6 +396,81 @@ except Exception as e:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# BVT-15: Tunable precision
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-15: Tunable precision knob")
+
+try:
+    from rac_torch import rac_set_precision, rac_get_precision
+    rac_set_precision(8)
+    check("set precision to 8", rac_get_precision() == 8)
+    rac_set_precision(24)
+    check("set precision to 24", rac_get_precision() == 24)
+    rac_set_precision(2)  # below min → clamped to 4
+    check("precision clamp lower bound", rac_get_precision() == 4)
+    rac_set_precision(99)  # above max → clamped to 24
+    check("precision clamp upper bound", rac_get_precision() == 24)
+    rac_set_precision(16)  # reset default
+except Exception as e:
+    check("precision knob", False, str(e)[:60])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BVT-16: RACRoPE / RACRMSNorm / RACLayerNorm / RACLlamaBlock
+# ═══════════════════════════════════════════════════════════════════════════
+header("BVT-16: Transformer primitives (RoPE / RMSNorm / LayerNorm / Llama block)")
+
+try:
+    import torch
+    from rac_torch import (
+        RACRoPE, RACRMSNorm, RACLayerNorm, RACRoPEAttention, RACLlamaBlock,
+    )
+
+    # RoPE shape check and magnitude preservation
+    rope = RACRoPE(head_dim=8, max_seq_len=16)
+    q = torch.randn(2, 2, 4, 8)  # [B, H, T, D]
+    k = torch.randn_like(q)
+    q2, k2 = rope(q, k)
+    check("RACRoPE output shape matches", q2.shape == q.shape and k2.shape == k.shape)
+    # Pair magnitudes preserved
+    pair_q  = q.view(2, 2, 4, 4, 2)
+    pair_q2 = q2.view(2, 2, 4, 4, 2)
+    m0 = pair_q.pow(2).sum(-1).sqrt()
+    m1 = pair_q2.pow(2).sum(-1).sqrt()
+    check("RoPE preserves pair magnitudes", torch.allclose(m0, m1, atol=1e-4))
+
+    # RMSNorm
+    rms = RACRMSNorm(32, eps=1e-6)
+    x = torch.randn(4, 32)
+    y = rms(x)
+    ms = y.pow(2).mean(dim=-1)
+    check("RMSNorm output shape", y.shape == x.shape)
+    check("RMSNorm mean-square ≈ 1", torch.allclose(ms, torch.ones_like(ms), atol=0.05))
+
+    # LayerNorm
+    ln = RACLayerNorm(32, eps=1e-5)
+    y = ln(x)
+    check("LayerNorm output shape", y.shape == x.shape)
+    check("LayerNorm row mean ≈ 0",
+          torch.allclose(y.mean(-1), torch.zeros(4), atol=0.01))
+
+    # RoPE attention forward
+    attn = RACRoPEAttention(d_model=32, n_heads=4, max_seq_len=16)
+    xin = torch.randn(2, 8, 32)
+    out = attn(xin, is_causal=True)
+    check("RACRoPEAttention output shape", out.shape == xin.shape)
+    check("RACRoPEAttention output finite", torch.isfinite(out).all().item())
+
+    # Full Llama block
+    block = RACLlamaBlock(d_model=32, n_heads=4, ff_dim=64, max_seq_len=16)
+    out = block(xin, is_causal=True)
+    check("RACLlamaBlock output shape", out.shape == xin.shape)
+    check("RACLlamaBlock output finite", torch.isfinite(out).all().item())
+except Exception as e:
+    check("transformer primitives", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 header("BVT Summary")

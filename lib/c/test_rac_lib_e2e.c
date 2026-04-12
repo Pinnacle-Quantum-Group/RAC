@@ -308,6 +308,157 @@ int main(void) {
     }
 
     /* ═══════════════════════════════════════════════════════════════════
+     * E2E-7: Transformer-stack integration (QKV → RoPE → attn → RMSNorm → FFN)
+     * ═══════════════════════════════════════════════════════════════════ */
+    HEADER("E2E-7: Transformer stack integration");
+    {
+        rac_config cfg = rac_default_config();
+        int B = 2, H = 4, T = 16, D = 32;         /* d_head = 32 */
+        int d_model = H * D;                       /* 128 */
+        int total = B * T * d_model;
+
+        float *x      = malloc(total * sizeof(float));
+        float *q      = malloc(total * sizeof(float));
+        float *k      = malloc(total * sizeof(float));
+        float *v      = malloc(total * sizeof(float));
+        float *attn   = malloc(total * sizeof(float));
+        float *normed = malloc(total * sizeof(float));
+        float *ffn    = malloc(B * T * d_model * sizeof(float));
+
+        /* QKV weights as three [d_model, d_model] matrices */
+        float *Wq = malloc(d_model * d_model * sizeof(float));
+        float *Wk = malloc(d_model * d_model * sizeof(float));
+        float *Wv = malloc(d_model * d_model * sizeof(float));
+        float *Wo = malloc(d_model * d_model * sizeof(float));
+        float *W1 = malloc(d_model * (4 * d_model) * sizeof(float));
+        float *W2 = malloc((4 * d_model) * d_model * sizeof(float));
+        float *hidden = malloc(B * T * 4 * d_model * sizeof(float));
+
+        rand_fill(x, total);
+        rand_fill(Wq, d_model*d_model);
+        rand_fill(Wk, d_model*d_model);
+        rand_fill(Wv, d_model*d_model);
+        rand_fill(Wo, d_model*d_model);
+        rand_fill(W1, d_model*4*d_model);
+        rand_fill(W2, 4*d_model*d_model);
+
+        /* Precompute RoPE cache (head_dim=D) */
+        int half = D / 2;
+        float *cos_tab = malloc(T * half * sizeof(float));
+        float *sin_tab = malloc(T * half * sizeof(float));
+        rac_rope_cache(cos_tab, sin_tab, T, D, 10000.0f);
+
+        /* Flatten x to [B*T, d_model] for matmul */
+        rac_matmul(x, Wq, q, B*T, d_model, d_model, &cfg);
+        rac_matmul(x, Wk, k, B*T, d_model, d_model, &cfg);
+        rac_matmul(x, Wv, v, B*T, d_model, d_model, &cfg);
+
+        /* View as [B, H, T, D] — we stored row-major [B*T, H*D] so a
+         * logical reshape is a no-op if we treat b*T*H*D as contiguous
+         * with stride H*D per seq. For the attention primitive we need
+         * to transpose to [B, H, T, D]. For this integration test we
+         * accept the straight layout and run attention per-batch. */
+
+        double t_total = now_ms();
+        rac_rope_apply(q, cos_tab, sin_tab, B*T, 1, 1, D*H, &cfg);  /* treat as one batch */
+        rac_rope_apply(k, cos_tab, sin_tab, B*T, 1, 1, D*H, &cfg);
+
+        rac_scaled_dot_attention(q, k, v, NULL, 1, attn, B, H, T, D, &cfg);
+
+        /* RMSNorm + FFN */
+        rac_rmsnorm(attn, normed, NULL, 1e-6f, B*T, d_model, &cfg);
+        rac_matmul(normed, W1, hidden, B*T, 4*d_model, d_model, &cfg);
+        /* SiLU in place on hidden */
+        rac_silu(hidden, hidden, B*T*4*d_model);
+        rac_matmul(hidden, W2, ffn, B*T, d_model, 4*d_model, &cfg);
+        double elapsed = now_ms() - t_total;
+
+        int finite = 1;
+        for (int i = 0; i < total; i++) if (!isfinite(ffn[i])) { finite = 0; break; }
+        CHECK("transformer stack produces finite output", finite);
+        printf("  full stack B=%d T=%d d=%d: %.3fms\n", B, T, d_model, elapsed);
+
+        free(x); free(q); free(k); free(v); free(attn); free(normed); free(ffn);
+        free(Wq); free(Wk); free(Wv); free(Wo); free(W1); free(W2); free(hidden);
+        free(cos_tab); free(sin_tab);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * E2E-8: Transformer-primitive throughput benchmark
+     * ═══════════════════════════════════════════════════════════════════ */
+    HEADER("E2E-8: Transformer primitive throughput");
+    {
+        rac_config cfg = rac_default_config();
+        int R = 4096, D = 4096;
+        float *x  = malloc(R * D * sizeof(float));
+        float *y  = malloc(R * D * sizeof(float));
+        rand_fill(x, R * D);
+
+        printf("\n  %-12s %10s %12s\n", "Op", "Time(ms)", "GB/s (r+w)");
+        printf("  %-12s %10s %12s\n", "────", "────────", "────────");
+
+        const int iters = 20;
+
+        double t0 = now_ms();
+        for (int i = 0; i < iters; i++) rac_rmsnorm(x, y, NULL, 1e-6f, R, D, &cfg);
+        double t = (now_ms() - t0) / iters;
+        printf("  %-12s %8.3fms %10.2f\n", "rmsnorm", t,
+               2.0 * R * D * sizeof(float) / (t * 1e6));
+
+        t0 = now_ms();
+        for (int i = 0; i < iters; i++) rac_layernorm(x, y, NULL, NULL, 1e-5f, R, D, &cfg);
+        t = (now_ms() - t0) / iters;
+        printf("  %-12s %8.3fms %10.2f\n", "layernorm", t,
+               2.0 * R * D * sizeof(float) / (t * 1e6));
+
+        /* RoPE */
+        int B=1, H=16, T=512, HD=64;
+        int total = B*H*T*HD;
+        float *qq = malloc(total*sizeof(float));
+        float *ct = malloc(T*HD/2*sizeof(float));
+        float *st2 = malloc(T*HD/2*sizeof(float));
+        rac_rope_cache(ct, st2, T, HD, 10000.0f);
+        rand_fill(qq, total);
+
+        t0 = now_ms();
+        for (int i = 0; i < iters; i++)
+            rac_rope_apply(qq, ct, st2, B, H, T, HD, &cfg);
+        t = (now_ms() - t0) / iters;
+        printf("  %-12s %8.3fms %10.2f\n", "rope_apply", t,
+               2.0 * total * sizeof(float) / (t * 1e6));
+
+        free(x); free(y); free(qq); free(ct); free(st2);
+        CHECK("transformer perf bench ran", 1);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * E2E-9: Tunable precision — iteration count vs throughput
+     * ═══════════════════════════════════════════════════════════════════ */
+    HEADER("E2E-9: CORDIC iter-count vs throughput");
+    {
+        int N = 1 << 18;
+        float *thetas = malloc(N * sizeof(float));
+        float *outx   = malloc(N * sizeof(float));
+        rand_fill(thetas, N);
+        printf("\n  %-8s %12s %12s\n", "iters", "time(ms)", "worst_err");
+        printf("  %-8s %12s %12s\n", "─────", "────────", "─────────");
+        for (int iters = 4; iters <= 24; iters += 4) {
+            double t0 = now_ms();
+            float worst = 0.0f;
+            for (int i = 0; i < N; i++) {
+                rac_vec2 r = rac_rotate_n((rac_vec2){1.0f, 0.0f}, thetas[i], iters);
+                outx[i] = r.x;
+                float e = fabsf(r.x - cosf(thetas[i]));
+                if (e > worst) worst = e;
+            }
+            double t = now_ms() - t0;
+            printf("  %-8d %10.3fms %10.2e\n", iters, t, worst);
+        }
+        free(thetas); free(outx);
+        CHECK("iter-sweep bench ran", 1);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
      * Summary
      * ═══════════════════════════════════════════════════════════════════ */
     HEADER("E2E Summary");

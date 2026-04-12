@@ -199,7 +199,13 @@ inline void softmax(const Tensor<float>& x, Tensor<float>& out, int batch, int n
 
 namespace prim {
     inline Vec2 rotate(Vec2 v, float theta) { return v.rotate(theta); }
+    inline Vec2 rotate_n(Vec2 v, float theta, int iters) {
+        auto r = rac_rotate_n(v, theta, iters); return Vec2(r);
+    }
     inline float project(Vec2 v, float theta) { return v.project(theta); }
+    inline float project_n(Vec2 v, float theta, int iters) {
+        return rac_project_n(v, theta, iters);
+    }
     inline float norm(Vec2 v) { return v.norm(); }
     inline Vec2 normalize(Vec2 v) { return v.normalized(); }
     inline float dot(Vec2 a, Vec2 b) { return a.dot(b); }
@@ -207,6 +213,70 @@ namespace prim {
     inline Vec2 complex_mul(Vec2 a, Vec2 b) { return a * b; }
     inline float exp(float x) { return rac_exp(x); }
     inline float tanh(float x) { return rac_tanh(x); }
+    inline float sigmoid(float x) { return rac_sigmoid(x); }
+    inline float rsqrt(float x) { return rac_rsqrt(x); }
+    inline std::pair<float, float> sincos(float theta) {
+        float s, c; rac_sincos(theta, &s, &c); return {s, c};
+    }
+}
+
+/* ── Transformer primitives ─────────────────────────────────────────────── */
+/*
+ * The AI stack expressed in native CORDIC modes:
+ *   matmul  — linear MAC
+ *   layernorm / rmsnorm — hyperbolic vectoring (rsqrt)
+ *   rope    — circular rotation (native)
+ *   softmax — hyperbolic rotation (exp) + linear vectoring (divide)
+ *   attention — composes the above
+ */
+
+inline void layernorm(const Tensor<float>& x, Tensor<float>& y,
+                      const float* gamma, const float* beta,
+                      float eps, int rows, int d,
+                      const Config& cfg = default_config) {
+    auto c_cfg = cfg.to_c();
+    rac_status st = rac_layernorm(x.data(), y.data(), gamma, beta,
+                                   eps, rows, d, &c_cfg);
+    if (st != RAC_OK) throw std::runtime_error("layernorm failed");
+}
+
+inline void rmsnorm(const Tensor<float>& x, Tensor<float>& y,
+                    const float* gamma, float eps, int rows, int d,
+                    const Config& cfg = default_config) {
+    auto c_cfg = cfg.to_c();
+    rac_status st = rac_rmsnorm(x.data(), y.data(), gamma, eps, rows, d, &c_cfg);
+    if (st != RAC_OK) throw std::runtime_error("rmsnorm failed");
+}
+
+inline void rope_cache(Tensor<float>& cos_out, Tensor<float>& sin_out,
+                       int max_seq, int head_dim, float base = 10000.0f) {
+    rac_status st = rac_rope_cache(cos_out.data(), sin_out.data(),
+                                    max_seq, head_dim, base);
+    if (st != RAC_OK) throw std::runtime_error("rope_cache failed");
+}
+
+inline void rope_apply(Tensor<float>& x,
+                       const Tensor<float>& cos_tab,
+                       const Tensor<float>& sin_tab,
+                       int batch, int n_heads, int seq, int head_dim,
+                       const Config& cfg = default_config) {
+    auto c_cfg = cfg.to_c();
+    rac_status st = rac_rope_apply(x.data(), cos_tab.data(), sin_tab.data(),
+                                    batch, n_heads, seq, head_dim, &c_cfg);
+    if (st != RAC_OK) throw std::runtime_error("rope_apply failed");
+}
+
+inline void attention(const Tensor<float>& q, const Tensor<float>& k,
+                      const Tensor<float>& v, Tensor<float>& out,
+                      const float* mask, bool is_causal,
+                      int batch, int n_heads, int seq, int head_dim,
+                      const Config& cfg = default_config) {
+    auto c_cfg = cfg.to_c();
+    rac_status st = rac_scaled_dot_attention(
+        q.data(), k.data(), v.data(),
+        mask, is_causal ? 1 : 0, out.data(),
+        batch, n_heads, seq, head_dim, &c_cfg);
+    if (st != RAC_OK) throw std::runtime_error("attention failed");
 }
 
 } /* namespace rac */

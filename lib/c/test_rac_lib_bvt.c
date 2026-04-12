@@ -162,6 +162,114 @@ int main(void) {
     CHECK("rac_hal_shutdown OK", 1);
     CHECK("profile after shutdown is NULL", rac_hal_profile() == NULL);
 
+    /* ── BVT-12: Tunable-precision CORDIC ─────────────────────────── */
+    HEADER("BVT-12: Tunable-precision CORDIC");
+    {
+        rac_vec2 v_unit = {1.0f, 0.0f};
+        rac_vec2 r8  = rac_rotate_n(v_unit, RAC_PI * 0.25f, 8);
+        rac_vec2 r16 = rac_rotate_n(v_unit, RAC_PI * 0.25f, 16);
+        float expected = cosf(RAC_PI * 0.25f);   /* ~0.7071 */
+        CHECK("rotate_n(8) converges to ±1%", fabsf(r8.x - expected) < 0.01f);
+        CHECK("rotate_n(16) within ±0.1%",    fabsf(r16.x - expected) < 0.001f);
+
+        float sx, cx;
+        rac_sincos(RAC_PI * 0.5f, &sx, &cx);
+        CHECK("sincos(π/2) → sin≈1", fabsf(sx - 1.0f) < 0.01f);
+        CHECK("sincos(π/2) → cos≈0", fabsf(cx) < 0.01f);
+
+        float rs = rac_rsqrt(4.0f);
+        CHECK("rsqrt(4) = 0.5",  fabsf(rs - 0.5f) < 1e-6f);
+        CHECK("rsqrt(<=0) = 0",  rac_rsqrt(0.0f) == 0.0f && rac_rsqrt(-1.0f) == 0.0f);
+
+        CHECK("sigmoid(0)  = 0.5",   fabsf(rac_sigmoid(0.0f) - 0.5f) < 1e-5f);
+        CHECK("sigmoid(10) ≈ 1",     rac_sigmoid(10.0f) > 0.999f);
+        CHECK("sigmoid(-10) ≈ 0",    rac_sigmoid(-10.0f) < 0.001f);
+    }
+
+    /* ── BVT-13: LayerNorm + RMSNorm ──────────────────────────────── */
+    HEADER("BVT-13: LayerNorm / RMSNorm");
+    {
+        float xn[8]   = {1,2,3,4,5,6,7,8};     /* 2 rows of d=4 */
+        float yn[8]   = {0};
+        rac_status st = rac_layernorm(xn, yn, NULL, NULL, 1e-5f, 2, 4, &cfg);
+        CHECK("layernorm returns OK", st == RAC_OK);
+
+        /* Row 0: mean=(1+2+3+4)/4=2.5 → zero-mean after norm */
+        float row0_mean = (yn[0]+yn[1]+yn[2]+yn[3]) / 4.0f;
+        CHECK("layernorm row0 mean ≈ 0", fabsf(row0_mean) < 0.01f);
+
+        /* Variance ≈ 1 */
+        float row0_var = 0.0f;
+        for (int i = 0; i < 4; i++) row0_var += (yn[i] - row0_mean)*(yn[i] - row0_mean);
+        row0_var /= 4.0f;
+        CHECK("layernorm row0 var ≈ 1", fabsf(row0_var - 1.0f) < 0.05f);
+
+        float rm[4] = {3, 4, 0, 0}, rmo[4] = {0};
+        st = rac_rmsnorm(rm, rmo, NULL, 1e-6f, 1, 4, &cfg);
+        CHECK("rmsnorm returns OK", st == RAC_OK);
+        /* ms=(9+16)/4=6.25 → rsqrt=0.4 → y=[1.2,1.6,0,0] */
+        CHECK("rmsnorm y[0] ≈ 1.2", fabsf(rmo[0] - 1.2f) < 0.01f);
+        CHECK("rmsnorm y[1] ≈ 1.6", fabsf(rmo[1] - 1.6f) < 0.01f);
+    }
+
+    /* ── BVT-14: RoPE ─────────────────────────────────────────────── */
+    HEADER("BVT-14: Rotary Position Embeddings (RoPE)");
+    {
+        const int seq = 4, head_dim = 4;
+        float cos_tab[4 * 2] = {0}, sin_tab[4 * 2] = {0};
+        rac_status st = rac_rope_cache(cos_tab, sin_tab, seq, head_dim, 10000.0f);
+        CHECK("rope_cache returns OK", st == RAC_OK);
+
+        /* Position 0 has cos=1, sin=0 for every frequency pair. */
+        CHECK("rope p=0 cos=1", fabsf(cos_tab[0] - 1.0f) < 0.001f && fabsf(cos_tab[1] - 1.0f) < 0.001f);
+        CHECK("rope p=0 sin=0", fabsf(sin_tab[0]) < 0.001f && fabsf(sin_tab[1]) < 0.001f);
+
+        /* Apply to a single batch/head/seq vector. Magnitude of each
+         * pair must be preserved — RoPE is a rotation. */
+        float x[16] = {
+            1,2,3,4,               /* t=0 */
+            5,6,7,8,               /* t=1 */
+            -1,0,0,1,              /* t=2 */
+            0.5f,-0.5f,1,-1,       /* t=3 */
+        };
+        float orig[16];
+        memcpy(orig, x, sizeof(x));
+        st = rac_rope_apply(x, cos_tab, sin_tab, 1, 1, seq, head_dim, &cfg);
+        CHECK("rope_apply returns OK", st == RAC_OK);
+
+        int pair_ok = 1;
+        for (int t = 0; t < seq; t++) {
+            for (int i = 0; i < head_dim / 2; i++) {
+                float a0 = orig[t*head_dim + 2*i];
+                float b0 = orig[t*head_dim + 2*i + 1];
+                float a1 = x[t*head_dim + 2*i];
+                float b1 = x[t*head_dim + 2*i + 1];
+                float n0 = sqrtf(a0*a0 + b0*b0);
+                float n1 = sqrtf(a1*a1 + b1*b1);
+                if (fabsf(n0 - n1) > 0.01f) pair_ok = 0;
+            }
+        }
+        CHECK("rope preserves each pair's magnitude", pair_ok);
+    }
+
+    /* ── BVT-15: Scaled dot-product attention ─────────────────────── */
+    HEADER("BVT-15: Scaled dot-product attention");
+    {
+        const int B=1, H=1, T=3, D=4;
+        float qv[B*H*T*D], kv[B*H*T*D], vv[B*H*T*D], ov[B*H*T*D];
+        for (int i = 0; i < B*H*T*D; i++) {
+            qv[i] = kv[i] = 1.0f;
+            vv[i] = 1.0f;
+        }
+        rac_status st = rac_scaled_dot_attention(qv, kv, vv, NULL, 0,
+                                                  ov, B, H, T, D, &cfg);
+        CHECK("attention returns OK", st == RAC_OK);
+        /* Uniform softmax, all-ones V → output is all-ones. */
+        int ones_ok = 1;
+        for (int i = 0; i < B*H*T*D; i++) if (fabsf(ov[i] - 1.0f) > 0.01f) ones_ok = 0;
+        CHECK("attention uniform case outputs ones", ones_ok);
+    }
+
     /* ── Summary ──────────────────────────────────────────────────── */
     HEADER("BVT Summary");
     printf("  Passed: %d\n  Failed: %d\n  Total:  %d\n", passed, failed, passed+failed);

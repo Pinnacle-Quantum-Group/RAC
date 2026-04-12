@@ -55,6 +55,58 @@ RAC replaces the Multiply-Accumulate (MAC) operation with geometric rotation as 
 | `rac_outer(a, b, C, m, n)` | Outer product |
 | `rac_matmul(A, B, C, M, N, K)` | Matrix multiply — zero multiply operators in kernel |
 
+### Transformer / AI Primitives (native CORDIC)
+
+Every op in a transformer maps to a native CORDIC mode:
+
+| Op                      | CORDIC mode            | Primitive                          |
+|-------------------------|------------------------|------------------------------------|
+| `QKᵀ` / `attn @ V`      | linear MAC             | `rac_matmul`                       |
+| Softmax `exp(x)`        | hyperbolic rotation    | `rac_exp`                          |
+| Softmax normalize       | linear vectoring       | built-in (divide)                  |
+| LayerNorm mean / var    | linear accumulate      | built-in                           |
+| `1 / √variance`         | hyperbolic vectoring   | **`rac_rsqrt`**                    |
+| RMSNorm                 | hyperbolic vectoring   | `rac_rmsnorm`                      |
+| LayerNorm               | accumulate + rsqrt     | `rac_layernorm`                    |
+| **RoPE embeddings**     | **circular rotation**  | **`rac_rope_apply` — native**      |
+| Sigmoid                 | hyperbolic rotation    | `rac_sigmoid` = ½(1 + tanh(x/2))   |
+| GELU / SiLU             | hyperbolic + circle    | `rac_gelu`, `rac_silu`             |
+| Scaled dot-product attn | composite              | `rac_attention`                    |
+
+**RoPE is the killer app.** Rotary position embeddings are *literally* Givens rotations. Every other accelerator emulates them with multipliers. RAC executes them natively — one `rac_rotate` per embedding-dim pair.
+
+### Tunable Precision
+
+CORDIC is an N-iteration algorithm — one bit of precision per iteration. That's a first-class knob for AI workloads:
+
+| Regime             | iters | use case                          |
+|--------------------|-------|-----------------------------------|
+| Training           | 24    | fp32-matched precision            |
+| Inference          | 16    | default, good quality             |
+| Edge / quantized   | 8     | tiny, cheap, good enough          |
+
+Exposed via:
+- C:   `rac_rotate_n(v, θ, iters)`, `rac_project_n`, `rac_polar_n`, `rac_exp_n`, `rac_tanh_n`
+- Rust: `cordic::rotate_n`, `project_n`, `polar_n`, `sincos`, `rsqrt`, `sigmoid`
+- PyTorch: `rac_set_precision(iters)` / `RAC_CORDIC_ITERS` env var
+
+No other architecture gives you that knob.
+
+### PyTorch-native classes
+
+```python
+from rac_torch import (
+    RACLinear, RACFusedFFN,              # FFN
+    RACRoPE, RACRoPEAttention,           # rotary-positional attention
+    RACRMSNorm, RACLayerNorm,            # CORDIC-rsqrt norms
+    RACLlamaBlock,                        # Llama-style transformer block
+    rac_set_precision,                   # tunable-precision knob
+)
+
+block = RACLlamaBlock(d_model=4096, n_heads=32, ff_dim=11008)
+y = block(x, is_causal=True)   # every op routes through RAC CORDIC
+```
+
 ---
 
 ## MAC Equivalence
