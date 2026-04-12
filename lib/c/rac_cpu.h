@@ -46,6 +46,8 @@ typedef struct { float x; float y; } rac_vec2;
 /* Inverse of the hyperbolic gain. Use as initial (x, y) so that
  * cordic_hyperbolic(K_HYP_INV, K_HYP_INV, z) produces e^z unscaled. */
 #define RAC_K_HYP_INV  1.2074970f
+/* Alias kept so both spellings resolve to the same (correct) reciprocal. */
+#define RAC_K_HYP_RECIP RAC_K_HYP_INV
 
 /* ── Error codes ────────────────────────────────────────────────────────── */
 

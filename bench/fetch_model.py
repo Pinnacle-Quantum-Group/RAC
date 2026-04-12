@@ -114,32 +114,8 @@ def fetch_hub(repo_id: str, revision: str, filenames: list[str] | None,
 
 # ── urllib fallback ─────────────────────────────────────────────────────
 
-_NEGATIVE_CACHE_NAME = ".404_cache"
-
-def _load_404_cache(dest_dir: pathlib.Path) -> set[str]:
-    f = dest_dir / _NEGATIVE_CACHE_NAME
-    if not f.exists(): return set()
-    try:
-        return set(line.strip() for line in f.read_text().splitlines() if line.strip())
-    except Exception:
-        return set()
-
-def _mark_404(dest_dir: pathlib.Path, filename: str) -> None:
-    f = dest_dir / _NEGATIVE_CACHE_NAME
-    try:
-        with open(f, "a") as fh:
-            fh.write(filename + "\n")
-    except Exception:
-        pass
-
-
 def _download_one(url: str, target: pathlib.Path, token: str | None) -> None:
     if target.exists() and target.stat().st_size > 0:
-        return
-    # Per-directory 404 cache: if we already asked HF for this filename
-    # and got 404, don't ask again on every run.
-    negative = _load_404_cache(target.parent)
-    if target.name in negative:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url)
@@ -154,7 +130,6 @@ def _download_one(url: str, target: pathlib.Path, token: str | None) -> None:
     except urllib.error.HTTPError as e:
         if e.code == 404:
             sys.stderr.write(f"  [skip] 404: {url}\n")
-            _mark_404(target.parent, target.name)
             return
         raise
 
@@ -164,17 +139,7 @@ def fetch_urllib(repo_id: str, revision: str,
                  token: str | None) -> pathlib.Path:
     dest = target_dir(repo_id, revision)
     if filenames is None:
-        # Optimization: if we already have a non-empty model.safetensors,
-        # skip pytorch_model.bin (the dup weight file that 404s for
-        # safetensors-only repos like TinyLlama). This is the common
-        # noise reduction: no more "[skip] 404: pytorch_model.bin"
-        # spam on every harness run.
-        safet = dest / "model.safetensors"
-        ptbin = dest / "pytorch_model.bin"
-        files = list(DEFAULT_FILES)
-        if safet.exists() and safet.stat().st_size > 0 and not ptbin.exists():
-            files = [f for f in files if f != "pytorch_model.bin"]
-        filenames = files
+        filenames = DEFAULT_FILES
     base = f"https://huggingface.co/{repo_id}/resolve/{revision}"
     for fn in filenames:
         url = f"{base}/{fn}"

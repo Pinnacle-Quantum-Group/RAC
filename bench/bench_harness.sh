@@ -52,64 +52,6 @@ if [[ -z "$BIN_DIR" ]]; then
 fi
 RAC_BIN="${BIN_DIR}/bench_rac_transformer"
 
-# ── PEP 668-safe Python deps ───────────────────────────────────────────
-# Debian / Ubuntu 23.04+ ship externally-managed Python. `pip install` on
-# the system interpreter errors out. When --auto-install is set we
-# provision a private venv under ~/.cache/rac_bench/venv and front-load
-# its bin on PATH so everything downstream (fetch_model.py, tinygrad,
-# huggingface_hub) uses it automatically.
-BENCH_VENV="${HOME}/.cache/rac_bench/venv"
-
-_ensure_venv() {
-  if [[ -d "$BENCH_VENV" && -x "$BENCH_VENV/bin/python3" ]]; then
-    return 0
-  fi
-  echo "  [auto-install] creating bench venv at $BENCH_VENV" >&2
-  python3 -m venv "$BENCH_VENV" 2>&1 | sed 's/^/    /' >&2 || {
-    echo "  [WARN] python3 -m venv failed; is python3-venv installed? (apt install python3-venv)" >&2
-    return 1
-  }
-  "$BENCH_VENV/bin/python3" -m pip install --quiet --upgrade pip setuptools wheel \
-    2>&1 | sed 's/^/    /' >&2 || true
-}
-
-_bench_pip_install() {
-  # $1..: package names. Tries system pip first; on PEP 668 failure falls
-  # back to the bench venv. Idempotent — skips if import succeeds.
-  local pkg
-  for pkg in "$@"; do
-    local mod="$pkg"
-    case "$pkg" in
-      huggingface_hub|huggingface-hub) mod=huggingface_hub ;;
-      *) mod="${pkg//-/_}" ;;
-    esac
-    if python3 -c "import $mod" 2>/dev/null; then
-      continue
-    fi
-    # System attempt (will fail silently on PEP 668)
-    if pip install --quiet "$pkg" 2>/dev/null; then
-      echo "  [auto-install] pip installed $pkg (system)" >&2
-      continue
-    fi
-    # Venv fallback
-    _ensure_venv || return 1
-    if "$BENCH_VENV/bin/pip" install --quiet "$pkg" 2>&1 | sed 's/^/    /' >&2; then
-      echo "  [auto-install] installed $pkg into $BENCH_VENV" >&2
-    else
-      echo "  [WARN] failed to install $pkg — continuing without it" >&2
-    fi
-  done
-}
-
-if [[ "$AUTO_INSTALL" -eq 1 ]]; then
-  _bench_pip_install huggingface_hub
-  # If the venv exists, front-load it so subsequent python3 calls pick it up.
-  if [[ -x "$BENCH_VENV/bin/python3" ]]; then
-    export PATH="$BENCH_VENV/bin:$PATH"
-    export VIRTUAL_ENV="$BENCH_VENV"
-  fi
-fi
-
 # ── Fetch weights once (both RAC and tinygrad pull the same files) ─────
 MODEL_ID="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 echo "  fetching $MODEL_ID (idempotent, cached)..." >&2
