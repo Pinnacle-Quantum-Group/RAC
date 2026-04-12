@@ -21,17 +21,78 @@ float rac_fma(float a, float b, float acc) {
 }
 
 /*
- * Tunable-precision CORDIC multiply-accumulate.
+ * rac_shiftadd_mul: a * b via pure integer shift-add.
  *
- *   iters >= 24  → fast path: single sign-XOR FMA (identical to rac_fma).
- *                  Zero overhead vs the fixed kernel.
- *   iters <  24  → genuine N-iteration CORDIC linear multiply.
- *                  Each iter is one shift-add (fmaf + subtract); total work
- *                  scales linearly with iters. Precision ≈ iters bits.
- *                  This is the curve a dedicated RAC ASIC walks natively.
+ * NO hardware multiplier and NO FMA is engaged in the computation — only
+ * integer shifts, adds, masks, a count-leading-zeros, and one final
+ * sign/exponent bit-pack to produce the fp32 result.
  *
- * On GPU, `iters` is warp-uniform per launch so the top-level branch is
- * predicted and incurs no divergence.
+ * This is the honest no-multiplier compute path the RAC pitch describes.
+ * On a dedicated ASIC each loop iteration is one shift-add cycle; on a GPU
+ * we're deliberately leaving the FP multiplier idle, which is slower in
+ * raw TOPS but demonstrates the algorithmic claim.
+ *
+ * `iters` selects how many top bits of b's mantissa are consumed.
+ *   24 → full fp32 precision (but prefer rac_fma_iters' fast path)
+ *   16 → ~16 bits of precision, bf16-ish
+ *    8 → ~8 bits, int8-ish
+ *    4 → ~4 bits, int4-ish
+ *
+ * Absolute error is bounded by roughly 2^-iters * |a*b|.
+ */
+__device__ __forceinline__
+float rac_shiftadd_mul(float a, float b, int iters) {
+    if (a == 0.0f || b == 0.0f) return 0.0f;
+
+    unsigned int ai = __float_as_uint(a);
+    unsigned int bi = __float_as_uint(b);
+    unsigned int sign = (ai ^ bi) & 0x80000000u;
+    int exp_a = (int)((ai >> 23) & 0xFFu) - 127;
+    int exp_b = (int)((bi >> 23) & 0xFFu) - 127;
+    /* 24-bit mantissas with the implicit leading 1 reinstated. */
+    unsigned int ma = 0x00800000u | (ai & 0x007FFFFFu);
+    unsigned int mb = 0x00800000u | (bi & 0x007FFFFFu);
+
+    /* Conditional shift-add: for each of the top `iters` bits of mb,
+     * add ma (shifted to align with the bit's weight) into the 48-bit
+     * product accumulator. One shift + mask + compare + conditional add
+     * per iteration. No multiplier, anywhere. */
+    unsigned long long prod = 0ULL;
+    int lim = iters < 1 ? 1 : (iters > 24 ? 24 : iters);
+    for (int i = 0; i < lim; i++) {
+        unsigned int bit = (mb >> (23 - i)) & 1u;
+        if (bit) prod += ((unsigned long long)ma) << (23 - i);
+    }
+    if (prod == 0ULL) return 0.0f;
+
+    /* Normalize: find the leading 1 and realign into the fp32 mantissa. */
+    int top = 63 - __clzll(prod);            /* top set bit position */
+    int shift_r = top - 23;
+    unsigned int mantissa;
+    if (shift_r > 0)      mantissa = (unsigned int)(prod >> shift_r) & 0x007FFFFFu;
+    else if (shift_r < 0) mantissa = (unsigned int)(prod << -shift_r) & 0x007FFFFFu;
+    else                  mantissa = (unsigned int)prod & 0x007FFFFFu;
+
+    int rexp = exp_a + exp_b + (top - 46) + 127;
+    if (rexp <= 0 || rexp >= 0xFF) return 0.0f;  /* flush sub-/super-normals */
+
+    unsigned int bits = sign | ((unsigned int)(rexp & 0xFFu) << 23) | mantissa;
+    return __uint_as_float(bits);
+}
+
+/*
+ * Tunable-precision multiply-accumulate.
+ *
+ *   iters >= 24 → fast path: single sign-XOR FMA. Uses hardware multiplier.
+ *                 Identical to rac_fma. Pick this for production perf.
+ *
+ *   iters <  24 → pure shift-add path via rac_shiftadd_mul + one float add
+ *                 to fold the product into acc. No FP multiplier is used in
+ *                 the critical path. Cycles scale linearly with iters —
+ *                 the RAC pitch curve, executed honestly on current GPUs
+ *                 (where the multiplier is idle, not the SFU).
+ *
+ * iters is warp-uniform per kernel launch so the dispatch branch is free.
  */
 __device__ __forceinline__
 float rac_fma_iters(float a, float b, float acc, int iters) {
@@ -43,24 +104,9 @@ float rac_fma_iters(float a, float b, float acc, int iters) {
         float mag_b = __uint_as_float(bi & 0x7FFFFFFFu);
         return fmaf(proj, mag_b, acc);
     }
-    if (a == 0.0f || b == 0.0f) return acc;
-
-    /* Decompose b = m * 2^e, |m| in [0.5, 1). CORDIC runs on m in that range. */
-    int e;
-    float m = frexpf(b, &e);
-
-    /* CORDIC linear rotation mode: after N iters, y ≈ a * m. */
-    float x = a;
-    float y = 0.0f;
-    float z = m;
-    float scale = 0.5f;
-    for (int i = 0; i < iters; i++) {
-        float d = (z >= 0.0f) ? 1.0f : -1.0f;
-        y = fmaf(d * scale, x, y);
-        z -= d * scale;
-        scale *= 0.5f;
-    }
-    return acc + ldexpf(y, e);
+    /* Multiplier-free path: product by shift-add, accumulate via adder. */
+    float prod = rac_shiftadd_mul(a, b, iters);
+    return acc + prod;
 }
 
 /* ── Tile parameters ──────────────────────────────────────────────────── */
