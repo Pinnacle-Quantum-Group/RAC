@@ -67,17 +67,47 @@ TinyLlama uses 4 KV heads (GQA): 32 query heads share 4 key/value heads.
 | **prefill** | 128 (override `--prefill N`) | compute-bound GEMM | peak GFLOPS |
 | **decode** | 1 | memory-bound GEMV | token latency |
 
-### Running the other two frameworks
+### Running all three frameworks (one command)
 
-**llama.cpp:** fill in `configs/llama_cpp.yaml`, then (once harness lands):
 ```bash
-./bench/run_llama_cpp.sh
+# On your box, from the repo root:
+./bench/bench_harness.sh --auto-install --auto-build --layer 0
 ```
 
-**tinygrad:** fill in `configs/tinygrad.yaml`, then:
+That command:
+1. Fetches TinyLlama weights into `~/.cache/rac_bench/` (via `fetch_model.py`)
+2. Runs the RAC bench with real layer-0 weights
+3. `--auto-build` clones + builds `llama.cpp` into `/tmp/llama.cpp` if missing,
+   then runs `llama-bench` on the Q8_0 GGUF
+4. `--auto-install` pip-installs `tinygrad` if missing, then runs a minimal
+   decoder-layer forward pass with real weights
+5. Prints individual JSON lines per framework, followed by a Markdown
+   side-by-side table with ratios vs RAC
+
+**Flags:** `--skip-rac`, `--skip-llama`, `--skip-tinygrad`, `--layer N`,
+`--bin-dir DIR` (override auto-detection of `bench_rac_transformer`).
+
+### Running each framework individually
+
+**RAC only** — see the "Real-weights run" section above.
+
+**llama.cpp only:**
 ```bash
-python bench/run_tinygrad.py
+# Prerequisite: llama-bench on $PATH, or pass --auto-build to clone/build into /tmp.
+./bench/run_llama_cpp.sh                 # uses configs/llama_cpp.yaml
+./bench/run_llama_cpp.sh --auto-build    # builds llama.cpp first if missing
 ```
+Output: one JSON line on stdout with prefill/decode tok/s (model-total
+and per-layer via the `n_layers_divisor`).
+
+**tinygrad only:**
+```bash
+python3 bench/run_tinygrad.py                  # uses configs/tinygrad.yaml
+python3 bench/run_tinygrad.py --auto-install   # pip install tinygrad if missing
+python3 bench/run_tinygrad.py --layer 5        # different decoder layer
+```
+Output: one JSON line with prefill/decode ms/layer and tok/s/layer.
+Loads real TinyLlama layer weights via tinygrad's `safe_load`.
 
 ### Fair-comparison notes
 
