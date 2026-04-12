@@ -27,6 +27,7 @@ extern crate alloc;
 pub mod cordic;
 pub mod matmul;
 pub mod activation;
+pub mod transformer;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -35,15 +36,22 @@ use core::f32::consts::PI;
 // Re-exports
 pub use cordic::{Vec2, rotate, rotate_raw, project, polar, norm, normalize, dot, coherence};
 pub use cordic::{complex_mul, exp, tanh, dct, softmax};
+pub use cordic::{rotate_n, project_n, polar_n, sincos, rsqrt, sigmoid};
 pub use matmul::{sgemm, matmul, fused_linear};
 pub use activation::{Activation, relu, gelu, silu, softmax_batch};
+pub use transformer::{layernorm, rmsnorm, rope_cache, rope_apply, scaled_dot_attention};
 
 /// CORDIC constants
 pub const K_INV: f32 = 0.60725;
 pub const K: f32 = 1.64676;
 pub const ITERS: usize = 16;
 pub const ITERS_FAST: usize = 12;
-pub const K_HYP_INV: f32 = 0.82816;
+/// Hyperbolic CORDIC forward gain.
+/// K_hyp = prod_{i=1..N, repeats at 4,13} sqrt(1 - 2^-2i) ≈ 0.82816 for N=16.
+pub const K_HYP: f32 = 0.82816;
+/// Inverse of the hyperbolic CORDIC gain; use as initial x and y so
+/// the (cosh, sinh) outputs come out un-scaled.
+pub const K_HYP_INV: f32 = 1.2074970;
 pub const RAC_PI: f32 = PI;
 
 /// Configuration for RAC operations

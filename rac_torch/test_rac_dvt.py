@@ -752,6 +752,194 @@ check("  all gradients flow", grads_ok)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# DVT-27: RACRoPE correctness (rotation invariance)
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-27: RACRoPE correctness")
+
+try:
+    from rac_torch import RACRoPE
+
+    rope = RACRoPE(head_dim=16, max_seq_len=32)
+    q = torch.randn(2, 4, 8, 16)
+    k = torch.randn_like(q)
+    q2, k2 = rope(q, k)
+
+    # Pair magnitudes preserved (RoPE is an orthogonal rotation per pair)
+    p0 = q.view(2, 4, 8, 8, 2)
+    p1 = q2.view(2, 4, 8, 8, 2)
+    m0 = p0.pow(2).sum(-1).sqrt()
+    m1 = p1.pow(2).sum(-1).sqrt()
+    check("RoPE preserves pair magnitudes", torch.allclose(m0, m1, atol=1e-4))
+
+    # RoPE respects relative position: Q·K invariance under equal shifts.
+    # (Stronger property — we check a simpler one: t=0 rotation is identity.)
+    check("RoPE at t=0 is identity",
+          torch.allclose(q[:, :, 0, :], q2[:, :, 0, :], atol=1e-4))
+
+    # Explicit positions argument
+    positions = torch.arange(8)
+    q3, _ = rope(q, k, positions=positions)
+    check("RoPE with explicit positions matches default",
+          torch.allclose(q3, q2, atol=1e-4))
+
+    # Gradient flows through RoPE
+    q_leaf = torch.randn(1, 1, 4, 16, requires_grad=True)
+    k_leaf = torch.randn(1, 1, 4, 16, requires_grad=True)
+    q_out, k_out = rope(q_leaf, k_leaf)
+    (q_out.sum() + k_out.sum()).backward()
+    check("RoPE grad flows to Q", q_leaf.grad is not None)
+    check("RoPE grad flows to K", k_leaf.grad is not None)
+except Exception as e:
+    check("RoPE correctness", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-28: RACRMSNorm vs torch-native RMSNorm reference
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-28: RACRMSNorm correctness")
+
+try:
+    from rac_torch import RACRMSNorm
+
+    d = 64
+    rms = RACRMSNorm(d, eps=1e-6)
+    x = torch.randn(8, d)
+
+    # Reference implementation
+    def ref_rmsnorm(x, w, eps):
+        ms = x.pow(2).mean(-1, keepdim=True)
+        return (x * torch.rsqrt(ms + eps)) * w
+
+    y = rms(x)
+    y_ref = ref_rmsnorm(x, rms.weight, 1e-6)
+    check("RMSNorm matches reference", torch.allclose(y, y_ref, atol=1e-5))
+
+    # Non-trivial gamma — scale all outputs by 2
+    with torch.no_grad():
+        rms.weight.fill_(2.0)
+    y = rms(x)
+    y_ref = ref_rmsnorm(x, rms.weight, 1e-6)
+    check("RMSNorm gamma scaling", torch.allclose(y, y_ref, atol=1e-5))
+
+    # Gradient
+    x_leaf = x.clone().requires_grad_(True)
+    rms(x_leaf).sum().backward()
+    check("RMSNorm grad flows to input", x_leaf.grad is not None)
+    check("RMSNorm grad flows to weight", rms.weight.grad is not None)
+except Exception as e:
+    check("RMSNorm correctness", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-29: RACLayerNorm vs torch.nn.LayerNorm reference
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-29: RACLayerNorm correctness")
+
+try:
+    from rac_torch import RACLayerNorm
+
+    d = 48
+    rac_ln = RACLayerNorm(d, eps=1e-5)
+    tn_ln  = torch.nn.LayerNorm(d, eps=1e-5)
+    with torch.no_grad():
+        tn_ln.weight.copy_(rac_ln.weight)
+        tn_ln.bias.copy_(rac_ln.bias)
+
+    x = torch.randn(4, 7, d)
+    y_rac = rac_ln(x)
+    y_ref = tn_ln(x)
+    check("RACLayerNorm matches torch.nn.LayerNorm",
+          torch.allclose(y_rac, y_ref, atol=1e-5))
+
+    # Bias=False variant
+    ln_no_bias = RACLayerNorm(d, eps=1e-5, bias=False)
+    y = ln_no_bias(x)
+    check("RACLayerNorm bias=False output shape", y.shape == x.shape)
+except Exception as e:
+    check("LayerNorm correctness", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-30: RACRoPEAttention end-to-end (forward + backward)
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-30: RACRoPEAttention forward + backward")
+
+try:
+    from rac_torch import RACRoPEAttention
+
+    attn = RACRoPEAttention(d_model=32, n_heads=4, max_seq_len=16)
+    x = torch.randn(2, 8, 32, requires_grad=True)
+    out = attn(x, is_causal=True)
+    check("RoPEAttention output shape", out.shape == x.shape)
+    out.sum().backward()
+    check("RoPEAttention backward flows", x.grad is not None)
+    check("RoPEAttention all params got grad",
+          all(p.grad is not None for p in attn.parameters()))
+
+    # Causal: last token's output doesn't depend on future tokens (no change
+    # when permuting future inputs on last position for is_causal=True).
+    x_a = torch.randn(1, 4, 32)
+    x_b = x_a.clone(); x_b[:, -1] = torch.randn(32)  # change last token
+    attn.eval()
+    with torch.no_grad():
+        ya = attn(x_a, is_causal=True)
+        yb = attn(x_b, is_causal=True)
+    # Tokens before the last should match in causal mode
+    check("RoPEAttention causal prefix unchanged",
+          torch.allclose(ya[:, :-1], yb[:, :-1], atol=1e-4))
+except Exception as e:
+    check("RoPEAttention correctness", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-31: RACLlamaBlock training step
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-31: RACLlamaBlock training")
+
+try:
+    from rac_torch import RACLlamaBlock
+
+    block = RACLlamaBlock(d_model=32, n_heads=4, ff_dim=64, max_seq_len=16)
+    opt = torch.optim.Adam(block.parameters(), lr=1e-3)
+    x = torch.randn(2, 8, 32)
+    target = torch.randn_like(x)
+
+    losses = []
+    for _ in range(20):
+        opt.zero_grad()
+        y = block(x, is_causal=True)
+        loss = (y - target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+
+    check("Llama block training decreases loss", losses[-1] < losses[0] * 0.95)
+    check("Llama block output finite after training",
+          torch.isfinite(block(x)).all().item())
+except Exception as e:
+    check("Llama training", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DVT-32: Tunable-precision knob roundtrip
+# ═══════════════════════════════════════════════════════════════════════════
+header("DVT-32: Tunable precision")
+
+try:
+    from rac_torch import rac_set_precision, rac_get_precision
+    for iters in [4, 8, 12, 16, 20, 24]:
+        rac_set_precision(iters)
+        check(f"precision {iters} roundtrips", rac_get_precision() == iters)
+    rac_set_precision(-5)
+    check("negative clamped to 4", rac_get_precision() == 4)
+    rac_set_precision(1000)
+    check("oversize clamped to 24", rac_get_precision() == 24)
+    rac_set_precision(16)
+except Exception as e:
+    check("precision knob", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 header("DVT Summary")

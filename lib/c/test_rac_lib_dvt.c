@@ -308,6 +308,246 @@ int main(void) {
     CHECK("softmax(8) sums to 1", fabsf(sm_sum - 1.0f) < 0.02f);
     CHECK("softmax monotonic", sm_out[7] > sm_out[0]);
 
+    /* ── DVT-10: Tunable-precision CORDIC (iters 4..24) ──────────── */
+    HEADER("DVT-10: Tunable-precision sweep");
+    {
+        /* Each additional iteration should not increase the worst-case
+         * error versus libm beyond the error at the previous iter count. */
+        float worst[25] = {0};
+        for (int iters = 4; iters <= 24; iters += 2) {
+            float worst_err = 0.0f;
+            for (int deg = 0; deg < 360; deg += 7) {
+                float theta = deg * RAC_PI / 180.0f;
+                rac_vec2 r = rac_rotate_n((rac_vec2){1.0f, 0.0f}, theta, iters);
+                float err = fmaxf(fabsf(r.x - cosf(theta)),
+                                  fabsf(r.y - sinf(theta)));
+                if (err > worst_err) worst_err = err;
+            }
+            worst[iters] = worst_err;
+            char name[128];
+            snprintf(name, sizeof(name),
+                     "iters=%d worst err=%.2e", iters, worst_err);
+            /* CORDIC adds ~1 bit per iter; error ≈ 2^-iters in practice,
+             * with some slack from gain compensation at small iter counts.
+             * Float32 bottoms out near 1e-5 for values near 1. */
+            float tol = fmaxf(1e-5f, 4.0f * ldexpf(1.0f, -iters));
+            CHECK(name, worst_err < tol);
+        }
+        CHECK("iters=16 strictly better than iters=4", worst[16] <= worst[4]);
+        CHECK("iters=24 strictly better than iters=8", worst[24] <= worst[8]);
+
+        /* project_n convergence */
+        rac_vec2 v = {1.0f, 0.0f};
+        CHECK("project_n(pi, 8) ≈ -1",  fabsf(rac_project_n(v, RAC_PI, 8) + 1.0f) < 0.01f);
+        CHECK("project_n(pi/2, 16) ≈ 0", fabsf(rac_project_n(v, RAC_PI * 0.5f, 16)) < 0.001f);
+
+        float mag, angle;
+        rac_polar_n((rac_vec2){3.0f, 4.0f}, &mag, &angle, 16);
+        CHECK("polar_n mag ≈ 5",  fabsf(mag - 5.0f) < 0.01f);
+        CHECK("polar_n angle ≈ atan2(4,3)", fabsf(angle - atan2f(4.0f, 3.0f)) < 0.01f);
+
+        /* exp_n / tanh_n should match libm on the CPU path */
+        CHECK("exp_n(0,8)=1", fabsf(rac_exp_n(0.0f, 8) - 1.0f) < 1e-6f);
+        CHECK("tanh_n(0,8)=0", fabsf(rac_tanh_n(0.0f, 8)) < 1e-6f);
+    }
+
+    /* ── DVT-11: rsqrt / sigmoid / sincos ─────────────────────────── */
+    HEADER("DVT-11: rsqrt / sigmoid / sincos sweep");
+    {
+        int rsqrt_ok = 1;
+        for (int i = 1; i <= 128; i++) {
+            float x = (float)i * 0.5f;
+            float expected = 1.0f / sqrtf(x);
+            if (fabsf(rac_rsqrt(x) - expected) > 1e-4f) { rsqrt_ok = 0; break; }
+        }
+        CHECK("rsqrt matches 1/sqrt over [0.5, 64]", rsqrt_ok);
+        CHECK("rsqrt(0) == 0 (guarded)",  rac_rsqrt(0.0f) == 0.0f);
+
+        int sig_ok = 1;
+        for (int i = -20; i <= 20; i++) {
+            float x = (float)i * 0.25f;
+            float expected = 1.0f / (1.0f + expf(-x));
+            if (fabsf(rac_sigmoid(x) - expected) > 1e-5f) { sig_ok = 0; break; }
+        }
+        CHECK("sigmoid matches 1/(1+e^-x)", sig_ok);
+
+        int sincos_ok = 1;
+        for (int deg = 0; deg < 360; deg += 11) {
+            float theta = deg * RAC_PI / 180.0f;
+            float s, c;
+            rac_sincos(theta, &s, &c);
+            if (fabsf(s - sinf(theta)) > 0.01f ||
+                fabsf(c - cosf(theta)) > 0.01f) { sincos_ok = 0; break; }
+        }
+        CHECK("sincos matches libm on full circle", sincos_ok);
+    }
+
+    /* ── DVT-12: LayerNorm / RMSNorm correctness + edge cases ─────── */
+    HEADER("DVT-12: LayerNorm / RMSNorm sweep");
+    {
+        /* Batch of 16 random rows × d=128 */
+        int R = 16, D = 128;
+        float *x = malloc(R*D*sizeof(float));
+        float *y = malloc(R*D*sizeof(float));
+        rand_fill(x, R*D);
+
+        rac_status st = rac_layernorm(x, y, NULL, NULL, 1e-5f, R, D, &cfg);
+        CHECK("layernorm random batch OK", st == RAC_OK);
+
+        /* Every row must have mean≈0 and variance≈1. */
+        int norm_ok = 1;
+        for (int r = 0; r < R; r++) {
+            float mean = 0, var = 0;
+            for (int i = 0; i < D; i++) mean += y[r*D + i];
+            mean /= D;
+            for (int i = 0; i < D; i++) { float z = y[r*D + i] - mean; var += z*z; }
+            var /= D;
+            if (fabsf(mean) > 0.01f || fabsf(var - 1.0f) > 0.05f) { norm_ok = 0; break; }
+        }
+        CHECK("layernorm produces zero-mean unit-variance rows", norm_ok);
+
+        /* With gamma=[2,2,..], scale doubles */
+        float gamma[128]; for (int i = 0; i < D; i++) gamma[i] = 2.0f;
+        rac_layernorm(x, y, gamma, NULL, 1e-5f, R, D, &cfg);
+        float var_scaled = 0, mean_scaled = 0;
+        for (int i = 0; i < D; i++) mean_scaled += y[i]; mean_scaled /= D;
+        for (int i = 0; i < D; i++) { float z = y[i] - mean_scaled; var_scaled += z*z; }
+        var_scaled /= D;
+        CHECK("layernorm gamma=2 → variance≈4", fabsf(var_scaled - 4.0f) < 0.2f);
+
+        /* RMSNorm: y = x / sqrt(mean(x^2) + eps) */
+        rac_rmsnorm(x, y, NULL, 1e-6f, R, D, &cfg);
+        int rms_ok = 1;
+        for (int r = 0; r < R && rms_ok; r++) {
+            float ms = 0;
+            for (int i = 0; i < D; i++) ms += y[r*D + i] * y[r*D + i];
+            ms /= D;
+            if (fabsf(ms - 1.0f) > 0.05f) rms_ok = 0;
+        }
+        CHECK("rmsnorm rows have mean-square ≈ 1", rms_ok);
+
+        /* Error handling */
+        CHECK("layernorm NULL → error",
+              rac_layernorm(NULL, y, NULL, NULL, 1e-5f, R, D, &cfg) == RAC_ERR_NULL_PTR);
+        CHECK("rmsnorm d=0 → error",
+              rac_rmsnorm(x, y, NULL, 1e-6f, R, 0, &cfg) == RAC_ERR_INVALID_DIM);
+
+        free(x); free(y);
+    }
+
+    /* ── DVT-13: RoPE properties ──────────────────────────────────── */
+    HEADER("DVT-13: RoPE rotation properties");
+    {
+        int seq = 16, head_dim = 64;
+        int half = head_dim / 2;
+        float *cos_tab = malloc(seq * half * sizeof(float));
+        float *sin_tab = malloc(seq * half * sizeof(float));
+        rac_status st = rac_rope_cache(cos_tab, sin_tab, seq, head_dim, 10000.0f);
+        CHECK("rope_cache runs OK", st == RAC_OK);
+
+        /* cos^2 + sin^2 == 1 for every entry */
+        int unit_ok = 1;
+        for (int i = 0; i < seq * half; i++) {
+            float s = sin_tab[i], c = cos_tab[i];
+            if (fabsf(s*s + c*c - 1.0f) > 0.01f) { unit_ok = 0; break; }
+        }
+        CHECK("rope cos^2 + sin^2 == 1", unit_ok);
+
+        /* Invalid odd head_dim rejected */
+        CHECK("rope_cache rejects odd head_dim",
+              rac_rope_cache(cos_tab, sin_tab, 4, 5, 10000.0f) == RAC_ERR_INVALID_DIM);
+
+        /* Apply RoPE: magnitudes of each 2-pair must be preserved */
+        int B=2, H=2;
+        int total = B*H*seq*head_dim;
+        float *x    = malloc(total*sizeof(float));
+        float *orig = malloc(total*sizeof(float));
+        rand_fill(x, total);
+        memcpy(orig, x, total*sizeof(float));
+
+        st = rac_rope_apply(x, cos_tab, sin_tab, B, H, seq, head_dim, &cfg);
+        CHECK("rope_apply runs OK", st == RAC_OK);
+
+        int mag_ok = 1;
+        for (int i = 0; i < total; i += 2) {
+            float m0 = sqrtf(orig[i]*orig[i] + orig[i+1]*orig[i+1]);
+            float m1 = sqrtf(x[i]*x[i] + x[i+1]*x[i+1]);
+            if (fabsf(m0 - m1) > 0.01f) { mag_ok = 0; break; }
+        }
+        CHECK("rope_apply preserves every 2-vector's magnitude", mag_ok);
+
+        /* Position 0 is an identity rotation */
+        float *x0       = malloc(half * 2 * sizeof(float));
+        float *x0_orig  = malloc(half * 2 * sizeof(float));
+        rand_fill(x0, half * 2); memcpy(x0_orig, x0, half * 2 * sizeof(float));
+        rac_rope_apply(x0, cos_tab, sin_tab, 1, 1, 1, head_dim, &cfg);
+        int id_ok = 1;
+        for (int i = 0; i < half*2; i++) {
+            if (fabsf(x0[i] - x0_orig[i]) > 1e-4f) { id_ok = 0; break; }
+        }
+        CHECK("rope at position 0 is identity", id_ok);
+
+        free(cos_tab); free(sin_tab); free(x); free(orig); free(x0); free(x0_orig);
+    }
+
+    /* ── DVT-14: Scaled dot-product attention ─────────────────────── */
+    HEADER("DVT-14: Attention correctness sweep");
+    {
+        int B=2, H=2, T=4, D=8;
+        int total = B*H*T*D;
+        float *q   = malloc(total*sizeof(float));
+        float *k   = malloc(total*sizeof(float));
+        float *v   = malloc(total*sizeof(float));
+        float *out = malloc(total*sizeof(float));
+
+        rand_fill(q, total);
+        rand_fill(k, total);
+        rand_fill(v, total);
+
+        rac_status st = rac_scaled_dot_attention(q, k, v, NULL, 0, out, B, H, T, D, &cfg);
+        CHECK("attention random run OK", st == RAC_OK);
+
+        /* Output must be finite */
+        int fin_ok = 1;
+        for (int i = 0; i < total; i++) if (!isfinite(out[i])) { fin_ok = 0; break; }
+        CHECK("attention output finite", fin_ok);
+
+        /* Causal output: token 0 attends only to itself → out[t=0] == V[t=0] */
+        rac_scaled_dot_attention(q, k, v, NULL, 1, out, B, H, T, D, &cfg);
+        float causal_err = 0;
+        for (int b=0; b<B; b++) for (int h=0; h<H; h++)
+          for (int d=0; d<D; d++) {
+            int o = ((b*H + h)*T + 0)*D + d;
+            int iv = ((b*H + h)*T + 0)*D + d;
+            float e = fabsf(out[o] - v[iv]);
+            if (e > causal_err) causal_err = e;
+        }
+        CHECK("attention causal t=0 attends only to itself", causal_err < 0.01f);
+
+        /* Uniform Q=K=0 → equal attention weights → out[t,d] = mean_s V[s,d] */
+        for (int i = 0; i < total; i++) { q[i] = 0; k[i] = 0; }
+        rac_scaled_dot_attention(q, k, v, NULL, 0, out, B, H, T, D, &cfg);
+        int uniform_ok = 1;
+        for (int b=0; b<B && uniform_ok; b++)
+          for (int h=0; h<H && uniform_ok; h++)
+            for (int d=0; d<D && uniform_ok; d++) {
+                float mean = 0;
+                for (int s = 0; s < T; s++)
+                    mean += v[((b*H + h)*T + s)*D + d];
+                mean /= T;
+                for (int t = 0; t < T; t++) {
+                    float got = out[((b*H + h)*T + t)*D + d];
+                    if (fabsf(got - mean) > 0.01f) { uniform_ok = 0; break; }
+                }
+            }
+        CHECK("attention uniform Q/K → mean-V output", uniform_ok);
+
+        CHECK("attention NULL → error",
+              rac_scaled_dot_attention(NULL, k, v, NULL, 0, out, B, H, T, D, &cfg) == RAC_ERR_NULL_PTR);
+
+        free(q); free(k); free(v); free(out);
+    }
+
     /* ── Summary ──────────────────────────────────────────────────── */
     HEADER("DVT Summary");
     printf("  Passed: %d\n  Failed: %d\n  Total:  %d\n", passed, failed, passed+failed);

@@ -692,6 +692,107 @@ check(f"converted attention matches vanilla (err={err:.2e})", err < 0.05)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# E2E-18: Llama-style block training convergence
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-18: RACLlamaBlock training convergence")
+
+try:
+    from rac_torch import RACLlamaBlock
+
+    torch.manual_seed(0)
+    block = RACLlamaBlock(d_model=64, n_heads=8, ff_dim=128, max_seq_len=32)
+    opt = torch.optim.Adam(block.parameters(), lr=1e-3)
+    x = torch.randn(4, 16, 64)
+    target = torch.randn_like(x)
+
+    init_loss = None
+    final_loss = None
+    for step in range(60):
+        opt.zero_grad()
+        y = block(x, is_causal=True)
+        loss = (y - target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        if step == 0: init_loss = loss.item()
+        if step == 59: final_loss = loss.item()
+
+    check(f"Llama training reduces loss ({init_loss:.4f} -> {final_loss:.4f})",
+          final_loss < init_loss * 0.85)
+except Exception as e:
+    check("Llama training convergence", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-19: Performance — RoPE, RMSNorm, LayerNorm throughput
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-19: Transformer-op throughput benchmark")
+
+try:
+    import time
+    from rac_torch import RACRoPE, RACRMSNorm, RACLayerNorm
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _bench(fn, x, n=20, warmup=5):
+        for _ in range(warmup): fn(x)
+        if device == 'cuda': torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n): fn(x)
+        if device == 'cuda': torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / n * 1000  # ms
+
+    # RMSNorm
+    rms = RACRMSNorm(4096).to(device)
+    tn_rms_ref = torch.nn.LayerNorm(4096).to(device)   # proxy baseline
+    x = torch.randn(32, 4096, device=device)
+    t_rms = _bench(lambda a: rms(a), x)
+    t_ln  = _bench(lambda a: tn_rms_ref(a), x)
+    print(f"  RMSNorm: {t_rms:.3f}ms    torch.nn.LayerNorm: {t_ln:.3f}ms")
+
+    # LayerNorm
+    ln = RACLayerNorm(4096).to(device)
+    t_rln = _bench(lambda a: ln(a), x)
+    print(f"  RACLayerNorm: {t_rln:.3f}ms")
+
+    # RoPE
+    rope = RACRoPE(head_dim=64, max_seq_len=512).to(device)
+    q = torch.randn(2, 16, 256, 64, device=device)
+    k = torch.randn_like(q)
+    t_rope = _bench(lambda a: rope(a, a)[0], q)
+    print(f"  RoPE apply (2,16,256,64): {t_rope:.3f}ms")
+
+    check("transformer throughput bench ran", True)
+except Exception as e:
+    check("transformer throughput bench", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# E2E-20: Precision knob — output delta across iter counts
+# ═══════════════════════════════════════════════════════════════════════════
+header("E2E-20: Tunable-precision effect")
+
+try:
+    from rac_torch import rac_set_precision, RACLlamaBlock
+
+    torch.manual_seed(0)
+    block = RACLlamaBlock(d_model=32, n_heads=4, ff_dim=64, max_seq_len=16)
+    x = torch.randn(2, 8, 32)
+
+    rac_set_precision(24)
+    y_hi = block(x)
+    rac_set_precision(8)
+    y_lo = block(x)
+    delta = (y_hi - y_lo).abs().max().item()
+    rac_set_precision(16)
+    # CPU fallback path is identical regardless of iters — delta should
+    # be small. If a CORDIC kernel is active the delta is observable.
+    check("precision knob did not crash", True)
+    print(f"  max |y(iters=24) - y(iters=8)| = {delta:.2e}")
+except Exception as e:
+    check("precision knob e2e", False, str(e)[:80])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 header("E2E Summary")
