@@ -54,16 +54,42 @@ RAC_BIN="${BIN_DIR}/bench_rac_transformer"
 
 _build_rac_bench() {
   # Build bench_rac_transformer + librac_avx2 via the top-level CMake
-  # project. Uses ../lib/build as the out-of-tree build dir. Idempotent.
-  local build_dir="${HERE}/../lib/build"
-  echo "  [auto-build] configuring RAC bench in $build_dir" >&2
+  # project using explicit -S/-B so a stray in-source cmake cache
+  # (eg. from someone running `cmake .` inside lib/) can't redirect
+  # the generator. Uses lib/build as the out-of-tree build dir.
+  # Idempotent.
+  local src_dir build_dir
+  src_dir="$(cd "${HERE}/../lib" && pwd)"
+  build_dir="${src_dir}/build"
+
+  # Clean up stale in-source cache if one exists. Without this, cmake
+  # writes to src_dir instead of build_dir, and the subsequent
+  # `cmake --build` step fails with "Error: could not load cache".
+  if [[ -f "$src_dir/CMakeCache.txt" ]]; then
+    echo "  [auto-build] removing stale in-source cmake cache at $src_dir/CMakeCache.txt" >&2
+    rm -f "$src_dir/CMakeCache.txt"
+    rm -rf "$src_dir/CMakeFiles"
+  fi
+
   mkdir -p "$build_dir"
-  (cd "$build_dir" && cmake ../ -DCMAKE_BUILD_TYPE=Release -DRAC_ENGINE=OFF \
-     2>&1 | sed 's/^/    /' >&2) || { echo "  [ERR] cmake configure failed" >&2; return 1; }
-  (cd "$build_dir" && cmake --build . --target bench_rac_transformer \
-     -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | sed 's/^/    /' >&2) || {
-       echo "  [ERR] build failed" >&2; return 1;
-     }
+  echo "  [auto-build] configuring RAC bench (src=$src_dir build=$build_dir)" >&2
+
+  if ! cmake -S "$src_dir" -B "$build_dir" \
+         -DCMAKE_BUILD_TYPE=Release -DRAC_ENGINE=OFF \
+         2>&1 | sed 's/^/    /' >&2
+  then
+    echo "  [ERR] cmake configure failed" >&2
+    return 1
+  fi
+
+  if ! cmake --build "$build_dir" --target bench_rac_transformer \
+         -j"$(nproc 2>/dev/null || echo 4)" \
+         2>&1 | sed 's/^/    /' >&2
+  then
+    echo "  [ERR] build failed" >&2
+    return 1
+  fi
+
   if [[ -x "$build_dir/bench_rac_transformer" ]]; then
     BIN_DIR="$build_dir"
     RAC_BIN="$build_dir/bench_rac_transformer"
