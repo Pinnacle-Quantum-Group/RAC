@@ -331,15 +331,13 @@ static void rmsnorm(const float *x, const float *scale, float *out,
     }
 }
 
-/* Scaled dot-product attention for a single (possibly-replicated) head.
- * OpenMP-parallel over T for each of the three phases — dominates the
- * tinyllama prefill wall-clock at T=128, nh=32. */
+/* Scaled dot-product attention — SERIAL body. Caller parallelizes over
+ * heads at the outer level. See attention_head_causal for rationale. */
 static void attention_head(const float *q, const float *k, const float *v,
                            float *out, float *scratch,
                            int T, int d_head) {
     const float scale = 1.0f / sqrtf((float)d_head);
 
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) {
         float *row = scratch + (size_t)i * T;
         for (int j = 0; j <= i; j++) {
@@ -350,11 +348,7 @@ static void attention_head(const float *q, const float *k, const float *v,
         }
         for (int j = i+1; j < T; j++) row[j] = -1e30f;
     }
-
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) rac_softmax(scratch + i*T, scratch + i*T, T);
-
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) {
         float *orow = out + (size_t)i * d_head;
         #pragma omp simd
@@ -376,21 +370,25 @@ typedef struct {
 } tx_bufs;
 
 static void bufs_alloc(tx_bufs *b, const tx_cfg *c, int T) {
-    size_t d = c->d_model;
+    size_t d  = c->d_model;
     size_t dk = (size_t)c->n_kv_heads * c->d_head;
+    size_t nq = c->n_heads;
+    size_t dh = c->d_head;
     b->norm    = xalloc((size_t)T * d);
     b->Q       = xalloc((size_t)T * d);
     b->K       = xalloc((size_t)T * dk);
     b->V       = xalloc((size_t)T * dk);
     b->att_out = xalloc((size_t)T * d);
-    b->scratch = xalloc((size_t)T * T);
+    /* Per-head scratch: one T_q*T_kv slab per head so the outer
+     * for-over-heads can run in parallel without aliasing. */
+    b->scratch = xalloc(nq * (size_t)T * T);
     b->ffn_in  = xalloc((size_t)T * d);
     b->ffn_g   = xalloc((size_t)T * c->d_ff);
     b->ffn_u   = xalloc((size_t)T * c->d_ff);
-    b->qc      = xalloc((size_t)T * c->d_head);
-    b->kc      = xalloc((size_t)T * c->d_head);
-    b->vc      = xalloc((size_t)T * c->d_head);
-    b->oc      = xalloc((size_t)T * c->d_head);
+    b->qc      = xalloc(nq * (size_t)T * dh);
+    b->kc      = xalloc(nq * (size_t)T * dh);
+    b->vc      = xalloc(nq * (size_t)T * dh);
+    b->oc      = xalloc(nq * (size_t)T * dh);
 }
 static void bufs_free(tx_bufs *b) {
     free(b->norm); free(b->Q); free(b->K); free(b->V); free(b->att_out);
@@ -410,19 +408,29 @@ static void decoder_forward(float *x, const tx_weights *w, tx_bufs *b,
     bench_fused_linear(b->norm, w->W_k, NULL, b->K, T, nkv*dh, d, RAC_ACT_NONE);
     bench_fused_linear(b->norm, w->W_v, NULL, b->V, T, nkv*dh, d, RAC_ACT_NONE);
 
+    /* Parallel across query heads. Each thread owns a head and gets a
+     * private slab of qc/kc/vc/oc/scratch so there's no aliasing. This
+     * is the hot outer loop — previously serial, which capped CPU
+     * saturation at ~1 core active during attention. */
+    #pragma omp parallel for schedule(static)
     for (int h = 0; h < nq; h++) {
-        int kv_h = h / gqa_repeat;              /* GQA: multiple q-heads share k/v */
+        int kv_h = h / gqa_repeat;                 /* GQA: q-heads share k/v */
+        float *qc = b->qc       + (size_t)h * T * dh;
+        float *kc = b->kc       + (size_t)h * T * dh;
+        float *vc = b->vc       + (size_t)h * T * dh;
+        float *oc = b->oc       + (size_t)h * T * dh;
+        float *sc = b->scratch  + (size_t)h * T * T;
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < dh; i++) {
-                b->qc[t*dh + i] = b->Q[(size_t)t * d + h * dh + i];
-                b->kc[t*dh + i] = b->K[(size_t)t * nkv * dh + kv_h * dh + i];
-                b->vc[t*dh + i] = b->V[(size_t)t * nkv * dh + kv_h * dh + i];
+                qc[t*dh + i] = b->Q[(size_t)t * d + h * dh + i];
+                kc[t*dh + i] = b->K[(size_t)t * nkv * dh + kv_h * dh + i];
+                vc[t*dh + i] = b->V[(size_t)t * nkv * dh + kv_h * dh + i];
             }
         }
-        attention_head(b->qc, b->kc, b->vc, b->oc, b->scratch, T, dh);
+        attention_head(qc, kc, vc, oc, sc, T, dh);
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < dh; i++) {
-                b->att_out[(size_t)t * d + h * dh + i] = b->oc[t*dh + i];
+                b->att_out[(size_t)t * d + h * dh + i] = oc[t*dh + i];
             }
         }
     }
@@ -491,49 +499,48 @@ static void kv_free(kv_cache *kv) {
 
 /*
  * Causal attention with strided K/V access into the KV cache.
- * Reads K[j * stride + kv_h * d_head + h] and V[...] directly — no copy.
- * T_q = query length (new tokens this step), T_kv = cache total length.
- * q_start_pos = absolute position of the first query token.
+ * SERIAL body — caller is expected to parallelize ACROSS heads at the
+ * outer level. Nesting OpenMP here would either serialize (if nested
+ * parallelism is off, the default) or oversubscribe cores (if it's on).
+ * Parallel-over-heads is coarser-grained and maps better to 22 layers x
+ * 32 heads = 704 independent work units per token.
  */
 static void attention_head_causal(
     const float *q_contig,      /* [T_q, d_head] */
     const float *k_cache, const float *v_cache,
     int kv_h, int nkv, int d_head,
     float *out, float *scratch,
-    int T_q, int T_kv, int q_start_pos)
+    int T_q, int T_kv, int q_start_pos,
+    int scratch_stride /* columns in `scratch` — must be >= T_kv */)
 {
     const float scale = 1.0f / sqrtf((float)d_head);
-    int stride = nkv * d_head;
+    int kv_stride = nkv * d_head;
 
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T_q; i++) {
         int abs_i = q_start_pos + i;
-        float *row = scratch + (size_t)i * T_kv;
+        float *row = scratch + (size_t)i * scratch_stride;
         const float *q_row = q_contig + (size_t)i * d_head;
         for (int j = 0; j < T_kv; j++) {
             if (j > abs_i) { row[j] = -1e30f; continue; }
-            const float *k_row = k_cache + (size_t)j * stride + (size_t)kv_h * d_head;
+            const float *k_row = k_cache + (size_t)j * kv_stride + (size_t)kv_h * d_head;
             float s = 0.0f;
-            /* SIMD-reduce to a vector FMA across d_head. For TinyLlama
-             * d_head=64 this lowers to exactly 8 vfmadd231ps instructions. */
             #pragma omp simd reduction(+:s)
             for (int h = 0; h < d_head; h++) s += q_row[h] * k_row[h];
             row[j] = s * scale;
         }
     }
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < T_q; i++) rac_softmax(scratch + (size_t)i * T_kv,
-                                               scratch + (size_t)i * T_kv, T_kv);
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T_q; i++) {
+        float *row = scratch + (size_t)i * scratch_stride;
+        rac_softmax(row, row, T_kv);
+    }
+    for (int i = 0; i < T_q; i++) {
+        const float *row = scratch + (size_t)i * scratch_stride;
         float *orow = out + (size_t)i * d_head;
-        /* Accumulate V weighted by the softmax row. Vectorized FMA over
-         * d_head, which is also the dimension the store walks. */
         #pragma omp simd
         for (int h = 0; h < d_head; h++) orow[h] = 0.0f;
         for (int j = 0; j < T_kv; j++) {
-            float s = scratch[(size_t)i * T_kv + j];
-            const float *v_row = v_cache + (size_t)j * stride + (size_t)kv_h * d_head;
+            float s = row[j];
+            const float *v_row = v_cache + (size_t)j * kv_stride + (size_t)kv_h * d_head;
             #pragma omp simd
             for (int h = 0; h < d_head; h++) orow[h] += s * v_row[h];
         }
@@ -565,21 +572,29 @@ static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
     bench_fused_linear_q8(b->norm, w->W_k, w->Wk_q8, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
     bench_fused_linear_q8(b->norm, w->W_v, w->Wv_q8, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
 
-    /* Per query head attention over the full cache. */
+    /* Parallel across query heads. Per-head slabs of qc/oc/scratch so
+     * the 32-head loop saturates cores without aliasing. scratch stride
+     * is kv->T_max (the upper bound used at bufs_alloc_for_full_model
+     * time) so layouts stay contiguous regardless of current cache length. */
+    const int Sstride = kv->T_max;    /* scratch's T_kv dimension */
+    #pragma omp parallel for schedule(static)
     for (int h = 0; h < nq; h++) {
         int kv_h = h / gqa_repeat;
+        float *qc = b->qc      + (size_t)h * T_new * dh;
+        float *oc = b->oc      + (size_t)h * T_new * dh;
+        float *sc = b->scratch + (size_t)h * T_new * Sstride;
         for (int t = 0; t < T_new; t++) {
             for (int i = 0; i < dh; i++) {
-                b->qc[t*dh + i] = b->Q[(size_t)t * d + h * dh + i];
+                qc[t*dh + i] = b->Q[(size_t)t * d + h * dh + i];
             }
         }
-        attention_head_causal(b->qc, kv->K[layer_idx], kv->V[layer_idx],
+        attention_head_causal(qc, kv->K[layer_idx], kv->V[layer_idx],
                               kv_h, nkv, dh,
-                              b->oc, b->scratch,
-                              T_new, total, start);
+                              oc, sc,
+                              T_new, total, start, Sstride);
         for (int t = 0; t < T_new; t++) {
             for (int i = 0; i < dh; i++) {
-                b->att_out[(size_t)t * d + h * dh + i] = b->oc[t*dh + i];
+                b->att_out[(size_t)t * d + h * dh + i] = oc[t*dh + i];
             }
         }
     }
@@ -678,20 +693,25 @@ static void init_weights_synthetic_full(tx_weights *layers, const tx_cfg *c) {
  * and T_max = prefill_T + decode_iters for K/V. */
 static void bufs_alloc_for_full_model(tx_bufs *b, const tx_cfg *c,
                                        int T_q_max, int T_kv_max) {
-    size_t d = c->d_model;
+    size_t d  = c->d_model;
+    size_t nq = c->n_heads;
+    size_t dh = c->d_head;
     b->norm    = xalloc((size_t)T_q_max * d);
     b->Q       = xalloc((size_t)T_q_max * d);
     b->K       = NULL;   /* KV cache owns the real K / V storage */
     b->V       = NULL;
     b->att_out = xalloc((size_t)T_q_max * d);
-    b->scratch = xalloc((size_t)T_q_max * T_kv_max);
+    /* Per-head scratch: nq * T_q_max * T_kv_max so the outer
+     * for-over-heads can run #pragma omp parallel for without
+     * contention on this array. */
+    b->scratch = xalloc(nq * (size_t)T_q_max * T_kv_max);
     b->ffn_in  = xalloc((size_t)T_q_max * d);
     b->ffn_g   = xalloc((size_t)T_q_max * c->d_ff);
     b->ffn_u   = xalloc((size_t)T_q_max * c->d_ff);
-    b->qc      = xalloc((size_t)T_q_max * c->d_head);
+    b->qc      = xalloc(nq * (size_t)T_q_max * dh);
     b->kc      = NULL;
     b->vc      = NULL;
-    b->oc      = xalloc((size_t)T_q_max * c->d_head);
+    b->oc      = xalloc(nq * (size_t)T_q_max * dh);
 }
 static void bufs_free_full_model(tx_bufs *b) {
     free(b->norm); free(b->Q); free(b->att_out);
