@@ -69,6 +69,16 @@ typedef enum {
     RAC_OP_INNER        = 14,
     RAC_OP_OUTER        = 15,
     RAC_OP_MATMUL       = 16,
+    /* Transformer primitives — added April 2026.
+     * Every op below maps directly to a CORDIC mode; see docs. */
+    RAC_OP_RSQRT        = 17,  /* hyperbolic vectoring (LayerNorm/RMSNorm) */
+    RAC_OP_SIGMOID      = 18,  /* via tanh(x/2) */
+    RAC_OP_SINCOS       = 19,  /* single-pass sin/cos — RoPE/DCT primitive */
+    RAC_OP_LAYERNORM    = 20,  /* mean + var + CORDIC rsqrt */
+    RAC_OP_RMSNORM      = 21,  /* CORDIC rsqrt only */
+    RAC_OP_ROPE_CACHE   = 22,  /* precompute sin/cos tables */
+    RAC_OP_ROPE_APPLY   = 23,  /* circular Givens rotation on Q/K */
+    RAC_OP_ATTENTION    = 24,  /* fused scaled dot-product attention */
     RAC_OP_EXTENDED     = 0xFF  /* reserved — FIL proprietary ops   */
 } rac_op_type;
 
@@ -238,6 +248,102 @@ __device__ __host__ void   rac_outer(float2 *a, float2 *b, float *C,
  */
 __device__ __host__ void   rac_matmul(float *A, float *B, float *C,
                                       int M, int N, int K);
+
+/* ── 7. Transformer primitives (native CORDIC modes) ─────────────────────── */
+/*
+ * Every op in a transformer expressed in its natural CORDIC mode:
+ *
+ *   QK^T / A@V         linear MAC           rac_matmul
+ *   Softmax exp(x)     hyperbolic rotation  rac_exp
+ *   Softmax normalize  linear vectoring     (divide)
+ *   Layer-norm mean    linear accumulate    built-in
+ *   Layer-norm rsqrt   hyperbolic vectoring rac_rsqrt
+ *   RMSNorm            hyperbolic vectoring rac_rsqrt
+ *   RoPE               circular rotation    rac_rope_apply  ← NATIVE
+ *   Sigmoid            hyperbolic rotation  rac_sigmoid
+ *
+ * RoPE is the standout primitive. Rotary position embeddings are
+ * *literally* Givens rotations — a mode every other accelerator emulates
+ * with multipliers. RAC computes them natively.
+ */
+
+/*
+ * rac_rsqrt: 1 / sqrt(x) via hyperbolic CORDIC vectoring.
+ * The LayerNorm/RMSNorm workhorse primitive.
+ */
+__device__ __host__ float  rac_rsqrt(float x);
+
+/*
+ * rac_sigmoid: sigmoid(x) = 0.5 * (1 + tanh(x/2))
+ * One hyperbolic-CORDIC pass, no explicit exp, no divide.
+ */
+__device__ __host__ float  rac_sigmoid(float x);
+
+/*
+ * rac_sincos: writes (cos(theta), sin(theta)) in one CORDIC rotation.
+ * Core primitive for RoPE and DCT.
+ */
+__device__ __host__ void   rac_sincos(float theta, float *s, float *c);
+
+/*
+ * rac_layernorm / rac_rmsnorm: per-row normalization with CORDIC rsqrt.
+ *   x, y:  [rows, d] row-major
+ *   gamma: [d] or NULL for identity scale
+ *   beta:  [d] or NULL for zero shift (layernorm only)
+ */
+__device__ __host__ void   rac_layernorm(const float *x, float *y,
+                                         const float *gamma,
+                                         const float *beta,
+                                         float eps, int rows, int d);
+__device__ __host__ void   rac_rmsnorm(const float *x, float *y,
+                                       const float *gamma,
+                                       float eps, int rows, int d);
+
+/*
+ * rac_rope_cache: precompute sin/cos tables for RoPE.
+ *   cos_out, sin_out: [max_seq, head_dim/2] row-major
+ *   base:             standard value 10000.0f
+ */
+__device__ __host__ void   rac_rope_cache(float *cos_out, float *sin_out,
+                                          int max_seq, int head_dim,
+                                          float base);
+
+/*
+ * rac_rope_apply: apply RoPE in place to a [batch, n_heads, seq, head_dim]
+ * tensor. Each 2-vector (x[2i], x[2i+1]) is a Givens rotation — native
+ * circular CORDIC. One rac_rotate per pair.
+ */
+__device__ __host__ void   rac_rope_apply(float *x,
+                                          const float *cos_tab,
+                                          const float *sin_tab,
+                                          int batch, int n_heads,
+                                          int seq, int head_dim);
+
+/*
+ * rac_attention: fused scaled dot-product attention.
+ * Composes matmul + softmax + matmul with all compute routed through
+ * RAC primitives.
+ *   q, k, v, out: [batch, n_heads, seq, head_dim]
+ *   mask:         optional [seq, seq] additive mask, or NULL
+ *   is_causal:    non-zero -> apply upper-triangular -inf mask
+ */
+__device__ __host__ void   rac_attention(const float *q, const float *k,
+                                         const float *v,
+                                         const float *mask, int is_causal,
+                                         float *out,
+                                         int batch, int n_heads,
+                                         int seq, int head_dim);
+
+/* ── 8. Tunable precision ────────────────────────────────────────────────── */
+/*
+ * Iteration count is a runtime knob. CORDIC converges one bit per iter:
+ *   Training:      24 iters — fp32-equivalent
+ *   Inference:     16 iters — default
+ *   Edge/quantized: 8 iters — tiny and fast
+ * No other architecture exposes this knob.
+ */
+__device__ __host__ float2 rac_rotate_precision(float2 v, float theta, int iters);
+__device__ __host__ float  rac_project_precision(float2 v, float theta, int iters);
 
 #ifdef __cplusplus
 }

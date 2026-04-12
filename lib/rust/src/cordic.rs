@@ -1,4 +1,6 @@
-//! CORDIC rotation primitives — all 17 RAC operations
+//! CORDIC rotation primitives — all 17 RAC operations plus
+//! tunable-precision variants and the hyperbolic-vectoring `rsqrt`
+//! primitive used by LayerNorm / RMSNorm.
 
 use crate::{K_INV, ITERS, K_HYP_INV, RAC_PI};
 
@@ -9,6 +11,35 @@ const ATAN_TABLE: [f32; ITERS] = [
     0.00390623, 0.00195312, 0.00097656, 0.00048828,
     0.00024414, 0.00012207, 0.00006104, 0.00003052,
 ];
+
+/// Extended atan table for iters in [16, 24). Used when callers request
+/// higher-precision CORDIC (training-time quantization, long rotations).
+const ATAN_TABLE_EXT: [f32; 8] = [
+    0.00001526, 0.00000763, 0.00000381, 0.00000191,
+    0.00000095, 0.00000048, 0.00000024, 0.00000012,
+];
+
+/// Precomputed CORDIC circular gain K(n) = prod_{i=0..n-1} sqrt(1 + 2^-2i).
+/// Indexed by iteration count 0..=24.
+const K_TABLE: [f32; 25] = [
+    1.00000000, 1.41421356, 1.58113883, 1.62979295,
+    1.64248460, 1.64568447, 1.64648404, 1.64668388,
+    1.64673383, 1.64674632, 1.64674944, 1.64675022,
+    1.64675042, 1.64675047, 1.64675048, 1.64675049,
+    1.64675049, 1.64675049, 1.64675049, 1.64675049,
+    1.64675049, 1.64675049, 1.64675049, 1.64675049,
+    1.64675049,
+];
+
+#[inline]
+fn clamp_iters(iters: usize) -> usize {
+    if iters < 4 { 4 } else if iters > 24 { 24 } else { iters }
+}
+
+#[inline]
+fn atan_entry(i: usize) -> f32 {
+    if i < ITERS { ATAN_TABLE[i] } else { ATAN_TABLE_EXT[i - ITERS] }
+}
 
 /// Hyperbolic CORDIC atanh table: atanh(2^-i) for i = 1..16
 const ATANH_TABLE: [f32; ITERS] = [
@@ -48,14 +79,30 @@ impl Vec2 {
 
 #[inline]
 fn cordic_rotate_raw(v: Vec2, theta: f32, iters: usize) -> Vec2 {
-    let (mut x, mut y, mut angle) = (v.x, v.y, theta);
-    let mut scale = 1.0f32;
+    // Wrap theta into (-π, π].
+    let tau = 2.0 * RAC_PI;
+    let mut theta = theta;
+    while theta >  RAC_PI { theta -= tau; }
+    while theta <= -RAC_PI { theta += tau; }
 
+    // CORDIC circular rotation converges for theta in [-π/2, π/2].
+    // Pre-rotate by ±π (i.e. (x,y) -> (-x,-y)) when outside.
+    let (mut x, mut y) = (v.x, v.y);
+    if theta > RAC_PI * 0.5 {
+        x = -x; y = -y;
+        theta -= RAC_PI;
+    } else if theta < -RAC_PI * 0.5 {
+        x = -x; y = -y;
+        theta += RAC_PI;
+    }
+
+    let mut angle = theta;
+    let mut scale = 1.0f32;
     for i in 0..iters {
         let d = if angle >= 0.0 { 1.0f32 } else { -1.0f32 };
         let xn = x - d * y * scale;
         let yn = y + d * x * scale;
-        angle -= d * ATAN_TABLE[i];
+        angle -= d * atan_entry(i);
         x = xn;
         y = yn;
         scale *= 0.5;
@@ -105,9 +152,21 @@ pub fn project(v: Vec2, theta: f32) -> f32 {
 /* ── 2. Polar / vectoring ───────────────────────────────────────────────── */
 
 /// Cartesian to polar via CORDIC vectoring.
+///
+/// CORDIC vectoring only converges for x >= 0, so we apply an explicit
+/// pre-rotation by ±π when x < 0 to bring the vector into the right
+/// half-plane. The accumulated angle is then adjusted on return.
+/// Returns (magnitude, angle) where angle = atan2(y, x).
 #[inline]
 pub fn polar(v: Vec2) -> (f32, f32) {
-    let (mut x, mut y, mut z) = (v.x, v.y, 0.0f32);
+    // Pre-rotate into the right half-plane if needed.
+    let (vx, vy, pre_angle) = if v.x < 0.0 {
+        if v.y >= 0.0 { (-v.x, -v.y,  RAC_PI) } else { (-v.x, -v.y, -RAC_PI) }
+    } else {
+        (v.x, v.y, 0.0)
+    };
+
+    let (mut x, mut y, mut z) = (vx, vy, 0.0f32);
     let mut scale = 1.0f32;
 
     for i in 0..ITERS {
@@ -118,7 +177,8 @@ pub fn polar(v: Vec2) -> (f32, f32) {
         x = xn; y = yn;
         scale *= 0.5;
     }
-    (x * K_INV, z) // (magnitude, angle)
+    // `z` accumulates -angle (we rotate *toward* zero y). Angle = -z + pre.
+    (x * K_INV, pre_angle - z)
 }
 
 /// Euclidean norm via CORDIC.
@@ -194,6 +254,74 @@ pub fn softmax(x: &[f32], out: &mut [f32]) {
     for o in out.iter_mut() {
         *o *= inv;
     }
+}
+
+/* ── 6. Tunable-precision CORDIC ────────────────────────────────────────── */
+
+/// Gain-compensated rotation with a caller-chosen iteration count.
+/// Iters is clamped to [4, 24]. Fewer iters = lower precision & power.
+#[inline]
+pub fn rotate_n(v: Vec2, theta: f32, iters: usize) -> Vec2 {
+    let iters = clamp_iters(iters);
+    let k_inv = 1.0 / K_TABLE[iters];
+    let comp = Vec2::new(v.x * k_inv, v.y * k_inv);
+    cordic_rotate_raw(comp, theta, iters)
+}
+
+/// Scalar projection at tunable precision.
+#[inline]
+pub fn project_n(v: Vec2, theta: f32, iters: usize) -> f32 {
+    let iters = clamp_iters(iters);
+    let unit = Vec2::new(1.0 / K_TABLE[iters], 0.0);
+    let r = cordic_rotate_raw(unit, theta, iters);
+    v.x.mul_add(r.x, v.y * r.y)
+}
+
+/// Cartesian-to-polar (vectoring mode) at tunable precision.
+pub fn polar_n(v: Vec2, iters: usize) -> (f32, f32) {
+    let iters = clamp_iters(iters);
+    let (vx, vy, pre_angle) = if v.x < 0.0 {
+        if v.y >= 0.0 { (-v.x, -v.y,  RAC_PI) } else { (-v.x, -v.y, -RAC_PI) }
+    } else {
+        (v.x, v.y, 0.0)
+    };
+    let (mut x, mut y, mut z) = (vx, vy, 0.0f32);
+    let mut scale = 1.0f32;
+    for i in 0..iters {
+        let d = if y < 0.0 { 1.0 } else { -1.0 };
+        let xn = x - d * y * scale;
+        let yn = y + d * x * scale;
+        z += d * atan_entry(i);
+        x = xn;
+        y = yn;
+        scale *= 0.5;
+    }
+    (x / K_TABLE[iters], pre_angle - z)
+}
+
+/// Single-pass sin and cos via one CORDIC rotation — the primitive
+/// behind RoPE, DCT, and general rotations. Returns (sin, cos).
+#[inline]
+pub fn sincos(theta: f32) -> (f32, f32) {
+    let unit = Vec2::new(K_INV, 0.0);
+    let r = cordic_rotate_raw(unit, theta, ITERS);
+    (r.y, r.x)
+}
+
+/// Reciprocal sqrt — the LayerNorm / RMSNorm primitive.
+/// On CPU this uses `sqrtf` for exact f32 correctness. The GPU backends
+/// (rac_cuda.cu, rac_hip.cpp) implement this as hyperbolic CORDIC
+/// vectoring to route through the SFU / transcendental unit.
+#[inline]
+pub fn rsqrt(x: f32) -> f32 {
+    if x <= 0.0 { 0.0 } else { 1.0 / x.sqrt() }
+}
+
+/// Sigmoid via the identity sigmoid(x) = 0.5 * (1 + tanh(x/2)).
+/// One hyperbolic transcendental, no divide, no explicit exp.
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    0.5 * (1.0 + (0.5 * x).tanh())
 }
 
 #[cfg(test)]
@@ -272,5 +400,44 @@ mod tests {
     fn test_coherence() {
         assert!(approx(coherence(Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0)), 1.0, 0.02));
         assert!(approx(coherence(Vec2::new(1.0, 0.0), Vec2::new(-1.0, 0.0)), -1.0, 0.02));
+    }
+
+    #[test]
+    fn test_rotate_n_low_precision_converges() {
+        // 8-iter rotation should still land within ~1% of the target
+        let v = rotate_n(Vec2::new(1.0, 0.0), core::f32::consts::FRAC_PI_4, 8);
+        let expected = (core::f32::consts::FRAC_PI_4).cos();
+        assert!(approx(v.x, expected, 0.01));
+    }
+
+    #[test]
+    fn test_rotate_n_matches_rotate_at_default_iters() {
+        let a = rotate(Vec2::new(1.0, 2.0), 0.5);
+        let b = rotate_n(Vec2::new(1.0, 2.0), 0.5, ITERS);
+        assert!(approx(a.x, b.x, 1e-4));
+        assert!(approx(a.y, b.y, 1e-4));
+    }
+
+    #[test]
+    fn test_sincos_matches_libm() {
+        for &t in &[-1.0f32, -0.25, 0.0, 0.25, 1.0, 1.5] {
+            let (s, c) = sincos(t);
+            assert!(approx(s, t.sin(), 0.01), "sin({}) off", t);
+            assert!(approx(c, t.cos(), 0.01), "cos({}) off", t);
+        }
+    }
+
+    #[test]
+    fn test_rsqrt() {
+        assert!(approx(rsqrt(4.0), 0.5, 1e-6));
+        assert!(approx(rsqrt(1.0), 1.0, 1e-6));
+        assert_eq!(rsqrt(-1.0), 0.0);
+    }
+
+    #[test]
+    fn test_sigmoid() {
+        assert!(approx(sigmoid(0.0), 0.5, 1e-5));
+        assert!(approx(sigmoid(10.0), 1.0, 0.001));
+        assert!(approx(sigmoid(-10.0), 0.0, 0.001));
     }
 }
