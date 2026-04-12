@@ -1,0 +1,35 @@
+# tinygrad comparison config (fill in to enable)
+#
+# tinygrad runs stock HF weights in Python. Like llama.cpp, its natural
+# granularity is whole-model — so the comparison strategy is the same
+# two options (full model ÷ n_layers, or build a 1-layer config).
+#
+# The tinygrad examples/llama.py is the usual starting point. Pin to
+# a known-good commit (tinygrad moves fast).
+
+python: /usr/bin/python3
+tinygrad_path: /path/to/tinygrad
+tinygrad_commit: main     # or a specific SHA for reproducibility
+
+# OPTION A — full TinyLlama, divide by n_layers
+hf_model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+n_layers_divisor: 22
+
+# OPTION B — custom 1-layer config (you'd build a small nn.Module inline)
+use_single_layer: false
+
+# Scenarios — match RAC bench
+prefill_tokens: 128
+decode_iters:   100        # number of single-token passes for steady-state
+
+# Device: CLANG (CPU JIT), LLVM, or CPU.
+# Use CLANG for a fair CPU-vs-CPU comparison with RAC on your Ryzen 9 5950X.
+device: CLANG
+
+# Precision
+dtype: float32             # or float16 — RAC is FP32 so FP32 is apples-to-apples
+
+# Threading control in tinygrad is via env vars; set these before invoking
+env:
+  OMP_NUM_THREADS: 16
+  TINYGRAD_CLANG_PARALLEL: 1

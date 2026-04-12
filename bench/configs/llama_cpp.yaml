@@ -1,0 +1,41 @@
+# llama.cpp comparison config (fill in to enable)
+#
+# The RAC bench runs a single-layer TinyLlama-shaped decoder. For a valid
+# comparison llama.cpp must run the SAME shape: d_model=512, n_heads=8,
+# d_ff=1536, prefill_T=128, decode_T=1. Since llama.cpp works at
+# whole-model granularity you have two options:
+#
+#   OPTION A — real model (easiest, less apples-to-apples)
+#     Run TinyLlama-1.1B in full. Divide perf numbers by n_layers (22)
+#     to get per-layer numbers that roughly match the RAC bench.
+#
+#   OPTION B — custom 1-layer GGUF (most accurate)
+#     Export a 1-layer TinyLlama-shaped model via llama.cpp's convert
+#     scripts, then run that. Numbers are directly comparable.
+#
+# Fill in the blanks below, then run ./bench/run_llama_cpp.sh.
+
+binary: /path/to/llama.cpp/build/bin/llama-bench
+
+# OPTION A
+model_path_real:  /path/to/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+n_layers_divisor: 22        # TinyLlama-1.1B has 22 decoder layers
+# OPTION B
+model_path_custom: /path/to/tinyllama-1layer-d512.gguf  # you generate this
+
+# Scenarios — match RAC bench exactly
+prefill_tokens: 128
+decode_tokens:  128          # llama-bench -n; 1-token latency derived as total/n
+
+# Quantizations to report (F32 is the baseline fair vs RAC FP32)
+quants:
+  - F32
+  - F16
+  - Q8_0
+  - Q4_K_M
+
+# Threading — match RAC's OMP_NUM_THREADS (set to physical core count)
+threads: 16
+
+# Extra llama-bench flags (override if needed)
+extra_flags: "-r 3"   # repeat 3 runs, take median
