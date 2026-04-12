@@ -110,6 +110,13 @@ if _RAC_AVAILABLE and _TORCH_CUDA_OK:
 def _rac_available() -> bool:
     return _RAC_AVAILABLE and _RAC_KERNEL_OK and _TORCH_CUDA_OK
 
+def _rac_has(op: str) -> bool:
+    """Is `op` (e.g. 'fused_linear_forward') exported by the loaded extension?
+    HIP and CUDA builds don't always expose the same surface — the HIP build
+    ships matmul/linear only, while CUDA also has fused_linear_*. Callers
+    should fall back to the unfused path when a specific op is missing."""
+    return _rac_available() and hasattr(_rac, op)
+
 
 # ── torch.compile compatibility ──────────────────────────────────────────────
 # Mark RAC functions as non-decomposable for torch.compile.
@@ -368,12 +375,13 @@ class RACFusedLinearFunction(Function):
         ctx.act_id = act_id
         ctx.has_bias = bias is not None
 
-        if _rac_available() and input.is_cuda and input.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        # Preferred path: single fused kernel (CUDA build exports this).
+        if _rac_has('fused_linear_forward') and input.is_cuda and \
+                input.dtype in (torch.float32, torch.float16, torch.bfloat16):
             bias_tensor = bias if bias is not None else torch.tensor([], device=input.device)
             output = _rac.fused_linear_forward(input, weight, bias_tensor, act_id)
             # Save pre-activation for backward (recompute from output is lossy for GELU/SiLU)
             if act_id > 0:
-                # Compute pre-activation = input @ weight.T + bias (unfused, for backward)
                 pre_act = F.linear(input.float(), weight.float(),
                                    bias.float() if bias is not None else None).to(input.dtype)
                 ctx.save_for_backward(input, weight, bias, pre_act)
@@ -381,7 +389,21 @@ class RACFusedLinearFunction(Function):
                 ctx.save_for_backward(input, weight, bias, output)
             return output
 
-        # Fallback
+        # Next best: RAC linear_forward + torch activation. HIP build lacks
+        # a fused kernel but still has linear_forward, so we still route the
+        # matmul through RAC and only apply the activation in torch.
+        if _rac_has('linear_forward') and input.is_cuda and \
+                input.dtype in (torch.float32, torch.float16, torch.bfloat16):
+            linear_out = RACLinearFunction.apply(input, weight, bias)
+            pre_act = linear_out
+            if act_id == ACT_RELU: out = torch.relu(linear_out)
+            elif act_id == ACT_GELU: out = F.gelu(linear_out)
+            elif act_id == ACT_SILU: out = F.silu(linear_out)
+            else:                    out = linear_out
+            ctx.save_for_backward(input, weight, bias, pre_act)
+            return out
+
+        # Pure-torch fallback (CPU or broken extension)
         out = F.linear(input.float(), weight.float(),
                        bias.float() if bias is not None else None)
         if act_id == ACT_RELU: out = torch.relu(out)
@@ -398,7 +420,8 @@ class RACFusedLinearFunction(Function):
         input, weight, bias, pre_act = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
 
-        if _rac_available() and grad_output.is_cuda and grad_output.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        if _rac_has('fused_linear_backward') and grad_output.is_cuda and \
+                grad_output.dtype in (torch.float32, torch.float16, torch.bfloat16):
             grads = _rac.fused_linear_backward(
                 grad_output.contiguous(), input, weight,
                 bias if bias is not None else torch.tensor([], device=input.device),
