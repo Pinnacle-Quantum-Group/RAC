@@ -117,6 +117,31 @@ def _rac_has(op: str) -> bool:
     should fall back to the unfused path when a specific op is missing."""
     return _rac_available() and hasattr(_rac, op)
 
+# Does the compiled extension accept the tunable-precision `iters` kwarg?
+# Older .so builds don't. Probe once so we don't pay the TypeError cost on
+# every call.
+_RAC_ACCEPTS_ITERS = False
+if _rac_available():
+    try:
+        _pa = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _pb = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _ = _rac.matmul_forward(_pa, _pb, iters=24)
+        torch.cuda.synchronize()
+        _RAC_ACCEPTS_ITERS = True
+        del _pa, _pb
+    except TypeError:
+        _RAC_ACCEPTS_ITERS = False
+    except Exception:
+        _RAC_ACCEPTS_ITERS = False
+
+def _rac_kw(**kw):
+    """Build a kwargs dict for _rac calls, omitting iters if the extension
+    is too old to accept it."""
+    if _RAC_ACCEPTS_ITERS:
+        return kw
+    kw.pop('iters', None)
+    return kw
+
 
 # ── torch.compile compatibility ──────────────────────────────────────────────
 # Mark RAC functions as non-decomposable for torch.compile.
@@ -143,7 +168,10 @@ class RACMatmulFunction(Function):
     def forward(ctx, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         ctx.save_for_backward(A, B)
         if _rac_available() and A.is_cuda and A.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            return _rac.matmul_forward(A, B)
+            # Pass per-call iters so the backward picks up the same value
+            # used in forward and so the global knob is honored even if
+            # set_cordic_iters isn't available in this build.
+            return _rac.matmul_forward(A, B, **_rac_kw(iters=_RAC_CORDIC_ITERS))
         return torch.matmul(A.float(), B.float()).to(A.dtype)
 
     @staticmethod
@@ -154,7 +182,8 @@ class RACMatmulFunction(Function):
         if _rac_available() and grad_C.is_cuda and grad_C.dtype in (torch.float32, torch.float16, torch.bfloat16):
             grads = _rac.matmul_backward(
                 grad_C.contiguous(), A, B,
-                ctx.needs_input_grad[0], ctx.needs_input_grad[1])
+                ctx.needs_input_grad[0], ctx.needs_input_grad[1],
+                **_rac_kw(iters=_RAC_CORDIC_ITERS))
             if ctx.needs_input_grad[0]: grad_A = grads[0]
             if ctx.needs_input_grad[1]: grad_B = grads[1]
         else:
@@ -189,7 +218,8 @@ class RACLinearFunction(Function):
 
         if _rac_available() and input.is_cuda and input.dtype in (torch.float32, torch.float16, torch.bfloat16):
             bias_tensor = bias if bias is not None else torch.tensor([], device=input.device)
-            return _rac.linear_forward(input, weight, bias_tensor)
+            return _rac.linear_forward(input, weight, bias_tensor,
+                                        **_rac_kw(iters=_RAC_CORDIC_ITERS))
 
         return F.linear(input.float(), weight.float(),
                         bias.float() if bias is not None else None).to(input.dtype)
@@ -201,7 +231,8 @@ class RACLinearFunction(Function):
 
         if _rac_available() and grad_output.is_cuda and grad_output.dtype in (torch.float32, torch.float16, torch.bfloat16):
             grads = _rac.linear_backward(
-                grad_output.contiguous(), input, weight, ctx.has_bias)
+                grad_output.contiguous(), input, weight, ctx.has_bias,
+                **_rac_kw(iters=_RAC_CORDIC_ITERS))
             if ctx.needs_input_grad[0]: grad_input  = grads[0]
             if ctx.needs_input_grad[1]: grad_weight = grads[1]
             if ctx.has_bias:            grad_bias   = grads[2]
@@ -962,17 +993,23 @@ def benchmark_model(
 
 _RAC_CORDIC_ITERS = int(os.environ.get('RAC_CORDIC_ITERS', '16'))
 
+_warned_iters_unsupported = False
+
 def rac_set_precision(iters: int) -> None:
     """
     Set the global CORDIC iteration count for RAC operations.
     Valid range: [4, 24]. Lower = faster / lower power, higher = more precise.
 
     Recommended settings:
-      - Training: 24 (fp32-equivalent precision)
-      - Inference: 16 (default, good quality)
-      - Edge/quantized inference: 8 (tiny and fast)
+      - Training: 24 (fp32-equivalent precision, fast sign-XOR FMA path)
+      - Inference: 16 (iterative CORDIC, ~16 shift-adds per element)
+      - Edge/quantized inference: 8 (iterative CORDIC, ~8 shift-adds)
+
+    With iters < 24 on GPU, the kernel runs the genuine N-iteration CORDIC
+    linear multiply — cycles scale with iters. iters == 24 hits the
+    single-FMA fast path with zero overhead.
     """
-    global _RAC_CORDIC_ITERS
+    global _RAC_CORDIC_ITERS, _warned_iters_unsupported
     iters = max(4, min(24, int(iters)))
     _RAC_CORDIC_ITERS = iters
     if _RAC_AVAILABLE and hasattr(_rac, 'set_cordic_iters'):
@@ -980,6 +1017,15 @@ def rac_set_precision(iters: int) -> None:
             _rac.set_cordic_iters(iters)
         except Exception:
             pass
+    elif _RAC_AVAILABLE and not _RAC_ACCEPTS_ITERS and not _warned_iters_unsupported:
+        warnings.warn(
+            "The loaded rac_cuda_ext does not support the tunable-precision "
+            "knob — rebuild with `bash build_hip.sh` (HIP) or "
+            "`pip install -e .` (CUDA) to pick up per-call `iters`. "
+            "The Python-level knob is still honored by pure-torch fallback paths.",
+            RuntimeWarning, stacklevel=2,
+        )
+        _warned_iters_unsupported = True
 
 def rac_get_precision() -> int:
     """Return the current CORDIC iteration count."""
@@ -1270,4 +1316,5 @@ def rac_info():
     print(f"  Transformer ops:     RACFusedQKV, RACFusedFFN, RACRoPE, RACRoPEAttention, RACLlamaBlock")
     print(f"  Norm ops:            RACRMSNorm, RACLayerNorm (CORDIC rsqrt)")
     print(f"  CORDIC iters:        {_RAC_CORDIC_ITERS} (tunable via rac_set_precision)")
+    print(f"  Ext accepts iters:   {_RAC_ACCEPTS_ITERS}")
     print(f"  Adaptive threshold:  {_RAC_MIN_ELEMENTS} elements (RAC_MIN_ELEMENTS)")
