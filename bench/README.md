@@ -1,68 +1,108 @@
 ## RAC transformer inference — three-way bench
 
-Side-by-side single-layer transformer inference: **RAC** (this library)
-vs **llama.cpp** vs **tinygrad**, same shape, same hardware, same
-prompt/decode scenarios.
+Side-by-side single-layer transformer inference: **RAC** vs **llama.cpp**
+vs **tinygrad**, same shape, same weights, same hardware, same scenarios.
 
-**Current status:** the RAC side runs end-to-end. The other two are
-stubbed — fill in `configs/llama_cpp.yaml` and `configs/tinygrad.yaml`
-with local paths/models, then re-run.
+### What's here
 
-### Model shape (start small)
+| file | purpose |
+|---|---|
+| `bench_rac_transformer.c` | RAC decoder-layer bench (synthetic OR real HF weights) |
+| `safetensors_reader.{h,c}` | minimal F32/F16/BF16 safetensors loader |
+| `test_safetensors.c` | 18 BVTs for the reader, synthesizes a tiny file in /tmp |
+| `fetch_model.py` | HF downloader + cache manager; prints resolved path |
+| `configs/llama_cpp.yaml` | llama-bench comparison config (fill in) |
+| `configs/tinygrad.yaml` | tinygrad comparison config (fill in) |
 
+### Quick-start: synthetic weights (no network)
+
+```bash
+cd build/
+cmake --build . --target bench_rac_transformer
+./bench_rac_transformer                         # tiny shape (d=512, 8 heads)
+./bench_rac_transformer --config tinyllama      # full TinyLlama shape, random init
 ```
-d_model   = 512
-n_heads   = 8           (d_head = 64)
-d_ff      = 1536        (~3× d_model, SwiGLU gated)
-layers    = 1           (single decoder block)
+
+### Real-weights run (HF download + auto-convert dtype)
+
+```bash
+# 1. Fetch the safetensors + config to ~/.cache/rac_bench/
+MODEL_DIR=$(python3 bench/fetch_model.py \
+                --model TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+
+# 2. Feed one layer's weights (default: layer 0) into the RAC bench.
+#    --safetensors implies --config tinyllama (d=2048, 32 heads, 4 kv-heads)
+./bench_rac_transformer --safetensors "$MODEL_DIR/model.safetensors"
+./bench_rac_transformer --safetensors "$MODEL_DIR/model.safetensors" --layer 5
 ```
 
-TinyLlama-shaped at 1 / 22 the depth. Small enough to load fast, large
-enough that the GEMM cost dominates and differences between frameworks
-surface cleanly.
+`fetch_model.py` uses `huggingface_hub` if installed (fast, resumable,
+parallel), else falls back to `urllib` (dep-free, slower). Cache dir
+is `~/.cache/rac_bench/` or `$HF_HOME/rac_bench/` if set. Gated repos:
+`HF_TOKEN=...` or `--token ...`.
+
+**Per-file fetch** (e.g. GGUF for llama.cpp):
+
+```bash
+GGUF=$(python3 bench/fetch_model.py \
+          --model TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF \
+          --file tinyllama-1.1b-chat-v1.0.Q8_0.gguf)
+echo "$GGUF"   # absolute cached path
+```
+
+### Model shapes
+
+| preset | d_model | heads | kv_heads (GQA) | d_head | d_ff |
+|---|---|---|---|---|---|
+| `--config tiny` | 512 | 8 | 8 | 64 | 1536 |
+| `--config tinyllama` | 2048 | 32 | **4** | 64 | 5632 |
+
+TinyLlama uses 4 KV heads (GQA): 32 query heads share 4 key/value heads.
+`bench_rac_transformer.c` handles the repeat mapping inline.
 
 ### Scenarios
 
 | scenario | T | bottleneck | measures |
 |---|---|---|---|
-| **prefill** | 128 | compute-bound (big GEMM) | peak GFLOPS |
-| **decode** | 1   | memory-bound (T=1 GEMV) | token latency |
+| **prefill** | 128 (override `--prefill N`) | compute-bound GEMM | peak GFLOPS |
+| **decode** | 1 | memory-bound GEMV | token latency |
 
-### Running
+### Running the other two frameworks
 
-**RAC:**
+**llama.cpp:** fill in `configs/llama_cpp.yaml`, then (once harness lands):
 ```bash
-cd build/
-cmake --build . --target bench_rac_transformer
-./bench_rac_transformer               # default: 30 prefill iters, 100 decode iters
-./bench_rac_transformer 100 200       # custom iteration counts
-```
-
-**llama.cpp:** fill in `configs/llama_cpp.yaml`, then:
-```bash
-./bench/run_llama_cpp.sh              # TODO: will be added once config is populated
+./bench/run_llama_cpp.sh
 ```
 
 **tinygrad:** fill in `configs/tinygrad.yaml`, then:
 ```bash
-python bench/run_tinygrad.py          # TODO: will be added once config is populated
+python bench/run_tinygrad.py
 ```
 
 ### Fair-comparison notes
 
-- **Precision:** RAC is FP32. llama.cpp defaults to Q4_K_M; tinygrad to FP16. The harness reports each framework at each precision it supports so you can pick a like-for-like comparison.
-- **Threading:** pin each framework to the same physical core count (16 on your 5950X). RAC uses OpenMP; llama.cpp uses `-t`; tinygrad uses `OMP_NUM_THREADS` + `TINYGRAD_CLANG_PARALLEL=1`.
-- **Warmup:** each framework gets one untimed warmup pass before the measurement loop.
-- **Layer scaling:** for framework comparisons at whole-model scale, divide by `n_layers_divisor` (22 for TinyLlama-1.1B) to get per-layer numbers.
+- **Tensor identity.** With `--safetensors` pointing at the same file all
+  three frameworks consume, the only variable is the execution engine.
+- **Precision.** RAC is FP32 internally (BF16 / F16 HF weights are
+  upcast on load). For apples-to-apples use F32 in llama.cpp
+  (`--type f32` / `-t f32` as supported) and `dtype: float32` in
+  tinygrad. Report Q8_0 / F16 separately as informational tiers.
+- **Threading.** Pin each to the same physical core count. RAC: OpenMP,
+  set `OMP_NUM_THREADS`. llama.cpp: `-t N`. tinygrad: `OMP_NUM_THREADS`
+  plus `TINYGRAD_CLANG_PARALLEL=1`.
+- **Warmup.** Each framework runs one untimed pass before timing.
+- **Layer scaling.** For whole-model framework comparisons, divide by
+  `n_layers_divisor` (22 for TinyLlama-1.1B) to compare per-layer.
 
-### What to expect (rough guidance)
+### Rough expected numbers on Ryzen 9 5950X (FP32)
 
-On a Ryzen 9 5950X running FP32:
-
-| framework | prefill (tokens/s/layer) | decode (ms/layer) |
+| framework | prefill (tok/s/layer) | decode (ms/layer) |
 |---|---|---|
-| RAC (CORDIC) | ~400–600 | ~0.3–0.8 |
-| llama.cpp (F32, cBLAS) | ~1500–3000 | ~0.1–0.3 |
-| tinygrad (CLANG/F32) | ~200–800 | ~0.5–2.0 |
+| RAC (CORDIC) | 400–600 | 0.3–0.8 |
+| llama.cpp (F32, cBLAS) | 1500–3000 | 0.1–0.3 |
+| tinygrad (CLANG/F32) | 200–800 | 0.5–2.0 |
 
-RAC's competitive advantage isn't FP32-on-x86-silicon (where tensor-oriented kernels beat CORDIC). The point of this bench is to establish **where RAC sits today on commodity silicon**, so that the FPGA/ASIC numbers have a ground-truth baseline to improve on.
+RAC's competitive advantage isn't FP32-on-x86-silicon (where tensor-
+oriented kernels beat CORDIC). The point of this bench is to establish
+where RAC sits on commodity silicon so the FPGA/ASIC numbers have a
+ground-truth baseline.

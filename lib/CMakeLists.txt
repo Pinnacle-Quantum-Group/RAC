@@ -133,12 +133,27 @@ target_include_directories(bench_rac_alu PRIVATE c/)
 target_link_libraries(bench_rac_alu rac_static m)
 
 # RAC single-layer transformer inference bench (vs llama.cpp / tinygrad)
-add_executable(bench_rac_transformer ${CMAKE_SOURCE_DIR}/../bench/bench_rac_transformer.c)
-target_include_directories(bench_rac_transformer PRIVATE c/)
+# Includes a minimal safetensors reader so --safetensors=PATH can load real
+# HF weights (fetched via bench/fetch_model.py).
+add_executable(bench_rac_transformer
+    ${CMAKE_SOURCE_DIR}/../bench/bench_rac_transformer.c
+    ${CMAKE_SOURCE_DIR}/../bench/safetensors_reader.c)
+target_include_directories(bench_rac_transformer PRIVATE
+    c/
+    ${CMAKE_SOURCE_DIR}/../bench)
 target_link_libraries(bench_rac_transformer rac_static m)
 if(OpenMP_C_FOUND)
     target_link_libraries(bench_rac_transformer OpenMP::OpenMP_C)
 endif()
+
+# Safetensors reader BVT (runs in /tmp, no HF access needed)
+add_executable(test_safetensors
+    ${CMAKE_SOURCE_DIR}/../bench/test_safetensors.c
+    ${CMAKE_SOURCE_DIR}/../bench/safetensors_reader.c)
+target_include_directories(test_safetensors PRIVATE
+    ${CMAKE_SOURCE_DIR}/../bench)
+target_link_libraries(test_safetensors m)
+add_test(NAME safetensors_bvt COMMAND test_safetensors)
 
 # RAC microcode BVT (RISC-V Xrac ISA reference interpreter)
 add_executable(test_rac_ucode c/test_rac_ucode.c)
