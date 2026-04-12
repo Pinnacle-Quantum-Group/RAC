@@ -991,23 +991,38 @@ def benchmark_model(
 #   os.environ['RAC_CORDIC_ITERS'] = '8'
 #   rac_set_precision(16)
 
-_RAC_CORDIC_ITERS = int(os.environ.get('RAC_CORDIC_ITERS', '16'))
+#
+# Default is 24 — that's the fast path (single sign-XOR FMA, hardware
+# multiplier engaged). Values below 24 select the shift-add path: no
+# hardware multiplier is used, the multiply is done in integer ALU via
+# conditional shift-adds. Slower on GPU (the multiplier is idle by
+# design), but the correct thing on a dedicated RAC ASIC.
+_RAC_CORDIC_ITERS = int(os.environ.get('RAC_CORDIC_ITERS', '24'))
 
 _warned_iters_unsupported = False
 
 def rac_set_precision(iters: int) -> None:
     """
-    Set the global CORDIC iteration count for RAC operations.
-    Valid range: [4, 24]. Lower = faster / lower power, higher = more precise.
+    Set the global CORDIC iteration count for RAC matmul / linear ops.
+    Valid range: [4, 24].
 
-    Recommended settings:
-      - Training: 24 (fp32-equivalent precision, fast sign-XOR FMA path)
-      - Inference: 16 (iterative CORDIC, ~16 shift-adds per element)
-      - Edge/quantized inference: 8 (iterative CORDIC, ~8 shift-adds)
+    Two distinct paths based on iters:
 
-    With iters < 24 on GPU, the kernel runs the genuine N-iteration CORDIC
-    linear multiply — cycles scale with iters. iters == 24 hits the
-    single-FMA fast path with zero overhead.
+      iters == 24  (default): fast path. Single sign-XOR FMA per element,
+                              uses the hardware FP multiplier. This is the
+                              "production" setting — same throughput as
+                              before the knob existed.
+
+      iters <  24:            multiplier-free path. Product computed via
+                              integer shift-add (one shift + compare + add
+                              per iter, iters total). No FP multiplier is
+                              engaged. Slower on a multiplier-rich GPU —
+                              that idle silicon is the point: on a
+                              dedicated RAC ASIC the multiplier doesn't
+                              exist, and cycles = iters.
+
+    On GPU, iters=16 runs the shift-add path with ~16 bits of mantissa
+    precision (bf16-ish). iters=8 is int8-ish. iters=4 is int4-ish.
     """
     global _RAC_CORDIC_ITERS, _warned_iters_unsupported
     iters = max(4, min(24, int(iters)))
