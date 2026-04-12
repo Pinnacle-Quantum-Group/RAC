@@ -49,8 +49,35 @@ except ImportError:
         RuntimeWarning, stacklevel=2
     )
 
+# ── Runtime health probe ────────────────────────────────────────────────────
+# If the extension was compiled for a different GPU arch (e.g. gfx1100 but
+# you're on gfx1030), the import succeeds but every kernel launch fails with
+# "HIP error: invalid device function" — and worse, the bad kernel can poison
+# the CUDA/HIP context so unrelated torch ops also start to fail.
+# Probe a tiny matmul once and disable the extension globally if it blows up.
+_RAC_KERNEL_OK = False
+if _RAC_AVAILABLE and torch.cuda.is_available():
+    try:
+        _probe_a = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _probe_b = torch.randn(4, 4, device='cuda', dtype=torch.float32)
+        _probe_out = _rac.matmul_forward(_probe_a, _probe_b)
+        torch.cuda.synchronize()
+        _ = _probe_out.sum().item()    # force error surface
+        _RAC_KERNEL_OK = True
+        del _probe_a, _probe_b, _probe_out
+    except Exception as _probe_err:
+        _RAC_AVAILABLE = False
+        warnings.warn(
+            f"RAC extension loaded but probe failed: {_probe_err}. "
+            f"This usually means the .so was compiled for a different GPU "
+            f"arch. Rebuild with the matching arch, e.g. "
+            f"`GFX_ARCH=gfx1100 bash build_hip.sh`. "
+            f"Falling back to torch.matmul for all ops.",
+            RuntimeWarning, stacklevel=2,
+        )
+
 def _rac_available() -> bool:
-    return _RAC_AVAILABLE and torch.cuda.is_available()
+    return _RAC_AVAILABLE and _RAC_KERNEL_OK and torch.cuda.is_available()
 
 
 # ── torch.compile compatibility ──────────────────────────────────────────────

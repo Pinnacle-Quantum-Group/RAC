@@ -48,6 +48,15 @@ def bench(fn, iters, device):
     return (time.perf_counter() - t0) / iters * 1000  # ms
 
 
+def safe_bench(name, fn, iters, device):
+    """Run a bench; print error and return None rather than aborting the run."""
+    try:
+        return bench(fn, iters, device)
+    except Exception as e:
+        print(f"  [SKIP] {name}: {type(e).__name__}: {str(e).splitlines()[0][:90]}")
+        return None
+
+
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,7 +69,8 @@ def main():
     for (B, H, T, D) in [(1, 8, 128, 64), (2, 16, 512, 64), (2, 32, 1024, 64)]:
         q = torch.randn(B, H, T, D, device=device)
         k = torch.randn_like(q)
-        t = bench(lambda: rope(q, k), args.iters, device)
+        t = safe_bench(f"RoPE B={B} H={H} T={T}", lambda: rope(q, k), args.iters, device)
+        if t is None: continue
         bytes_moved = 2 * q.numel() * q.element_size() * 2  # Q+K read+write
         gbps = bytes_moved / (t * 1e6)
         print(f"  B={B} H={H} T={T} D={D}:  {t:7.3f} ms   {gbps:6.2f} GB/s")
@@ -71,8 +81,9 @@ def main():
         rms = RACRMSNorm(d).to(device)
         ref = torch.nn.LayerNorm(d).to(device)
         x = torch.randn(64, d, device=device)
-        t_rac = bench(lambda: rms(x), args.iters, device)
-        t_ref = bench(lambda: ref(x),  args.iters, device)
+        t_rac = safe_bench(f"RMS d={d}", lambda: rms(x), args.iters, device)
+        t_ref = safe_bench(f"LN d={d}",  lambda: ref(x), args.iters, device)
+        if t_rac is None or t_ref is None: continue
         print(f"  d={d}:  RMS={t_rac:6.3f}ms    LayerNorm={t_ref:6.3f}ms    "
               f"ratio={t_rac/t_ref:.2f}x")
 
@@ -82,8 +93,9 @@ def main():
         rln = RACLayerNorm(d).to(device)
         tln = torch.nn.LayerNorm(d).to(device)
         x = torch.randn(64, d, device=device)
-        t_rac = bench(lambda: rln(x), args.iters, device)
-        t_ref = bench(lambda: tln(x), args.iters, device)
+        t_rac = safe_bench(f"RACLN d={d}", lambda: rln(x), args.iters, device)
+        t_ref = safe_bench(f"torchLN d={d}", lambda: tln(x), args.iters, device)
+        if t_rac is None or t_ref is None: continue
         print(f"  d={d}:  RACLN={t_rac:6.3f}ms    torchLN={t_ref:6.3f}ms    "
               f"ratio={t_rac/t_ref:.2f}x")
 
@@ -94,7 +106,9 @@ def main():
             d_model=D, n_heads=H, ff_dim=4 * D, max_seq_len=T
         ).to(device)
         x = torch.randn(B, T, D, device=device)
-        t = bench(lambda: block(x, is_causal=True), args.iters, device)
+        t = safe_bench(f"Llama B={B} T={T} D={D}",
+                        lambda: block(x, is_causal=True), args.iters, device)
+        if t is None: continue
         params = sum(p.numel() for p in block.parameters())
         print(f"  B={B} T={T} D={D} H={H}:  {t:7.3f} ms   params={params/1e6:.2f}M")
 
@@ -104,7 +118,9 @@ def main():
     x = torch.randn(2, 64, 256, device=device)
     for iters in [4, 8, 12, 16, 20, 24]:
         rac_set_precision(iters)
-        t = bench(lambda: block(x, is_causal=True), args.iters, device)
+        t = safe_bench(f"iters={iters}",
+                        lambda: block(x, is_causal=True), args.iters, device)
+        if t is None: continue
         print(f"  iters={iters:2d}:  {t:7.3f} ms    (get={rac_get_precision()})")
     rac_set_precision(16)
 
