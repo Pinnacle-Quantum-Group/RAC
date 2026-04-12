@@ -41,7 +41,24 @@ typedef struct { float x; float y; } rac_vec2;
 #define RAC_ITERS      16
 #define RAC_ITERS_FAST 12
 #define RAC_PI         3.14159265358979f
-#define RAC_K_HYP_INV  0.82816f
+
+/*
+ * Hyperbolic CORDIC gain constants. Note: this CORDIC sequence has
+ * K_HYP < 1 (unlike circular K > 1). So to RECOVER cosh/sinh from the
+ * gain-scaled output you DIVIDE by K_HYP (equivalently, multiply by
+ * 1/K_HYP ≈ 1.20749).
+ *
+ * Historical note: the legacy macro RAC_K_HYP_INV is misnamed — its
+ * numerical value (0.82816) is actually K_HYP, not its inverse. We
+ * keep it for backward compatibility with rac_cuda.cu / rac_hip.cpp
+ * but new code should prefer RAC_K_HYP (value-correct) and
+ * RAC_K_HYP_RECIP (the true 1/K_HYP ≈ 1.20749).
+ */
+#define RAC_K_HYP       0.82816f     /* hyperbolic CORDIC gain */
+#define RAC_K_HYP_RECIP 1.20749f     /* 1 / RAC_K_HYP — use to un-gain output */
+#define RAC_K_HYP_INV   0.82816f     /* DEPRECATED alias for RAC_K_HYP
+                                      * (kept for backward compatibility;
+                                      * prefer RAC_K_HYP or RAC_K_HYP_RECIP) */
 
 /* ── Error codes ────────────────────────────────────────────────────────── */
 

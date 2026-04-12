@@ -305,10 +305,10 @@ void rac_alu_compensate(rac_alu_state *s) {
     /* Circular CORDIC gain K ≈ 1.647 inflates magnitude per call; compensate
      * by K^-1 ≈ 0.607 (RAC_ALU_K_INV). Hyperbolic CORDIC gain K_hyp ≈ 0.828
      * deflates magnitude per call; compensate by 1/K_hyp ≈ 1.208. The macro
-     * RAC_ALU_K_HYP_INV stores K_hyp itself, so we divide rather than multiply. */
+     * Use RAC_ALU_K_HYP_RECIP (= 1/K_HYP ≈ 1.207) to un-gain hyperbolic output. */
     float c;
     if (s->mode == RAC_ALU_MODE_HYPERBOLIC) {
-        c = _alu_powf(1.0f / RAC_ALU_K_HYP_INV, s->chain);
+        c = _alu_powf(RAC_ALU_K_HYP_RECIP, s->chain);
     } else {
         c = _alu_powf(RAC_ALU_K_INV, s->chain);
     }
@@ -555,15 +555,15 @@ float rac_alu_exp(float x) {
     float r = x - (float)k * LN2;
 
     /* e^r = cosh(r) + sinh(r) via hyperbolic CORDIC with x0=1, y0=0, z=r.
-     * After the sequence, x' = K_hyp · cosh(r), y' = K_hyp · sinh(r),
-     * where K_hyp ≈ 0.82816. Divide by K_hyp to recover cosh/sinh. */
+     * After the sequence, x' = K_HYP · cosh(r), y' = K_HYP · sinh(r),
+     * where K_HYP ≈ 0.82816. Multiply by K_HYP_RECIP (1/K_HYP ≈ 1.207)
+     * to recover cosh/sinh. */
     rac_alu_state s;
     rac_alu_reset(&s);
     rac_alu_load(&s, 1.0f, 0.0f, r);
     rac_alu_set_mode(&s, RAC_ALU_MODE_HYPERBOLIC, RAC_ALU_DIR_ROTATION);
     rac_alu_run(&s, RAC_ALU_ITERS);
-    const float inv_K_hyp = 1.0f / RAC_ALU_K_HYP_INV;
-    float er = (s.x + s.y) * inv_K_hyp;
+    float er = (s.x + s.y) * RAC_ALU_K_HYP_RECIP;
 
     /* Apply 2^k via direct float32 exponent bit manipulation.
      * ldexpf would work, but the inline form avoids a libc call. */
