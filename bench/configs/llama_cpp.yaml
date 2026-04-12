@@ -1,0 +1,29 @@
+# llama.cpp comparison config — TinyLlama-1.1B-Chat-v1.0
+#
+# Values are sensible defaults for a fair comparison with the RAC bench.
+# run_llama_cpp.sh reads this file and auto-fetches the model via
+# fetch_model.py; if llama-bench isn't on $PATH it'll print build
+# instructions (or, with --auto-build, clone + build into /tmp/llama.cpp).
+
+# Where to find llama-bench (leave blank → auto-detect)
+binary: ""
+
+# The GGUF repo + filename to pull. TheBloke publishes every common
+# quant; Q8_0 is the closest match to the RAC FP32 bench (near-lossless).
+gguf_repo: TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
+gguf_file: tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+
+# Per-layer scaling — TinyLlama-1.1B has 22 decoder layers.
+# Bench reports total throughput; dividing by this gives per-layer numbers
+# comparable to the single-layer RAC bench.
+n_layers_divisor: 22
+
+# Scenarios — match bench_rac_transformer
+prefill_tokens: 128
+decode_tokens:  128       # llama-bench -n; 1-token latency = total / n
+
+# Threads (match OMP_NUM_THREADS used for the RAC bench)
+threads: 16
+
+# Repeats (llama-bench reports median)
+repeats: 3

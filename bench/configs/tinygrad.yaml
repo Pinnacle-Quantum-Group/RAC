@@ -1,0 +1,26 @@
+# tinygrad comparison config — TinyLlama-1.1B-Chat-v1.0
+#
+# run_tinygrad.py reads this and auto-pip-installs tinygrad if missing.
+# Uses tinygrad's CLANG (CPU JIT) backend for a fair CPU-vs-CPU compare
+# against RAC on the Ryzen 9 5950X.
+
+hf_model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Per-layer scaling divisor (same as llama.cpp config)
+n_layers_divisor: 22
+
+# Scenarios
+prefill_tokens: 128
+decode_iters:   100
+
+# Backend: CLANG (CPU JIT, fastest CPU), LLVM, PYTHON (debug), CUDA, HIP
+device: CLANG
+
+# Precision
+dtype: float32        # float32 for apples-to-apples with RAC
+
+# Threading env vars (applied via os.environ before tinygrad import)
+env:
+  OMP_NUM_THREADS: 16
+  TINYGRAD_CLANG_PARALLEL: 1
+  JIT: 1
