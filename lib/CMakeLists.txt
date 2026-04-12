@@ -122,6 +122,11 @@ target_include_directories(test_rac_alu PRIVATE c/)
 target_link_libraries(test_rac_alu rac_static m)
 add_test(NAME rac_alu_bvt COMMAND test_rac_alu)
 
+# RAC ALU microbenchmark (not added to ctest — interactive perf tool)
+add_executable(bench_rac_alu c/bench_rac_alu.c)
+target_include_directories(bench_rac_alu PRIVATE c/)
+target_link_libraries(bench_rac_alu rac_static m)
+
 # ── Physics library ─────────────────────────────────────────────────────
 #
 # RAC Native Physics: amalgamates CUDA (PhysX/Flex) + AMD (FEMFX/ROCm)

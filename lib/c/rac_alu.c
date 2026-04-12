@@ -36,6 +36,23 @@ static const int _alu_hyp_iter_map[RAC_ALU_ITERS] = {
     1,2,3,4,4,5,6,7,8,9,10,11,12,13,13,14
 };
 
+/* Precomputed 2^-i tables keyed by iteration counter. Circular CORDIC
+ * uses i directly; hyperbolic uses iter_map[i]. Dodges the _alu_shift
+ * loop on the hot path. */
+static const float _alu_circ_scale[RAC_ALU_ITERS] = {
+    1.0f, 0.5f, 0.25f, 0.125f,
+    0.0625f, 0.03125f, 0.015625f, 0.0078125f,
+    0.00390625f, 0.001953125f, 0.0009765625f, 0.00048828125f,
+    0.000244140625f, 0.0001220703125f, 0.00006103515625f, 0.000030517578125f
+};
+
+static const float _alu_hyp_scale[RAC_ALU_ITERS] = {
+    0.5f,         0.25f,        0.125f,        0.0625f,
+    0.0625f,      0.03125f,     0.015625f,     0.0078125f,
+    0.00390625f,  0.001953125f, 0.0009765625f, 0.00048828125f,
+    0.000244140625f, 0.0001220703125f, 0.0001220703125f, 0.00006103515625f
+};
+
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 
 #ifndef RAC_ALU_PI
@@ -95,7 +112,7 @@ static inline float _alu_table_value(const rac_alu_state *s) {
             return _alu_atanh_table[_alu_hyp_iter_map[idx] - 1];
         case RAC_ALU_MODE_LINEAR:
             /* linear CORDIC: z residual is 2^-i (directly) */
-            return _alu_shift(1.0f, idx);
+            return _alu_circ_scale[idx] * 0.5f;   /* z residual = 2^-(i+1) */
         case RAC_ALU_MODE_CIRCULAR:
         default:
             return _alu_atan_table[idx];
@@ -103,10 +120,9 @@ static inline float _alu_table_value(const rac_alu_state *s) {
 }
 
 static inline float _alu_scale_value(const rac_alu_state *s) {
-    if (s->mode == RAC_ALU_MODE_HYPERBOLIC) {
-        return _alu_shift(1.0f, _alu_hyp_iter_map[s->iter]);
-    }
-    return _alu_shift(1.0f, s->iter);
+    if (s->mode == RAC_ALU_MODE_HYPERBOLIC) return _alu_hyp_scale[s->iter];
+    if (s->mode == RAC_ALU_MODE_CIRCULAR)   return _alu_circ_scale[s->iter];
+    return _alu_circ_scale[s->iter];  /* linear: same 2^-i */
 }
 
 /* ── Low-level ALU ops ───────────────────────────────────────────────────── */
@@ -182,11 +198,73 @@ int rac_alu_micro_step(rac_alu_state *s) {
     return 0;
 }
 
+/* Specialized straight-line loops for each mode. The mode switch inside
+ * rac_alu_micro_step is hoisted out of the loop — the compiler then fully
+ * unrolls the CORDIC sequence since the table reads become constant loads. */
+static inline void _alu_run_circ_rot(rac_alu_state *s, int iters) {
+    float x = s->x, y = s->y, z = s->z;
+    for (int i = 0; i < iters; i++) {
+        float d     = (z >= 0.0f) ? 1.0f : -1.0f;
+        float scale = _alu_circ_scale[i];
+        float xn    = x - d * y * scale;
+        float yn    = y + d * x * scale;
+        z -= d * _alu_atan_table[i];
+        x = xn; y = yn;
+    }
+    s->x = x; s->y = y; s->z = z;
+    s->d = (z >= 0.0f) ? 1.0f : -1.0f;
+    s->iter  = iters;
+    s->chain += iters;
+}
+
+static inline void _alu_run_circ_vec(rac_alu_state *s, int iters) {
+    float x = s->x, y = s->y, z = s->z;
+    for (int i = 0; i < iters; i++) {
+        float d     = (y <  0.0f) ? 1.0f : -1.0f;
+        float scale = _alu_circ_scale[i];
+        float xn    = x - d * y * scale;
+        float yn    = y + d * x * scale;
+        z -= d * _alu_atan_table[i];
+        x = xn; y = yn;
+    }
+    s->x = x; s->y = y; s->z = z;
+    s->d = (y < 0.0f) ? 1.0f : -1.0f;
+    s->iter  = iters;
+    s->chain += iters;
+}
+
+static inline void _alu_run_hyp_rot(rac_alu_state *s, int iters) {
+    float x = s->x, y = s->y, z = s->z;
+    for (int i = 0; i < iters; i++) {
+        float d     = (z >= 0.0f) ? 1.0f : -1.0f;
+        float scale = _alu_hyp_scale[i];
+        float xn    = x + d * y * scale;
+        float yn    = y + d * x * scale;
+        z -= d * _alu_atanh_table[_alu_hyp_iter_map[i] - 1];
+        x = xn; y = yn;
+    }
+    s->x = x; s->y = y; s->z = z;
+    s->d = (z >= 0.0f) ? 1.0f : -1.0f;
+    s->iter  = iters;
+    s->chain += iters;
+}
+
 int rac_alu_run(rac_alu_state *s, int iters) {
     if (iters > RAC_ALU_ITERS) iters = RAC_ALU_ITERS;
     s->iter = 0;
-    for (int i = 0; i < iters; i++) {
-        if (rac_alu_micro_step(s) != 0) return -1;
+
+    if (s->mode == RAC_ALU_MODE_CIRCULAR && s->dir == RAC_ALU_DIR_ROTATION) {
+        _alu_run_circ_rot(s, iters);
+    } else if (s->mode == RAC_ALU_MODE_CIRCULAR && s->dir == RAC_ALU_DIR_VECTORING) {
+        _alu_run_circ_vec(s, iters);
+    } else if (s->mode == RAC_ALU_MODE_HYPERBOLIC && s->dir == RAC_ALU_DIR_ROTATION) {
+        _alu_run_hyp_rot(s, iters);
+    } else {
+        /* Linear mode and hyperbolic-vectoring: fall through to the generic
+         * micro-step path (used rarely, not perf-critical). */
+        for (int i = 0; i < iters; i++) {
+            if (rac_alu_micro_step(s) != 0) return -1;
+        }
     }
     return 0;
 }
