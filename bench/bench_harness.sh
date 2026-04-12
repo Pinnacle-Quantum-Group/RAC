@@ -134,26 +134,41 @@ _ensure_venv() {
 
 _bench_pip_install() {
   # $1..: package names. Tries system pip first; on PEP 668 failure falls
-  # back to the bench venv. Idempotent — skips if import succeeds.
-  local pkg
+  # back to the bench venv. Idempotent — skips if import succeeds in the
+  # venv Python (not system Python, because the venv is what the bench
+  # ends up using via PATH override below).
+  local pkg check_py
+  # Prefer venv python for the module check so we know the venv has it
+  # (what matters downstream). Fall back to system python3 if no venv yet.
+  check_py=$([[ -x "$BENCH_VENV/bin/python3" ]] && echo "$BENCH_VENV/bin/python3" || echo python3)
   for pkg in "$@"; do
     local mod="$pkg"
     case "$pkg" in
       huggingface_hub|huggingface-hub) mod=huggingface_hub ;;
       *) mod="${pkg//-/_}" ;;
     esac
-    if python3 -c "import $mod" 2>/dev/null; then
+    if "$check_py" -c "import $mod" 2>/dev/null; then
+      echo "  [auto-install] $pkg already present in $check_py" >&2
       continue
     fi
     # System attempt (will fail silently on PEP 668)
     if pip install --quiet "$pkg" 2>/dev/null; then
       echo "  [auto-install] pip installed $pkg (system)" >&2
+      check_py=python3
       continue
     fi
-    # Venv fallback
+    # Venv fallback. Show pip output so heavy installs (torch ~800 MB)
+    # report progress + any failure. Previously --quiet hid torch's
+    # compile/download errors completely.
     _ensure_venv || return 1
-    if "$BENCH_VENV/bin/pip" install --quiet "$pkg" 2>&1 | sed 's/^/    /' >&2; then
-      echo "  [auto-install] installed $pkg into $BENCH_VENV" >&2
+    echo "  [auto-install] installing $pkg into $BENCH_VENV ..." >&2
+    if "$BENCH_VENV/bin/pip" install "$pkg" 2>&1 | sed 's/^/    /' >&2; then
+      if "$BENCH_VENV/bin/python3" -c "import $mod" 2>/dev/null; then
+        echo "  [auto-install] $pkg installed and importable" >&2
+        check_py="$BENCH_VENV/bin/python3"
+      else
+        echo "  [WARN] $pkg reported install OK but 'import $mod' still fails in the venv" >&2
+      fi
     else
       echo "  [WARN] failed to install $pkg — continuing without it" >&2
     fi
@@ -208,7 +223,25 @@ run_rac() {
       echo "  [WARN] $RAC_BIN is not linked against libgomp — OpenMP pragmas are no-ops." >&2
     fi
   fi
-  : "${OMP_NUM_THREADS:=$(nproc 2>/dev/null || echo 1)}"
+  # Default OMP_NUM_THREADS to PHYSICAL core count, not logical. This
+  # bench's decode path is a pure GEMV (memory-bandwidth bound); SMT
+  # siblings on the same physical core share L1/L2 and just thrash each
+  # other when both are running DRAM-streaming workloads. Using physical
+  # cores gave ~2x decode speedup on the 5950X (16 phys / 32 logical).
+  #
+  # Prefill is compute-bound and would benefit from all 32 logical cores,
+  # but the difference is smaller than the decode loss. One setting that
+  # works reasonably for both is "physical". User can override via
+  # OMP_NUM_THREADS=X in the environment.
+  if [[ -z "${OMP_NUM_THREADS:-}" ]]; then
+    local _phys
+    _phys=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {c=$2} /^Socket\(s\):/ {s=$2} END {if (c && s) print c*s}')
+    if [[ -n "$_phys" && "$_phys" -gt 0 ]]; then
+      OMP_NUM_THREADS="$_phys"
+    else
+      OMP_NUM_THREADS=$(nproc 2>/dev/null || echo 1)
+    fi
+  fi
   export OMP_NUM_THREADS
   local quant_flag="" quant_name="F32"
   if [[ "${RAC_BENCH_QUANT:-}" == "q8_0" || "${RAC_BENCH_QUANT:-}" == "Q8_0" ]]; then
