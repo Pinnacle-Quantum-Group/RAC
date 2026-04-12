@@ -41,6 +41,12 @@ parallel), else falls back to `urllib` (dep-free, slower). Cache dir
 is `~/.cache/rac_bench/` or `$HF_HOME/rac_bench/` if set. Gated repos:
 `HF_TOKEN=...` or `--token ...`.
 
+**PEP 668 / Debian 3.12+:** if `pip install huggingface_hub` fails
+with `externally-managed-environment`, set `HF_BOOTSTRAP_VENV=1` and
+re-run. `fetch_model.py` will auto-create a venv under
+`~/.cache/rac_bench/venv` and re-exec itself under that interpreter.
+`bench_harness.sh --auto-install` sets this flag automatically.
+
 **Per-file fetch** (e.g. GGUF for llama.cpp):
 
 ```bash
@@ -67,12 +73,67 @@ TinyLlama uses 4 KV heads (GQA): 32 query heads share 4 key/value heads.
 | **prefill** | 128 (override `--prefill N`) | compute-bound GEMM | peak GFLOPS |
 | **decode** | 1 | memory-bound GEMV | token latency |
 
+### Three-path primitive bench (CPU ↔ GPU SFU ↔ GLU RTL)
+
+Every RAC primitive uses the same CORDIC algorithm. `bench_three_paths.py`
+measures each on all three substrates side-by-side:
+
+```bash
+python3 bench/bench_three_paths.py                 # default N=1M elements
+python3 bench/bench_three_paths.py --skip-gpu      # CPU + GLU only
+```
+
+Output:
+
+```
+  Op             CPU AVX2 CORDIC     GPU SFU path         GLU (ASIC proj)
+  ─────────────────────────────────────────────────────────────────────────
+  rac_rsqrt          ###  ns              ###  ns             0.62 ns
+  rac_exp            ###  ns              ###  ns             0.62 ns
+  rac_rope           ###  ns              ###  ns             0.62 ns
+  rac_sigmoid        ###  ns              ###  ns             0.62 ns
+
+  SGEMM  (512x512 @ 512x512, float32)
+    CPU AVX2+FMA CORDIC:        ##.## ms/call   ####.# GFLOPS
+    GPU rac_torch SFU:          ##.## ms/call   ####.# GFLOPS
+    GLU native CORDIC bank:     ##.## ms/call    600.0 GFLOPS  (432-engine projection)
+```
+
+- **CPU path** — `librac.so` built with `-mavx2 -mfma`; called via ctypes.
+  Shift-add dual-cell runs on AVX2 YMM lanes.
+- **GPU path** — if `torch.cuda.is_available()` and `rac_torch` is built,
+  the matmul row goes through `rac_torch.rac_matmul` (SFU-routed CORDIC);
+  scalar rows use `torch.rsqrt` / `torch.exp` / etc which are already
+  backed by the GPU's transcendental units.
+- **GLU path** — projected from `rtl/rac_cordic_core.v`: one CORDIC
+  result per clock per pipelined engine at 200 MHz. `--bank-size N`
+  overrides the default 8-engine bank.
+
+### Status check — what's missing?
+
+Before running anything, inspect the environment:
+
+```bash
+./bench/configure.sh
+```
+
+Prints a table of every component (RAC binary, llama-bench, tinygrad,
+huggingface_hub, cached weights, thread count) with ✓ / ⚠ / ✗ and a
+one-liner for anything that's missing. Also rewrites
+`configs/llama_cpp.yaml` with the detected `llama-bench` path + thread
+count, so `run_llama_cpp.sh` picks them up automatically. Idempotent —
+safe to re-run.
+
 ### Running all three frameworks (one command)
 
 ```bash
 # On your box, from the repo root:
 ./bench/bench_harness.sh --auto-install --auto-build --layer 0
 ```
+
+`bench_harness.sh` internally runs `configure.sh --quiet` up front so
+paths stay current even if you've just installed `llama-bench` or
+cleared the cache.
 
 That command:
 1. Fetches TinyLlama weights into `~/.cache/rac_bench/` (via `fetch_model.py`)

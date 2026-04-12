@@ -62,17 +62,39 @@ def ensure_tinygrad(auto_install: bool) -> None:
     import importlib.util
     if importlib.util.find_spec("tinygrad") is not None:
         return
-    if auto_install:
-        print("  installing tinygrad via pip...", file=sys.stderr)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "tinygrad"])
+    except ImportError:
+        pass
+    if not auto_install:
+        print(
+            "  [ERROR] tinygrad not importable.\n"
+            "    pip install tinygrad\n"
+            "  or rerun this script with --auto-install.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Try a normal system-wide install first.
+    print("  installing tinygrad via pip...", file=sys.stderr)
+    rc = subprocess.call([sys.executable, "-m", "pip", "install", "-q", "tinygrad"])
+    if rc == 0:
         return
-    print(
-        "  [ERROR] tinygrad not importable.\n"
-        "    pip install tinygrad\n"
-        "  or rerun this script with --auto-install.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+
+    # PEP 668 (Debian/Ubuntu 3.12+) blocks system pip. Create a venv
+    # under ~/.cache/rac_bench/venv and re-exec ourselves from there.
+    venv_dir = pathlib.Path(
+        os.environ.get("HF_HOME", str(pathlib.Path.home() / ".cache"))
+    ) / "rac_bench" / "venv"
+    print(f"  system pip install failed; bootstrapping venv at {venv_dir}",
+          file=sys.stderr)
+    if not venv_dir.exists():
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+    venv_py = venv_dir / "bin" / "python3"
+    subprocess.check_call([str(venv_py), "-m", "pip", "install", "-q",
+                           "--upgrade", "pip", "tinygrad", "huggingface_hub"])
+    # Re-exec this script under the venv interpreter. The --auto-install
+    # flag is dropped so we don't re-trigger the bootstrap.
+    new_argv = [str(venv_py), __file__] + [a for a in sys.argv[1:] if a != "--auto-install"]
+    os.execv(str(venv_py), new_argv)
 
 
 def _available_backends_no_import():
@@ -153,9 +175,21 @@ def build_layer(cfg, weights_path, layer_idx):
     """
     Build a tinygrad Tensor-level decoder layer reading real weights.
     Returns a callable `forward(x)` that runs the whole block.
+
+    tinygrad gotcha: safe_load() returns tensors whose device is the
+    DISK-backed safetensors file. Any kernel that mixes DISK and the
+    compute device (CLANG, CUDA, etc.) fails with
+      RuntimeError: all buffers must be on the same device
+    So we explicitly .to(Device.DEFAULT).realize() every weight, which
+    reads the bytes off disk once and materializes a buffer on CLANG.
     """
-    from tinygrad import Tensor
+    from tinygrad import Tensor, Device
+    from tinygrad.dtype import dtypes
     from tinygrad.nn.state import safe_load
+
+    # Pin default device BEFORE any Tensor op. Inputs created later
+    # will inherit this; weights get .to()'d to it explicitly below.
+    Device.DEFAULT = cfg["device"]
 
     state = safe_load(str(weights_path))
 
@@ -175,19 +209,33 @@ def build_layer(cfg, weights_path, layer_idx):
     if missing:
         raise RuntimeError(f"missing tensors: {missing}")
 
-    # Dtype casting happens in tinygrad automatically on first op;
-    # we'll keep everything in the configured precision.
-    dtype_map = {"float32": "float", "float16": "half", "bfloat16": "bfloat16"}
-    tg_dtype = dtype_map.get(cfg["dtype"], "float")
+    # Pick target dtype
+    if cfg["dtype"] == "float16":
+        target_dt = dtypes.float16
+    elif cfg["dtype"] == "bfloat16":
+        target_dt = dtypes.bfloat16
+    else:
+        target_dt = dtypes.float32
 
-    W = {k: state[n].cast(tg_dtype) for k, n in names.items()}
+    # Load + move-to-device + cast + realize for every weight.
+    # .realize() forces the actual DISK read and allocates a CLANG buffer;
+    # without it, the weight stays symbolic on DISK and the forward-pass
+    # kernel fails the cross-device check.
+    W = {}
+    print(f"  loading {len(names)} tensors to {Device.DEFAULT}...",
+          file=sys.stderr)
+    for k, name in names.items():
+        t = state[name]                           # DISK
+        t = t.to(Device.DEFAULT)                  # move to compute device
+        t = t.cast(target_dt)                     # dtype promote
+        t = t.contiguous().realize()              # allocate + read
+        W[k] = t
 
     # TinyLlama-1.1B dims
     d       = 2048
     n_heads = 32
     n_kv    = 4
     d_head  = 64
-    d_ff    = 5632
 
     def rmsnorm(x, gamma, eps=1e-5):
         var = (x * x).mean(axis=-1, keepdim=True)
@@ -207,19 +255,19 @@ def build_layer(cfg, weights_path, layer_idx):
 
         # GQA: repeat k/v groups
         rep = n_heads // n_kv
-        k = k.repeat_interleave(rep, dim=0)  # [nq, T, dh]
+        k = k.repeat_interleave(rep, dim=0)
         v = v.repeat_interleave(rep, dim=0)
 
-        scores = (q @ k.permute(0, 2, 1)) * (1.0 / (d_head ** 0.5))   # [nq, T, T]
+        scores = (q @ k.permute(0, 2, 1)) * (1.0 / (d_head ** 0.5))
 
-        # Causal mask
+        # Causal mask (additive: 0 on keep, -1e9 on mask)
         if T > 1:
-            mask = Tensor.ones(T, T).tril() - Tensor.ones(T, T)
-            scores = scores + mask * 1e9    # below-diagonal is 0, above = -inf-ish
+            mask = (Tensor.ones(T, T).tril() - Tensor.ones(T, T))
+            scores = scores + mask * 1e9
 
         attn = scores.softmax(axis=-1)
         out  = attn @ v                                               # [nq, T, dh]
-        out  = out.permute(1, 0, 2).reshape(T, d)                     # [T, d]
+        out  = out.permute(1, 0, 2).reshape(T, d)
         out  = out @ W["o"].T
         x    = x + out
 
@@ -265,14 +313,8 @@ def main():
     cfg["device"] = probe_dev
 
     ensure_tinygrad(args.auto_install)
-
-    # Re-probe after install in case auto-install was a no-op previously
-    # and the initial _pick_device returned a default. No-op if already set.
-    dev = _pick_device(cfg["device"])
-    os.environ["DEV"] = dev
-    cfg["device"] = dev
-
-    from tinygrad import Tensor
+    from tinygrad import Tensor, Device
+    from tinygrad.dtype import dtypes
 
     weights = fetch_weights(cfg["hf_model_id"])
     layer = build_layer(cfg, weights, args.layer)
@@ -280,9 +322,11 @@ def main():
     T = cfg["prefill_tokens"]
     d_model = 2048
 
-    # Build inputs
-    x_prefill = Tensor.rand(T, d_model).cast("float" if cfg["dtype"] == "float32" else "half")
-    x_decode  = Tensor.rand(1, d_model).cast("float" if cfg["dtype"] == "float32" else "half")
+    # Match the weight dtype (build_layer already set Device.DEFAULT).
+    in_dt = {"float16": dtypes.float16,
+             "bfloat16": dtypes.bfloat16}.get(cfg["dtype"], dtypes.float32)
+    x_prefill = Tensor.rand(T, d_model).cast(in_dt).realize()
+    x_decode  = Tensor.rand(1, d_model).cast(in_dt).realize()
 
     # Warmup
     _ = layer(x_prefill).realize()

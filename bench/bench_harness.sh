@@ -41,6 +41,12 @@ for arg in "$@"; do
   esac
 done
 
+# Run configure.sh up front: auto-detect tools + update YAMLs with the
+# resolved llama-bench path / thread count. Silent JSON output.
+if [[ -x "${HERE}/configure.sh" ]]; then
+  "${HERE}/configure.sh" --quiet >/dev/null 2>&1 || true
+fi
+
 # Auto-detect the RAC bench binary (built via cmake in lib/build)
 if [[ -z "$BIN_DIR" ]]; then
   for cand in "${HERE}/../lib/build" "${HERE}/../build" "/tmp/rac_build"; do
@@ -164,6 +170,12 @@ if [[ "$AUTO_INSTALL" -eq 1 ]]; then
 fi
 
 # ── Fetch weights once (both RAC and tinygrad pull the same files) ─────
+# If --auto-install was requested, let fetch_model.py + run_tinygrad.py
+# bootstrap a venv under $HF_HOME/rac_bench/venv (bypasses PEP 668 on
+# Debian/Ubuntu 3.12+ system Python).
+if [[ "$AUTO_INSTALL" -eq 1 ]]; then
+  export HF_BOOTSTRAP_VENV=1
+fi
 MODEL_ID="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 echo "  fetching $MODEL_ID (idempotent, cached)..." >&2
 MODEL_DIR=$(python3 "${HERE}/fetch_model.py" --model "$MODEL_ID") || {
@@ -226,37 +238,30 @@ run_llama() {
   [[ "$SKIP_LLAMA" -eq 1 ]] && return 0
   ARGS=()
   [[ "$AUTO_BUILD" -eq 1 ]] && ARGS+=(--auto-build)
-  # Capture the script's stdout (the JSON line) but let stderr through so
-  # diagnostics (CSV-parse warnings, build errors, debug dumps) are visible.
-  # Using a tmpfile redirect keeps stderr live while isolating stdout.
-  local stdout_file
-  stdout_file=$(mktemp)
-  if bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" >"$stdout_file"; then
-    LLAMA_JSON=$(cat "$stdout_file")
+  # Capture stdout (JSON) into a tempfile; let stderr flow to the user
+  # so they see GGUF download progress + llama-bench model-load output.
+  local out; out=$(mktemp)
+  if bash "${HERE}/run_llama_cpp.sh" "${ARGS[@]}" > "$out"; then
+    LLAMA_JSON=$(cat "$out")
   else
-    echo "  [WARN] llama.cpp run failed; skipping" >&2
+    echo "  [WARN] llama.cpp run failed; see stderr above" >&2
     LLAMA_JSON=""
   fi
-  rm -f "$stdout_file"
+  rm -f "$out"
 }
 
 run_tiny() {
   [[ "$SKIP_TINY" -eq 1 ]] && return 0
   ARGS=(--layer "$LAYER")
   [[ "$AUTO_INSTALL" -eq 1 ]] && ARGS+=(--auto-install)
-  # Same pattern as run_llama: keep stderr streaming so the user sees
-  # device-selection / install / ImportError messages live.
-  local stdout_file
-  stdout_file=$(mktemp)
-  if python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" >"$stdout_file"; then
-    TINY_JSON=$(cat "$stdout_file")
+  local out; out=$(mktemp)
+  if python3 "${HERE}/run_tinygrad.py" "${ARGS[@]}" > "$out"; then
+    TINY_JSON=$(cat "$out")
   else
-    echo "  [WARN] tinygrad run failed; skipping" >&2
+    echo "  [WARN] tinygrad run failed; see stderr above" >&2
     TINY_JSON=""
-    rm -f "$stdout_file"
-    return 1
   fi
-  rm -f "$stdout_file"
+  rm -f "$out"
 }
 
 echo "  ── RAC ──────────────────────────────────" >&2; run_rac   || true

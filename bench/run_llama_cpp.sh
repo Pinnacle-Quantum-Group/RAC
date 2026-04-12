@@ -90,25 +90,31 @@ EOF
 fi
 
 # ── Fetch the GGUF (idempotent — fetch_model.py caches) ──────────────────
+echo "  fetching GGUF: ${GGUF_REPO}/${GGUF_FILE} (≈1.1 GB first time, cached after)..." >&2
 GGUF_PATH=$(python3 "${HERE}/fetch_model.py" \
               --model "${GGUF_REPO}" --file "${GGUF_FILE}")
 if [[ ! -s "$GGUF_PATH" ]]; then
   echo "  [ERROR] fetched path empty: $GGUF_PATH" >&2; exit 4
 fi
+GGUF_SZ=$(stat -c%s "$GGUF_PATH" 2>/dev/null || stat -f%z "$GGUF_PATH" 2>/dev/null || echo 0)
+printf "  GGUF ready (%d MB) at %s\n" \
+       "$((GGUF_SZ / 1024 / 1024))" "$GGUF_PATH" >&2
 
 # ── Run llama-bench ──────────────────────────────────────────────────────
-# llama-bench emits a CSV-like table; we capture and parse.
+# llama-bench emits a CSV-like table on stdout + model-loading progress
+# on stderr. We capture stdout into a tempfile and let stderr flow to
+# the user's terminal so they see what's happening.
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
-"$BIN" -m "$GGUF_PATH" \
-       -p "$PREFILL" -n "$DECODE" \
-       -t "$THREADS" -r "$REPEATS" \
-       -o csv > "$TMP" 2>/dev/null || {
-  echo "  [ERROR] llama-bench failed; stderr follows:" >&2
-  "$BIN" -m "$GGUF_PATH" -p "$PREFILL" -n "$DECODE" -t "$THREADS" -r "$REPEATS" >&2
+echo "  running llama-bench  [p=$PREFILL n=$DECODE t=$THREADS r=$REPEATS] ..." >&2
+if ! "$BIN" -m "$GGUF_PATH" \
+            -p "$PREFILL" -n "$DECODE" \
+            -t "$THREADS" -r "$REPEATS" \
+            -o csv > "$TMP"; then
+  echo "  [ERROR] llama-bench exited non-zero" >&2
   exit 5
-}
+fi
 
 # Parse the CSV. llama-bench schemas seen in the wild:
 #   pre-2024:  columns include "test" + "t/s"

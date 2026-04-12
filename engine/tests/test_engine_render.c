@@ -9,6 +9,7 @@
 #include "../rac_engine_light.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 static int tests_passed = 0;
@@ -48,8 +49,8 @@ static void test_framebuffer_ppm(void)
     /* Verify file exists and has correct header */
     FILE *f = fopen("/tmp/rac_test_render.ppm", "rb");
     CHECK(f != NULL, "file exists");
-    char header[32];
-    fgets(header, sizeof(header), f);
+    char header[32] = {0};
+    CHECK(fgets(header, sizeof(header), f) != NULL, "PPM header readable");
     CHECK(header[0] == 'P' && header[1] == '6', "PPM P6 header");
     fclose(f);
 
