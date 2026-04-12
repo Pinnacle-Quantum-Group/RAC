@@ -25,12 +25,12 @@ option(RAC_AVX2   "Enable AVX2/FMA intrinsics" ON)
 
 # ── Core C library ──────────────────────────────────────────────────────
 
-add_library(rac SHARED c/rac_cpu.c)
+add_library(rac SHARED c/rac_cpu.c c/rac_alu.c)
 target_include_directories(rac PUBLIC c/)
 target_link_libraries(rac m)
 target_compile_options(rac PRIVATE -O3 -march=native -Wall -Wextra)
 
-add_library(rac_static STATIC c/rac_cpu.c)
+add_library(rac_static STATIC c/rac_cpu.c c/rac_alu.c)
 target_include_directories(rac_static PUBLIC c/)
 target_link_libraries(rac_static m)
 target_compile_options(rac_static PRIVATE -O3 -march=native -Wall -Wextra)
@@ -116,6 +116,12 @@ if(TARGET rac_avx2)
     target_link_libraries(test_rac_threads rac_avx2 m)
 endif()
 
+# RAC Adder + ALU BVT (no AVX2 dependency — self-contained)
+add_executable(test_rac_alu c/test_rac_alu.c)
+target_include_directories(test_rac_alu PRIVATE c/)
+target_link_libraries(test_rac_alu rac_static m)
+add_test(NAME rac_alu_bvt COMMAND test_rac_alu)
+
 # ── Physics library ─────────────────────────────────────────────────────
 #
 # RAC Native Physics: amalgamates CUDA (PhysX/Flex) + AMD (FEMFX/ROCm)
@@ -157,7 +163,7 @@ add_test(NAME physics_bvt COMMAND test_rac_physics_bvt)
 
 install(TARGETS rac rac_static DESTINATION lib)
 install(TARGETS rac_physics rac_physics_static DESTINATION lib)
-install(FILES c/rac_cpu.h c/rac_avx2.h c/rac_physics.h DESTINATION include/rac)
+install(FILES c/rac_cpu.h c/rac_alu.h c/rac_avx2.h c/rac_physics.h DESTINATION include/rac)
 if(TARGET rac_avx2)
     install(TARGETS rac_avx2 DESTINATION lib)
 endif()
