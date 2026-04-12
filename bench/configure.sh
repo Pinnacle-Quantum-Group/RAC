@@ -147,11 +147,25 @@ else
 fi
 
 # ── 7. Threads / hardware ──────────────────────────────────────────────
-PHYS_CORES=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null \
-               || sysctl -n hw.physicalcpu 2>/dev/null \
-               || nproc 2>/dev/null \
-               || echo 16)
-# Prefer physical over logical — matches the RAC bench thread-scaling finding
+# Count UNIQUE (physical_id, core_id) pairs in /proc/cpuinfo — the simple
+# "processor:" line-count was wrong for SMT CPUs (e.g. a 5950X reported
+# 32/32 instead of 16/32). lscpu -p is cleaner when available.
+PHYS_CORES=""
+if command -v lscpu >/dev/null 2>&1; then
+  PHYS_CORES=$(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -un | wc -l)
+fi
+if [[ -z "$PHYS_CORES" || "$PHYS_CORES" = "0" ]]; then
+  if [[ -r /proc/cpuinfo ]]; then
+    PHYS_CORES=$(awk -F: '
+        /^physical id/ { phys = $2 }
+        /^core id/     { core = $2; seen[phys "_" core] = 1 }
+        END            { print length(seen) }
+    ' /proc/cpuinfo)
+  fi
+fi
+if [[ -z "$PHYS_CORES" || "$PHYS_CORES" = "0" ]]; then
+  PHYS_CORES=$(sysctl -n hw.physicalcpu 2>/dev/null || nproc 2>/dev/null || echo 16)
+fi
 LOG_CORES=$(nproc 2>/dev/null || echo "$PHYS_CORES")
 row "Threads detected"    "✓" "${PHYS_CORES} physical, ${LOG_CORES} logical (recommended: physical)"
 
