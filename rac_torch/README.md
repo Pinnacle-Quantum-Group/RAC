@@ -15,6 +15,36 @@ USE_ROCM=1 pip install -e .
 pip install -e .
 ```
 
+### ROCm GPU arch compatibility
+
+If import succeeds but every kernel launch says `HIP error: invalid device
+function`, the `.so` was compiled for a different `gfx*` target than your
+card (or PyTorch's ROCm wheels don't cover it). Check your card:
+
+```bash
+rocminfo | grep -m1 'Name:.*gfx'
+```
+
+Rebuild the extension for that arch:
+
+```bash
+GFX_ARCH=gfx1100 bash build_hip.sh     # RX 7900 series
+GFX_ARCH=gfx1030 bash build_hip.sh     # RX 6800/6900 series
+```
+
+**Navi 33 (RX 7600 / 7700 / some 7800 mobile) workaround.** PyTorch ROCm
+wheels typically don't ship `gfx1102` kernels, so both torch's own ops and
+the RAC extension will fail. Route gfx1102 through the gfx1100 code path:
+
+```bash
+export HSA_OVERRIDE_GFX_VERSION=11.0.0
+GFX_ARCH=gfx1100 bash build_hip.sh     # compile against the reported arch
+python3 test_rac_perf.py
+```
+
+`rac_torch.py` probes the device at import time and warns distinctly
+for each failure mode (torch install vs. RAC extension mismatch).
+
 ---
 
 ## Usage

@@ -69,12 +69,19 @@ if torch.cuda.is_available():
         _TORCH_CUDA_OK = True
         del _pa, _pb, _pc
     except Exception as _tp_err:
+        _hint = ""
+        if torch.version.hip:
+            _hint = (
+                " HINT: PyTorch ROCm wheels often omit gfx1102 (Navi 33, "
+                "RX 7600/7700). Try `HSA_OVERRIDE_GFX_VERSION=11.0.0 python ...` "
+                "to route gfx1102 through the gfx1100 code path."
+            )
         warnings.warn(
             f"torch+{torch.version.hip or torch.version.cuda} device probe failed: "
             f"{type(_tp_err).__name__}: {str(_tp_err).splitlines()[0][:120]}. "
             f"This is a PyTorch/driver install problem, NOT a RAC problem. "
             f"Check `rocminfo | grep 'Name:.*gfx'` against your PyTorch's "
-            f"supported arch list. Falling back to CPU.",
+            f"supported arch list. Falling back to CPU.{_hint}",
             RuntimeWarning, stacklevel=2,
         )
 
