@@ -25,12 +25,12 @@ option(RAC_AVX2   "Enable AVX2/FMA intrinsics" ON)
 
 # ── Core C library ──────────────────────────────────────────────────────
 
-add_library(rac SHARED c/rac_cpu.c c/rac_alu.c c/rac_ucode.c)
+add_library(rac SHARED c/rac_cpu.c c/rac_alu.c c/rac_ucode.c c/rac_xrac.c)
 target_include_directories(rac PUBLIC c/)
 target_link_libraries(rac m)
 target_compile_options(rac PRIVATE -O3 -march=native -Wall -Wextra)
 
-add_library(rac_static STATIC c/rac_cpu.c c/rac_alu.c c/rac_ucode.c)
+add_library(rac_static STATIC c/rac_cpu.c c/rac_alu.c c/rac_ucode.c c/rac_xrac.c)
 target_include_directories(rac_static PUBLIC c/)
 target_link_libraries(rac_static m)
 target_compile_options(rac_static PRIVATE -O3 -march=native -Wall -Wextra)
@@ -138,6 +138,12 @@ target_include_directories(test_rac_ucode PRIVATE c/)
 target_link_libraries(test_rac_ucode rac_static m)
 add_test(NAME rac_ucode_bvt COMMAND test_rac_ucode)
 
+# RAC Xrac ISS BVT (real RV32 + Xrac machine code)
+add_executable(test_rac_xrac c/test_rac_xrac.c)
+target_include_directories(test_rac_xrac PRIVATE c/)
+target_link_libraries(test_rac_xrac rac_static m)
+add_test(NAME rac_xrac_bvt COMMAND test_rac_xrac)
+
 # ── Physics library ─────────────────────────────────────────────────────
 #
 # RAC Native Physics: amalgamates CUDA (PhysX/Flex) + AMD (FEMFX/ROCm)
@@ -179,7 +185,7 @@ add_test(NAME physics_bvt COMMAND test_rac_physics_bvt)
 
 install(TARGETS rac rac_static DESTINATION lib)
 install(TARGETS rac_physics rac_physics_static DESTINATION lib)
-install(FILES c/rac_cpu.h c/rac_alu.h c/rac_ucode.h c/rac_avx2.h c/rac_physics.h DESTINATION include/rac)
+install(FILES c/rac_cpu.h c/rac_alu.h c/rac_ucode.h c/rac_xrac.h c/rac_avx2.h c/rac_physics.h DESTINATION include/rac)
 if(TARGET rac_avx2)
     install(TARGETS rac_avx2 DESTINATION lib)
 endif()
