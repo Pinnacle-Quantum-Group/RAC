@@ -9,9 +9,15 @@
  * Build: cc -O3 -march=native rac_alu.c rac_cpu.c -lm -c
  */
 
+/* posix_memalign needs _POSIX_C_SOURCE >= 200112L. Define before any
+ * system header so the prototype is visible under -std=c99. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
 #include "rac_alu.h"
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__AVX2__) && defined(__FMA__)
@@ -835,12 +841,12 @@ static float _alu_inner_batch_avx2(const rac_vec2 *a, const rac_vec2 *b, int n) 
  * embarrassingly parallel across rows. */
 static void _alu_outer_batch_avx2(const rac_vec2 *a, const rac_vec2 *b,
                                   float *C, int m, int n) {
-    /* Aligned temp tables */
-    float *mb = (float *)aligned_alloc(32,
-        ((size_t)n * sizeof(float) + 31u) & ~31u);
-    float *ab = (float *)aligned_alloc(32,
-        ((size_t)n * sizeof(float) + 31u) & ~31u);
-    if (!mb || !ab) { free(mb); free(ab); return; }
+    /* Aligned temp tables. posix_memalign is C99-friendly; aligned_alloc
+     * would require C11 which this tree doesn't use (CMAKE_C_STANDARD=99). */
+    float *mb = NULL, *ab = NULL;
+    size_t nb = ((size_t)n * sizeof(float) + 31u) & ~31u;
+    if (posix_memalign((void **)&mb, 32, nb) != 0) { return; }
+    if (posix_memalign((void **)&ab, 32, nb) != 0) { free(mb); return; }
 
     /* Phase 1: polar(b) once per j. */
     const int n8 = n / 8;

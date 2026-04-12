@@ -41,6 +41,12 @@ parallel), else falls back to `urllib` (dep-free, slower). Cache dir
 is `~/.cache/rac_bench/` or `$HF_HOME/rac_bench/` if set. Gated repos:
 `HF_TOKEN=...` or `--token ...`.
 
+**PEP 668 / Debian 3.12+:** if `pip install huggingface_hub` fails
+with `externally-managed-environment`, set `HF_BOOTSTRAP_VENV=1` and
+re-run. `fetch_model.py` will auto-create a venv under
+`~/.cache/rac_bench/venv` and re-exec itself under that interpreter.
+`bench_harness.sh --auto-install` sets this flag automatically.
+
 **Per-file fetch** (e.g. GGUF for llama.cpp):
 
 ```bash

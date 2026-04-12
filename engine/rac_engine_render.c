@@ -508,7 +508,6 @@ void rac_render_shadow_pass(rac_light *light,
     rac_mat4 mvp = rac_mat4_mul(light_view_proj, model_matrix);
 
     for (int i = 0; i < mesh->num_indices; i += 3) {
-        rac_phys_vec3 v[3];
         float sx[3], sy[3], sz[3], sw[3];
 
         for (int k = 0; k < 3; k++) {
@@ -541,7 +540,6 @@ void rac_render_shadow_pass(rac_light *light,
             /* NDC to shadow map coords */
             sx[k] = (sx[k] + 1.0f) * 0.5f * (float)res;
             sy[k] = (1.0f - sy[k]) * 0.5f * (float)res;
-            v[k] = p;
         }
 
         /* Simple rasterization for shadow depth */

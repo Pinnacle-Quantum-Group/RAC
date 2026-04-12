@@ -78,6 +78,28 @@ def have_hub() -> bool:
         return False
 
 
+def maybe_bootstrap_venv() -> None:
+    """If HF_BOOTSTRAP_VENV=1 and huggingface_hub is missing, build a
+    venv under cache_root()/venv with pip + huggingface_hub and re-exec
+    ourselves from that interpreter. Lets Debian/Ubuntu users opt into
+    a non-PEP-668 pip install without polluting system Python."""
+    if os.environ.get("HF_BOOTSTRAP_VENV") != "1":
+        return
+    if have_hub():
+        return
+    venv_dir = cache_root() / "venv"
+    if not venv_dir.exists():
+        import subprocess
+        sys.stderr.write(f"  bootstrapping venv at {venv_dir} ...\n")
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+        subprocess.check_call([
+            str(venv_dir / "bin" / "python3"), "-m", "pip", "install",
+            "-q", "--upgrade", "pip", "huggingface_hub",
+        ])
+    os.execv(str(venv_dir / "bin" / "python3"),
+             [str(venv_dir / "bin" / "python3"), __file__] + sys.argv[1:])
+
+
 # ── huggingface_hub path ────────────────────────────────────────────────
 
 def fetch_hub(repo_id: str, revision: str, filenames: list[str] | None,
@@ -167,6 +189,7 @@ def main() -> int:
                     help="after fetching, print the absolute path to this "
                          "specific file (useful for shell command sub).")
     args = ap.parse_args()
+    maybe_bootstrap_venv()
 
     try:
         if have_hub():

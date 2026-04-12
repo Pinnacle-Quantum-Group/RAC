@@ -62,17 +62,37 @@ def ensure_tinygrad(auto_install: bool) -> None:
         return
     except ImportError:
         pass
-    if auto_install:
-        print("  installing tinygrad via pip...", file=sys.stderr)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "tinygrad"])
+    if not auto_install:
+        print(
+            "  [ERROR] tinygrad not importable.\n"
+            "    pip install tinygrad\n"
+            "  or rerun this script with --auto-install.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Try a normal system-wide install first.
+    print("  installing tinygrad via pip...", file=sys.stderr)
+    rc = subprocess.call([sys.executable, "-m", "pip", "install", "-q", "tinygrad"])
+    if rc == 0:
         return
-    print(
-        "  [ERROR] tinygrad not importable.\n"
-        "    pip install tinygrad\n"
-        "  or rerun this script with --auto-install.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+
+    # PEP 668 (Debian/Ubuntu 3.12+) blocks system pip. Create a venv
+    # under ~/.cache/rac_bench/venv and re-exec ourselves from there.
+    venv_dir = pathlib.Path(
+        os.environ.get("HF_HOME", str(pathlib.Path.home() / ".cache"))
+    ) / "rac_bench" / "venv"
+    print(f"  system pip install failed; bootstrapping venv at {venv_dir}",
+          file=sys.stderr)
+    if not venv_dir.exists():
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+    venv_py = venv_dir / "bin" / "python3"
+    subprocess.check_call([str(venv_py), "-m", "pip", "install", "-q",
+                           "--upgrade", "pip", "tinygrad", "huggingface_hub"])
+    # Re-exec this script under the venv interpreter. The --auto-install
+    # flag is dropped so we don't re-trigger the bootstrap.
+    new_argv = [str(venv_py), __file__] + [a for a in sys.argv[1:] if a != "--auto-install"]
+    os.execv(str(venv_py), new_argv)
 
 
 def fetch_weights(model_id: str) -> pathlib.Path:
