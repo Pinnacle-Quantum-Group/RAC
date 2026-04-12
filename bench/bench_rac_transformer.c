@@ -85,9 +85,22 @@ static void cfg_apply_preset(tx_cfg *c, const char *name) {
 /* ── Weights + buffers ─────────────────────────────────────────────────── */
 
 typedef struct {
+    /* Original [N, K] row-major weights — the layout HF / safetensors
+     * and the Q8_0 GEMV expect. Kept because bench_gemv (M==1 decode)
+     * walks this layout natively. */
     float *W_q, *W_k, *W_v, *W_o;
     float *W_g, *W_u, *W_d;
     float *rms_att, *rms_ffn;
+
+    /* Pre-transposed [K, N] row-major copies, produced once at load
+     * time. These feed rac_hal_sgemm directly — the AVX2 micro-kernel
+     * wants [K, N] and would otherwise re-transpose via malloc on EVERY
+     * fused_linear call (22 layers * 7 ops * up to 46 MB = ~4 GB of
+     * per-batch memcpy at TinyLlama shape, dominating prefill wall
+     * time). Pre-transposing once trades 2x weight memory (~1.1 GB for
+     * TinyLlama f32) for ~GB/s of recurrent memory traffic. */
+    float *W_q_kn, *W_k_kn, *W_v_kn, *W_o_kn;
+    float *W_g_kn, *W_u_kn, *W_d_kn;
 
     /* Optional Q8_0 shadow copies of the linear-layer weights. NULL when
      * --q8_0 is not set. Each pointer is a flat array of rac_q8_0_block
@@ -200,8 +213,38 @@ static void free_weights(tx_weights *w) {
     free(w->W_q); free(w->W_k); free(w->W_v); free(w->W_o);
     free(w->W_g); free(w->W_u); free(w->W_d);
     free(w->rms_att); free(w->rms_ffn);
+    free(w->W_q_kn); free(w->W_k_kn); free(w->W_v_kn); free(w->W_o_kn);
+    free(w->W_g_kn); free(w->W_u_kn); free(w->W_d_kn);
     free(w->Wq_q8); free(w->Wk_q8); free(w->Wv_q8); free(w->Wo_q8);
     free(w->Wg_q8); free(w->Wu_q8); free(w->Wd_q8);
+}
+
+/*
+ * Transpose an [N, K] row-major matrix into a newly allocated [K, N]
+ * buffer. Parallel over N (source row direction) so each thread owns
+ * a contiguous N-stripe of source reads, striding into the output.
+ */
+static float *transpose_nk_to_kn(const float *src, int N, int K) {
+    float *dst = xalloc((size_t)K * N);
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        const float *srow = src + (size_t)j * K;
+        /* dst[k * N + j] = src[j * K + k] */
+        for (int k = 0; k < K; k++) dst[(size_t)k * N + j] = srow[k];
+    }
+    return dst;
+}
+
+static void weights_pretranspose(tx_weights *w, const tx_cfg *c) {
+    int d  = c->d_model;
+    int dk = c->n_kv_heads * c->d_head;
+    w->W_q_kn = transpose_nk_to_kn(w->W_q, d,        d);
+    w->W_k_kn = transpose_nk_to_kn(w->W_k, dk,       d);
+    w->W_v_kn = transpose_nk_to_kn(w->W_v, dk,       d);
+    w->W_o_kn = transpose_nk_to_kn(w->W_o, d,        d);
+    w->W_g_kn = transpose_nk_to_kn(w->W_g, c->d_ff,  d);
+    w->W_u_kn = transpose_nk_to_kn(w->W_u, c->d_ff,  d);
+    w->W_d_kn = transpose_nk_to_kn(w->W_d, d,        c->d_ff);
 }
 
 /*
@@ -281,14 +324,72 @@ static inline void bench_gemv(
     }
 }
 
+/*
+ * Fused bias + activation pass over a [M, N] matrix. Used as the epilogue
+ * after rac_hal_sgemm. Parallel across rows with SIMD elementwise inside.
+ */
+static inline void bench_bias_act(float *out, const float *bias,
+                                    int M, int N, rac_activation act) {
+    if (act == RAC_ACT_NONE && !bias) return;
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < M; i++) {
+        float *row = out + (size_t)i * N;
+        if (bias) {
+            #pragma omp simd
+            for (int j = 0; j < N; j++) row[j] += bias[j];
+        }
+        if (act == RAC_ACT_RELU) {
+            #pragma omp simd
+            for (int j = 0; j < N; j++) row[j] = row[j] > 0.0f ? row[j] : 0.0f;
+        } else if (act == RAC_ACT_GELU) {
+            for (int j = 0; j < N; j++)
+                row[j] = 0.5f * row[j] * (1.0f + erff(row[j] * 0.7071067811865f));
+        } else if (act == RAC_ACT_SILU) {
+            for (int j = 0; j < N; j++)
+                row[j] = row[j] / (1.0f + expf(-row[j]));
+        }
+    }
+}
+
+/*
+ * bench_fused_linear: the bench's single dispatch point for
+ *   output[M, N] = act(input[M, K] @ weight[N, K]^T + bias)
+ *
+ * weight_nk:  [N, K] row-major (the HF / llama / Q8 layout). Used for
+ *             the M=1 GEMV decode path — bench_gemv walks this layout
+ *             natively with no copy.
+ *
+ * weight_kn:  [K, N] row-major — pre-transposed weight produced once
+ *             at load. rac_hal_sgemm's AVX2 micro-kernel consumes
+ *             [K, N] directly, so passing this here avoids a
+ *             full [N,K]->[K,N] malloc+memcpy on every call. At
+ *             TinyLlama prefill that transpose was ~4 GB/batch of
+ *             wasted memory traffic and dominated wall clock.
+ *
+ * If weight_kn is NULL, we fall back to rac_hal_fused_linear (which
+ * does the transpose internally) — the synthetic-weights path doesn't
+ * pre-transpose.
+ */
 static inline void bench_fused_linear(
-    const float *input, const float *weight, const float *bias,
+    const float *input,
+    const float *weight_nk,       /* [N, K] — original layout */
+    const float *weight_kn,       /* [K, N] — pre-transposed, may be NULL */
+    const float *bias,
     float *output, int M, int N, int K, rac_activation act)
 {
     if (M == 1) {
-        bench_gemv(input, weight, bias, output, N, K, act);
+        bench_gemv(input, weight_nk, bias, output, N, K, act);
+        return;
+    }
+    if (weight_kn) {
+        /* Fast path: no per-call transpose. input[M,K] @ weight_kn[K,N]
+         * direct into output[M,N] via the tuned AVX2/Zen3 micro-kernel. */
+        rac_hal_sgemm(input, weight_kn, output, M, N, K, 1.0f, 0.0f);
+        bench_bias_act(output, bias, M, N, act);
     } else {
-        rac_hal_fused_linear(input, weight, bias, output, M, N, K, act);
+        /* Slow path: lets rac_hal_fused_linear do its own transpose.
+         * Still correct, just pays the transpose tax. */
+        rac_hal_fused_linear(input, weight_nk, bias, output, M, N, K, act);
     }
 }
 
@@ -299,7 +400,9 @@ static inline void bench_fused_linear(
  * Otherwise falls through to the f32 path.
  */
 static inline void bench_fused_linear_q8(
-    const float *input, const float *weight_f32,
+    const float *input,
+    const float *weight_nk,
+    const float *weight_kn,
     const rac_q8_0_block *weight_q8,
     const float *bias,
     float *output, int M, int N, int K, rac_activation act)
@@ -308,7 +411,7 @@ static inline void bench_fused_linear_q8(
         rac_q8_0_gemv(input, weight_q8, bias, output, N, K, act);
         return;
     }
-    bench_fused_linear(input, weight_f32, bias, output, M, N, K, act);
+    bench_fused_linear(input, weight_nk, weight_kn, bias, output, M, N, K, act);
 }
 
 /* ── Transformer primitives ────────────────────────────────────────────── */
@@ -404,9 +507,9 @@ static void decoder_forward(float *x, const tx_weights *w, tx_bufs *b,
 
     /* Attention block */
     rmsnorm(x, w->rms_att, b->norm, T, d);
-    bench_fused_linear(b->norm, w->W_q, NULL, b->Q, T, d, d, RAC_ACT_NONE);
-    bench_fused_linear(b->norm, w->W_k, NULL, b->K, T, nkv*dh, d, RAC_ACT_NONE);
-    bench_fused_linear(b->norm, w->W_v, NULL, b->V, T, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear(b->norm, w->W_q, w->W_q_kn, NULL, b->Q, T, d, d, RAC_ACT_NONE);
+    bench_fused_linear(b->norm, w->W_k, w->W_k_kn, NULL, b->K, T, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear(b->norm, w->W_v, w->W_v_kn, NULL, b->V, T, nkv*dh, d, RAC_ACT_NONE);
 
     /* Parallel across query heads. Each thread owns a head and gets a
      * private slab of qc/kc/vc/oc/scratch so there's no aliasing. This
@@ -435,19 +538,17 @@ static void decoder_forward(float *x, const tx_weights *w, tx_bufs *b,
         }
     }
 
-    bench_fused_linear(b->att_out, w->W_o, NULL, b->norm, T, d, d, RAC_ACT_NONE);
+    bench_fused_linear(b->att_out, w->W_o, w->W_o_kn, NULL, b->norm, T, d, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T * d; i++) x[i] += b->norm[i];
 
-    /* FFN block (SwiGLU). Gate/up projection uses the AVX2 fused kernel
-     * with RAC_ACT_SILU baked in; the elementwise gate*up and final
-     * residual add are SIMD-reduced. */
+    /* FFN block (SwiGLU). */
     rmsnorm(x, w->rms_ffn, b->ffn_in, T, d);
-    bench_fused_linear(b->ffn_in, w->W_g, NULL, b->ffn_g, T, c->d_ff, d, RAC_ACT_SILU);
-    bench_fused_linear(b->ffn_in, w->W_u, NULL, b->ffn_u, T, c->d_ff, d, RAC_ACT_NONE);
+    bench_fused_linear(b->ffn_in, w->W_g, w->W_g_kn, NULL, b->ffn_g, T, c->d_ff, d, RAC_ACT_SILU);
+    bench_fused_linear(b->ffn_in, w->W_u, w->W_u_kn, NULL, b->ffn_u, T, c->d_ff, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T * c->d_ff; i++) b->ffn_g[i] *= b->ffn_u[i];
-    bench_fused_linear(b->ffn_g, w->W_d, NULL, b->norm, T, d, c->d_ff, RAC_ACT_NONE);
+    bench_fused_linear(b->ffn_g, w->W_d, w->W_d_kn, NULL, b->norm, T, d, c->d_ff, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T * d; i++) x[i] += b->norm[i];
 }
@@ -564,13 +665,13 @@ static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
     int total = start + T_new;
 
     rmsnorm(x, w->rms_att, b->norm, T_new, d);
-    bench_fused_linear_q8(b->norm, w->W_q, w->Wq_q8, NULL, b->Q, T_new, d, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_q, w->W_q_kn, w->Wq_q8, NULL, b->Q, T_new, d, d, RAC_ACT_NONE);
 
     /* Write K/V directly into the cache at the new slots. */
     float *K_slot = kv->K[layer_idx] + (size_t)start * nkv * dh;
     float *V_slot = kv->V[layer_idx] + (size_t)start * nkv * dh;
-    bench_fused_linear_q8(b->norm, w->W_k, w->Wk_q8, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
-    bench_fused_linear_q8(b->norm, w->W_v, w->Wv_q8, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_k, w->W_k_kn, w->Wk_q8, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_v, w->W_v_kn, w->Wv_q8, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
 
     /* Parallel across query heads. Per-head slabs of qc/oc/scratch so
      * the 32-head loop saturates cores without aliasing. scratch stride
@@ -599,17 +700,17 @@ static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
         }
     }
 
-    bench_fused_linear_q8(b->att_out, w->W_o, w->Wo_q8, NULL, b->norm, T_new, d, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->att_out, w->W_o, w->W_o_kn, w->Wo_q8, NULL, b->norm, T_new, d, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
 
     /* FFN (SwiGLU) — HAL-dispatched fused kernels, SIMD elementwise. */
     rmsnorm(x, w->rms_ffn, b->ffn_in, T_new, d);
-    bench_fused_linear_q8(b->ffn_in, w->W_g, w->Wg_q8, NULL, b->ffn_g, T_new, c->d_ff, d, RAC_ACT_SILU);
-    bench_fused_linear_q8(b->ffn_in, w->W_u, w->Wu_q8, NULL, b->ffn_u, T_new, c->d_ff, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->ffn_in, w->W_g, w->W_g_kn, w->Wg_q8, NULL, b->ffn_g, T_new, c->d_ff, d, RAC_ACT_SILU);
+    bench_fused_linear_q8(b->ffn_in, w->W_u, w->W_u_kn, w->Wu_q8, NULL, b->ffn_u, T_new, c->d_ff, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * c->d_ff; i++) b->ffn_g[i] *= b->ffn_u[i];
-    bench_fused_linear_q8(b->ffn_g, w->W_d, w->Wd_q8, NULL, b->norm, T_new, d, c->d_ff, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->ffn_g, w->W_d, w->W_d_kn, w->Wd_q8, NULL, b->norm, T_new, d, c->d_ff, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
 }
@@ -766,6 +867,16 @@ static int run_full_model(tx_cfg *c) {
     } else {
         init_weights_synthetic_full(layers, c);
     }
+
+    /* Pre-transpose every weight matrix once. This is what unblocks the
+     * prefill path — rac_hal_sgemm wants [K, N] natively, and otherwise
+     * rac_fused_linear_avx2 would malloc + transpose on every call
+     * (~4 GB/batch at TinyLlama shape, dominating wall clock). */
+    printf("  pre-transposing linear weights to [K,N] layout for prefill ...\n");
+    double tt0 = now_sec();
+    for (int L = 0; L < c->n_layers; L++) weights_pretranspose(&layers[L], c);
+    printf("  pre-transpose complete (%.2fs, skips per-call transpose on every decoder linear)\n",
+           now_sec() - tt0);
 
     /* Optional Q8_0 shadow-quantize of all linear layer weights. One-time
      * pass (a few seconds for TinyLlama on 32 threads). Adds ~0.25x memory
