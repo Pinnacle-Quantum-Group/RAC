@@ -162,12 +162,13 @@ _bench_pip_install() {
 
 if [[ "$AUTO_INSTALL" -eq 1 ]]; then
   _bench_pip_install huggingface_hub
-  # For the F32-GGUF conversion path in run_llama_cpp.sh we need
-  # convert_hf_to_gguf.py's deps (safetensors + sentencepiece + numpy).
-  # torch is intentionally NOT installed here — the conversion script
-  # only needs it if the checkpoint is a pytorch_model.bin (ours is
-  # safetensors, so numpy+safetensors is enough).
-  _bench_pip_install safetensors sentencepiece numpy
+  # For the F32-GGUF conversion path in run_llama_cpp.sh we need the
+  # full convert_hf_to_gguf.py dependency set: transformers (for
+  # AutoConfig), safetensors, sentencepiece, numpy, torch. torch is
+  # heavy but convert_hf_to_gguf imports it unconditionally for
+  # tensor ops during conversion. On the bench venv this is a one-
+  # time pip cost.
+  _bench_pip_install transformers safetensors sentencepiece numpy torch
   # If the venv exists, front-load it so subsequent python3 calls pick it up.
   if [[ -x "$BENCH_VENV/bin/python3" ]]; then
     export PATH="$BENCH_VENV/bin:$PATH"

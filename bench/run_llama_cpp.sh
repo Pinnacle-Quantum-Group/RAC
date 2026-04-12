@@ -148,7 +148,18 @@ get_f32_gguf() {
 
 echo "  fetching GGUF: ${GGUF_REPO}/${GGUF_FILE} (precision=$PRECISION) ..." >&2
 if [[ "$PRECISION" == "f32" || "$PRECISION" == "F32" || "$PRECISION" == "fp32" ]]; then
-  GGUF_PATH=$(get_f32_gguf) || exit 4
+  GGUF_PATH=$(get_f32_gguf)
+  if [[ -z "$GGUF_PATH" || ! -s "$GGUF_PATH" ]]; then
+    echo "  [WARN] F32 GGUF conversion failed — falling back to Q8_0 for" >&2
+    echo "         the comparison. Install 'transformers' + 'torch' in" >&2
+    echo "         the bench venv to enable F32 apples-to-apples:" >&2
+    echo "         ~/.cache/rac_bench/venv/bin/pip install transformers torch" >&2
+    PRECISION="q8_0"
+    GGUF_FILE="$GGUF_FILE_Q8_0"
+    QUANT="Q8_0"
+    GGUF_PATH=$(python3 "${HERE}/fetch_model.py" \
+                  --model "${GGUF_REPO}" --file "${GGUF_FILE}")
+  fi
 else
   GGUF_PATH=$(python3 "${HERE}/fetch_model.py" \
                 --model "${GGUF_REPO}" --file "${GGUF_FILE}")
