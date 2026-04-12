@@ -32,6 +32,7 @@
 #include "rac_cpu.h"
 #include "rac_hal.h"          /* HAL auto-dispatches to rac_sgemm_avx2 / */
                                /* rac_fused_linear_avx2 / asm micro-kernels */
+#include "rac_q8_0.h"         /* Q8_0 block format + AVX2 GEMV */
 #include "safetensors_reader.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,7 @@ typedef struct {
     int decode_iters;
     int layer_idx;       /* which layer to load from safetensors (single-layer mode) */
     int full_model;      /* 0 = single-layer bench, 1 = whole stack + KV cache */
+    int quant_q8_0;      /* if set, quantize weights to Q8_0 after load (decode path) */
     const char *safetensors_path;
     const char *config_name;
 } tx_cfg;
@@ -86,6 +88,14 @@ typedef struct {
     float *W_q, *W_k, *W_v, *W_o;
     float *W_g, *W_u, *W_d;
     float *rms_att, *rms_ffn;
+
+    /* Optional Q8_0 shadow copies of the linear-layer weights. NULL when
+     * --q8_0 is not set. Each pointer is a flat array of rac_q8_0_block
+     * structs in the same [N, K/32] row-major layout as the f32 matrix.
+     * Used only on the M==1 GEMV path (decode). Prefill still uses f32
+     * weights through the AVX2 micro-kernel. */
+    rac_q8_0_block *Wq_q8, *Wk_q8, *Wv_q8, *Wo_q8;
+    rac_q8_0_block *Wg_q8, *Wu_q8, *Wd_q8;
 } tx_weights;
 
 static float *xalloc(size_t n) {
@@ -190,6 +200,39 @@ static void free_weights(tx_weights *w) {
     free(w->W_q); free(w->W_k); free(w->W_v); free(w->W_o);
     free(w->W_g); free(w->W_u); free(w->W_d);
     free(w->rms_att); free(w->rms_ffn);
+    free(w->Wq_q8); free(w->Wk_q8); free(w->Wv_q8); free(w->Wo_q8);
+    free(w->Wg_q8); free(w->Wu_q8); free(w->Wd_q8);
+}
+
+/*
+ * Produce Q8_0 shadow copies of each linear-layer weight matrix. Called
+ * once per layer after f32 load when --q8_0 is requested. Memory cost
+ * is ~0.25x the f32 arrays.
+ */
+static rac_q8_0_block *q8_alloc_and_quantize(const float *src, int N, int K) {
+    size_t blocks = rac_q8_0_blocks((size_t)N * K);
+    rac_q8_0_block *dst = NULL;
+    /* posix_memalign for 64-byte alignment — matches xalloc() elsewhere.
+     * The AVX2 kernel uses _mm_loadu / _mm256_loadu (unaligned) but
+     * aligned data is still faster on Zen / Skylake. */
+    if (posix_memalign((void **)&dst, 64, blocks * sizeof(rac_q8_0_block)) != 0 || !dst) {
+        fprintf(stderr, "q8_0 alloc failed (%zu blocks)\n", blocks);
+        exit(1);
+    }
+    rac_q8_0_quantize_matrix(src, dst, N, K);
+    return dst;
+}
+
+static void weights_quantize_q8_0(tx_weights *w, const tx_cfg *c) {
+    int d  = c->d_model;
+    int dk = c->n_kv_heads * c->d_head;
+    w->Wq_q8 = q8_alloc_and_quantize(w->W_q, d,          d);
+    w->Wk_q8 = q8_alloc_and_quantize(w->W_k, dk,         d);
+    w->Wv_q8 = q8_alloc_and_quantize(w->W_v, dk,         d);
+    w->Wo_q8 = q8_alloc_and_quantize(w->W_o, d,          d);
+    w->Wg_q8 = q8_alloc_and_quantize(w->W_g, c->d_ff,    d);
+    w->Wu_q8 = q8_alloc_and_quantize(w->W_u, c->d_ff,    d);
+    w->Wd_q8 = q8_alloc_and_quantize(w->W_d, d,          c->d_ff);
 }
 
 /*
@@ -247,6 +290,25 @@ static inline void bench_fused_linear(
     } else {
         rac_hal_fused_linear(input, weight, bias, output, M, N, K, act);
     }
+}
+
+/*
+ * Q8_0-aware variant. When weight_q8 is non-NULL and M==1, we take the
+ * dedicated Q8_0 GEMV path (4x less weight bandwidth than f32 — this is
+ * where the pitch meets llama.cpp's Q8_0 decode numbers head-on).
+ * Otherwise falls through to the f32 path.
+ */
+static inline void bench_fused_linear_q8(
+    const float *input, const float *weight_f32,
+    const rac_q8_0_block *weight_q8,
+    const float *bias,
+    float *output, int M, int N, int K, rac_activation act)
+{
+    if (M == 1 && weight_q8 != NULL) {
+        rac_q8_0_gemv(input, weight_q8, bias, output, N, K, act);
+        return;
+    }
+    bench_fused_linear(input, weight_f32, bias, output, M, N, K, act);
 }
 
 /* ── Transformer primitives ────────────────────────────────────────────── */
@@ -495,13 +557,13 @@ static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
     int total = start + T_new;
 
     rmsnorm(x, w->rms_att, b->norm, T_new, d);
-    bench_fused_linear(b->norm, w->W_q, NULL, b->Q, T_new, d, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_q, w->Wq_q8, NULL, b->Q, T_new, d, d, RAC_ACT_NONE);
 
     /* Write K/V directly into the cache at the new slots. */
     float *K_slot = kv->K[layer_idx] + (size_t)start * nkv * dh;
     float *V_slot = kv->V[layer_idx] + (size_t)start * nkv * dh;
-    bench_fused_linear(b->norm, w->W_k, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
-    bench_fused_linear(b->norm, w->W_v, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_k, w->Wk_q8, NULL, K_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->norm, w->W_v, w->Wv_q8, NULL, V_slot, T_new, nkv*dh, d, RAC_ACT_NONE);
 
     /* Per query head attention over the full cache. */
     for (int h = 0; h < nq; h++) {
@@ -522,17 +584,17 @@ static void decoder_forward_kv(float *x, const tx_weights *w, tx_bufs *b,
         }
     }
 
-    bench_fused_linear(b->att_out, w->W_o, NULL, b->norm, T_new, d, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->att_out, w->W_o, w->Wo_q8, NULL, b->norm, T_new, d, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
 
     /* FFN (SwiGLU) — HAL-dispatched fused kernels, SIMD elementwise. */
     rmsnorm(x, w->rms_ffn, b->ffn_in, T_new, d);
-    bench_fused_linear(b->ffn_in, w->W_g, NULL, b->ffn_g, T_new, c->d_ff, d, RAC_ACT_SILU);
-    bench_fused_linear(b->ffn_in, w->W_u, NULL, b->ffn_u, T_new, c->d_ff, d, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->ffn_in, w->W_g, w->Wg_q8, NULL, b->ffn_g, T_new, c->d_ff, d, RAC_ACT_SILU);
+    bench_fused_linear_q8(b->ffn_in, w->W_u, w->Wu_q8, NULL, b->ffn_u, T_new, c->d_ff, d, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * c->d_ff; i++) b->ffn_g[i] *= b->ffn_u[i];
-    bench_fused_linear(b->ffn_g, w->W_d, NULL, b->norm, T_new, d, c->d_ff, RAC_ACT_NONE);
+    bench_fused_linear_q8(b->ffn_g, w->W_d, w->Wd_q8, NULL, b->norm, T_new, d, c->d_ff, RAC_ACT_NONE);
     #pragma omp parallel for simd schedule(static)
     for (size_t i = 0; i < (size_t)T_new * d; i++) x[i] += b->norm[i];
 }
@@ -648,6 +710,10 @@ static void usage(const char *argv0) {
         "  --layer N                    which layer to load (single-layer mode)\n"
         "  --full-model                 run ALL decoder layers + KV cache\n"
         "                                 (apples-to-apples with llama-bench)\n"
+        "  --q8_0                       quantize linear weights to Q8_0 after\n"
+        "                                 load (block=32 int8 + fp16 scale,\n"
+        "                                 matches llama.cpp). Decode GEMV uses\n"
+        "                                 4x less weight bandwidth.\n"
         "  --prefill N                  prefill T tokens (default: 128)\n"
         "  --prefill-iters N            # prefill passes (default: 30)\n"
         "  --decode-iters N             # decode passes (default: 100)\n"
@@ -679,6 +745,20 @@ static int run_full_model(tx_cfg *c) {
         }
     } else {
         init_weights_synthetic_full(layers, c);
+    }
+
+    /* Optional Q8_0 shadow-quantize of all linear layer weights. One-time
+     * pass (a few seconds for TinyLlama on 32 threads). Adds ~0.25x memory
+     * overhead on top of f32 weights. Decode GEMVs then use the Q8_0
+     * variant; prefill still uses the f32 AVX2 micro-kernel. */
+    if (c->quant_q8_0) {
+        printf("  quantizing weights to Q8_0 (decode path) ...\n");
+        double q_t0 = now_sec();
+        for (int L = 0; L < c->n_layers; L++) {
+            weights_quantize_q8_0(&layers[L], c);
+        }
+        printf("  Q8_0 quantization complete (%.2fs, 4x weight bandwidth reduction on decode)\n",
+               now_sec() - q_t0);
     }
 
     int T_prompt = c->prefill_T;
@@ -741,8 +821,8 @@ static int run_full_model(tx_cfg *c) {
     double gflops_pre = flops_per_tok * T_prompt * c->prefill_iters / s_pre / 1e9;
     double gflops_dec = flops_per_tok * c->decode_iters / s_dec / 1e9;
 
-    printf("\n── RAC results (full-model, %d layers, KV cache) ──────────\n",
-           c->n_layers);
+    printf("\n── RAC results (full-model, %d layers, KV cache, %s decode) ──────────\n",
+           c->n_layers, c->quant_q8_0 ? "Q8_0" : "F32");
     printf("  prefill T=%d:   %7.2f ms/token   %8.2f tok/s   %7.1f GFLOPS\n",
            T_prompt, ms_pre / T_prompt, tps_pre, gflops_pre);
     printf("  decode  T=1:    %7.2f ms/token   %8.2f tok/s   %7.1f GFLOPS\n",
@@ -774,6 +854,7 @@ int main(int argc, char **argv) {
             cfg_apply_preset(&c, "tinyllama");
         }
         else if (!strcmp(argv[i], "--full-model"))                 c.full_model    = 1;
+        else if (!strcmp(argv[i], "--q8_0") || !strcmp(argv[i], "--q8")) c.quant_q8_0  = 1;
         else if (!strcmp(argv[i], "--layer") && i+1 < argc)        c.layer_idx     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefill") && i+1 < argc)      c.prefill_T     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefill-iters") && i+1 < argc)c.prefill_iters = atoi(argv[++i]);
@@ -789,8 +870,9 @@ int main(int argc, char **argv) {
     rac_hal_init();
     rac_hal_print_profile();
 
-    printf("RAC %stransformer inference bench\n",
-           c.full_model ? "FULL-MODEL " : "single-layer ");
+    printf("RAC %stransformer inference bench%s\n",
+           c.full_model ? "FULL-MODEL " : "single-layer ",
+           c.quant_q8_0 ? " [Q8_0 decode]" : "");
     printf("  config=%s  d_model=%d  n_heads=%d  n_kv_heads=%d  d_head=%d  d_ff=%d"
            "  n_layers=%d\n  prefill_T=%d  prefill_iters=%d  decode_iters=%d\n",
            c.config_name, c.d_model, c.n_heads, c.n_kv_heads, c.d_head, c.d_ff,

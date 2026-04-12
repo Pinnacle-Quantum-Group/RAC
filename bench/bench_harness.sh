@@ -162,6 +162,12 @@ _bench_pip_install() {
 
 if [[ "$AUTO_INSTALL" -eq 1 ]]; then
   _bench_pip_install huggingface_hub
+  # For the F32-GGUF conversion path in run_llama_cpp.sh we need
+  # convert_hf_to_gguf.py's deps (safetensors + sentencepiece + numpy).
+  # torch is intentionally NOT installed here — the conversion script
+  # only needs it if the checkpoint is a pytorch_model.bin (ours is
+  # safetensors, so numpy+safetensors is enough).
+  _bench_pip_install safetensors sentencepiece numpy
   # If the venv exists, front-load it so subsequent python3 calls pick it up.
   if [[ -x "$BENCH_VENV/bin/python3" ]]; then
     export PATH="$BENCH_VENV/bin:$PATH"
@@ -203,12 +209,17 @@ run_rac() {
   fi
   : "${OMP_NUM_THREADS:=$(nproc 2>/dev/null || echo 1)}"
   export OMP_NUM_THREADS
-  echo "  [info] OMP_NUM_THREADS=$OMP_NUM_THREADS  mode=full-model" >&2
+  local quant_flag="" quant_name="F32"
+  if [[ "${RAC_BENCH_QUANT:-}" == "q8_0" || "${RAC_BENCH_QUANT:-}" == "Q8_0" ]]; then
+    quant_flag="--q8_0"
+    quant_name="Q8_0"
+  fi
+  echo "  [info] OMP_NUM_THREADS=$OMP_NUM_THREADS  mode=full-model  quant=$quant_name" >&2
 
   # Run the FULL-MODEL bench (all 22 layers + KV cache). This gives numbers
   # directly comparable to llama-bench's full-model tok/s — no n_layers
   # multiplication anywhere. --layer is ignored in full-model mode.
-  OUT=$("$RAC_BIN" --safetensors "$SAFET" --full-model \
+  OUT=$("$RAC_BIN" --safetensors "$SAFET" --full-model $quant_flag \
                    --prefill-iters 5 --decode-iters 50 2>/dev/null)
   echo "$OUT" >&2
 
@@ -222,12 +233,18 @@ run_rac() {
   dec_ms=$(echo "$OUT"  | awk '/decode  T=1:/{print $(NF-5)}' | head -1)
   dec_tps=$(echo "$OUT" | awk '/decode  T=1:/{print $(NF-3)}' | head -1)
   dec_gf=$(echo "$OUT"  | awk '/decode  T=1:/{print $(NF-1)}' | head -1)
+  # "quant" here describes the DECODE path. Prefill is always F32 — Q8_0
+  # only substitutes for the linear-layer GEMV during decode, where the
+  # memory bandwidth advantage matters most.
+  local quant_label="F32"
+  [[ "$quant_flag" == "--q8_0" ]] && quant_label="F32 (prefill) / Q8_0 (decode)"
   RAC_JSON=$(cat <<JSON
 {"framework": "RAC",
  "model": "$MODEL_ID",
- "quant": "F32",
+ "quant": "$quant_label",
  "scope": "full_model",
  "n_layers": 22,
+ "threads": $OMP_NUM_THREADS,
  "prefill_ms_per_token": ${pre_ms:-0},
  "prefill_tok_s_model":  ${pre_tps:-0},
  "prefill_gflops":       ${pre_gf:-0},
