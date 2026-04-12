@@ -57,9 +57,28 @@ def safe_bench(name, fn, iters, device):
         return None
 
 
+def _device_is_healthy(dev: str) -> bool:
+    if dev == "cpu":
+        return True
+    try:
+        a = torch.randn(4, 4, device=dev)
+        b = torch.matmul(a, a)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        _ = b.sum().item()
+        return True
+    except Exception as e:
+        print(f"[WARN] {dev} device probe failed: {type(e).__name__}: "
+              f"{str(e).splitlines()[0][:100]}")
+        return False
+
+
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if not _device_is_healthy(device):
+        print(f"[WARN] falling back to CPU")
+        device = "cpu"
     print(f"Device: {device}    iters/bench: {args.iters}")
     print("=" * 66)
 
