@@ -207,9 +207,18 @@ float    rac_alu_tanh(float x);
  * the host CPU supports AVX2+FMA at runtime.
  */
 int      rac_alu_has_avx2(void);
+int      rac_alu_omp_threads(void);   /* 1 if OpenMP not enabled */
 void     rac_alu_rotate_batch(const rac_vec2 *v, const float *theta,
                               rac_vec2 *out, int n);
 float    rac_alu_inner_batch(const rac_vec2 *a, const rac_vec2 *b, int n);
+void     rac_alu_outer_batch(const rac_vec2 *a, const rac_vec2 *b,
+                             float *C, int m, int n);
+
+/* SoA batch rotate — skips the AoS→SoA transpose. Preferred for callers
+ * that can keep x and y in separate aligned arrays. */
+void     rac_alu_rotate_batch_soa(const float *vx, const float *vy,
+                                  const float *theta,
+                                  float *out_x, float *out_y, int n);
 
 /* ── Inspection / introspection ──────────────────────────────────────────── */
 

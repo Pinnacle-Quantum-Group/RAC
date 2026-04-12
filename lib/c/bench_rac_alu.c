@@ -26,6 +26,17 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* 64-byte aligned malloc wrapper (posix_memalign is always available on
+ * POSIX + MinGW; avoids the C11-only aligned_alloc warning under -std=c99). */
+static void *bench_alloc(size_t bytes) {
+    void *p = NULL;
+    if (posix_memalign(&p, 64, bytes) != 0) return NULL;
+    return p;
+}
 
 /* ── Timing helpers ──────────────────────────────────────────────────────── */
 
@@ -189,8 +200,8 @@ int main(int argc, char **argv) {
     /* ── 5. Inner product — projection accumulator ─────────────────── */
     banner("5. Inner product — projection accumulator under load");
     {
-        rac_vec2 *a = aligned_alloc(64, N_INNER_VEC * sizeof(rac_vec2));
-        rac_vec2 *b = aligned_alloc(64, N_INNER_VEC * sizeof(rac_vec2));
+        rac_vec2 *a = bench_alloc(N_INNER_VEC * sizeof(rac_vec2));
+        rac_vec2 *b = bench_alloc(N_INNER_VEC * sizeof(rac_vec2));
         if (!a || !b) { fprintf(stderr, "alloc failed\n"); return 1; }
         for (int i = 0; i < N_INNER_VEC; i++) {
             a[i].x = (float)((i % 31) - 15) * 0.1f;
@@ -260,9 +271,9 @@ int main(int argc, char **argv) {
     {
         const int N = 1 << 16;
         const int REPS = 200;
-        rac_vec2 *v     = aligned_alloc(64, N * sizeof(rac_vec2));
-        float    *theta = aligned_alloc(64, N * sizeof(float));
-        rac_vec2 *out   = aligned_alloc(64, N * sizeof(rac_vec2));
+        rac_vec2 *v     = bench_alloc(N * sizeof(rac_vec2));
+        float    *theta = bench_alloc(N * sizeof(float));
+        rac_vec2 *out   = bench_alloc(N * sizeof(rac_vec2));
         if (!v || !theta || !out) { fprintf(stderr, "alloc failed\n"); return 1; }
         for (int i = 0; i < N; i++) {
             v[i].x = 1.0f;  v[i].y = 0.0f;
@@ -303,8 +314,8 @@ int main(int argc, char **argv) {
     {
         const int N = 1 << 12;
         const int REPS = 2000;
-        rac_vec2 *a = aligned_alloc(64, N * sizeof(rac_vec2));
-        rac_vec2 *b = aligned_alloc(64, N * sizeof(rac_vec2));
+        rac_vec2 *a = bench_alloc(N * sizeof(rac_vec2));
+        rac_vec2 *b = bench_alloc(N * sizeof(rac_vec2));
         if (!a || !b) { fprintf(stderr, "alloc failed\n"); return 1; }
         for (int i = 0; i < N; i++) {
             a[i].x = (float)((i % 31) - 15) * 0.1f;
@@ -326,6 +337,112 @@ int main(int argc, char **argv) {
         long total = (long)N * (long)REPS;
         report_pair("inner_batch (per element)",
                     s_scalar, total, s_batch, total);
+
+        free(a); free(b);
+    }
+
+    /* ── 10. SoA rotate batch (skip AoS transpose) ─────────────────── */
+    banner("10. SoA rotate batch — AoS transpose skipped");
+    {
+        const int N = 1 << 16;
+        const int REPS = 200;
+        float *vx    = bench_alloc(N * sizeof(float));
+        float *vy    = bench_alloc(N * sizeof(float));
+        float *theta = bench_alloc(N * sizeof(float));
+        float *ox    = bench_alloc(N * sizeof(float));
+        float *oy    = bench_alloc(N * sizeof(float));
+        for (int i = 0; i < N; i++) {
+            vx[i] = 1.0f; vy[i] = 0.0f;
+            theta[i] = (float)(i & 127) * 0.01f;
+        }
+
+        double t0 = now_sec();
+        float acc = 0.0f;
+        for (int r = 0; r < REPS; r++) {
+            rac_alu_rotate_batch_soa(vx, vy, theta, ox, oy, N);
+            acc += ox[0] + oy[N-1];
+        }
+        double dt = now_sec() - t0; SINK(acc);
+        long total = (long)N * (long)REPS;
+        report("rotate_batch_soa (per element)", dt, total);
+
+        free(vx); free(vy); free(theta); free(ox); free(oy);
+    }
+
+    /* ── 11. outer_batch — AVX2 + OMP + two-phase polar cache ──────── */
+    banner("11. Outer product batch — two-phase + OMP");
+    {
+        const int M = 512, N = 512;
+        const int REPS = 100;
+        rac_vec2 *a = bench_alloc(M * sizeof(rac_vec2));
+        rac_vec2 *b = bench_alloc(N * sizeof(rac_vec2));
+        float *C    = bench_alloc((size_t)M * N * sizeof(float));
+        for (int i = 0; i < M; i++) {
+            a[i].x = (float)((i % 31) - 15) * 0.1f;
+            a[i].y = (float)((i % 17) - 8)  * 0.1f;
+        }
+        for (int j = 0; j < N; j++) {
+            b[j].x = (float)((j % 23) - 11) * 0.1f;
+            b[j].y = (float)((j % 13) - 6)  * 0.1f;
+        }
+
+        double t0 = now_sec();
+        for (int r = 0; r < REPS; r++) rac_alu_outer(a, b, C, M, N);
+        double s_scalar = now_sec() - t0; SINK(C[0]);
+
+        t0 = now_sec();
+        for (int r = 0; r < REPS; r++) rac_alu_outer_batch(a, b, C, M, N);
+        double s_batch = now_sec() - t0; SINK(C[0]);
+
+        long total = (long)M * (long)N * (long)REPS;
+        report_pair("outer (per element)",
+                    s_scalar, total, s_batch, total);
+
+        free(a); free(b); free(C);
+    }
+
+    /* ── 12. OpenMP thread scaling on inner_batch ──────────────────── */
+    banner("12. OpenMP thread scaling — inner_batch");
+    {
+        const int N = 1 << 18;
+        const int REPS = 200;
+        rac_vec2 *a = bench_alloc(N * sizeof(rac_vec2));
+        rac_vec2 *b = bench_alloc(N * sizeof(rac_vec2));
+        for (int i = 0; i < N; i++) {
+            a[i].x = (float)((i % 31) - 15) * 0.1f;
+            a[i].y = (float)((i % 17) - 8)  * 0.1f;
+            b[i].x = (float)((i % 23) - 11) * 0.1f;
+            b[i].y = (float)((i % 13) - 6)  * 0.1f;
+        }
+
+        printf("  max OMP threads: %d\n", rac_alu_omp_threads());
+
+#ifdef _OPENMP
+        const int tcs[] = {1, 2, 4, 8, 16};
+        const int ntcs  = (int)(sizeof(tcs)/sizeof(tcs[0]));
+        /* Cache max threads once — omp_set_num_threads() changes what
+         * omp_get_max_threads() returns, so sampling it in the loop
+         * collapses to 1 after the first iteration. */
+        const int max_threads = rac_alu_omp_threads();
+        for (int k = 0; k < ntcs; k++) {
+            int t = tcs[k];
+            if (t > max_threads) continue;
+            omp_set_num_threads(t);
+            double t0 = now_sec();
+            float acc = 0.0f;
+            for (int r = 0; r < REPS; r++) acc += rac_alu_inner_batch(a, b, N);
+            double dt = now_sec() - t0; SINK(acc);
+            long total = (long)N * (long)REPS;
+            double ns  = dt * 1e9 / (double)total;
+            double mps = (double)total / dt / 1e6;
+            printf("  %-24s t=%2d  %9.2f ns/op   %9.2f Mops/s   (%.3f s)\n",
+                   "inner_batch", t, ns, mps, dt);
+            fflush(stdout);
+        }
+        omp_set_num_threads(max_threads);
+#else
+        printf("  (OpenMP not enabled at build time)\n");
+#endif
 
         free(a); free(b);
     }
