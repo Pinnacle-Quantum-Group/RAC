@@ -195,30 +195,57 @@ static void free_weights(tx_weights *w) {
 /*
  * Bench-side wrapper picking the right fused_linear variant per shape.
  *
- *   rac_hal_fused_linear -> rac_fused_linear_avx2 does a full [N,K] -> [K,N]
- *   transpose of the weight matrix on EVERY call (malloc + O(N*K) copy).
- *   For TinyLlama's FFN that's a 46 MB allocation + copy per call — at
- *   decode-time (M=1) it dominates wall clock by 10-20x over the actual
- *   matmul.
+ *   M >= 2 (prefill):  rac_hal_fused_linear -> rac_fused_linear_avx2
+ *     uses the tuned Zen3/AVX512 micro-kernel. Parallelizes over M via
+ *     MR=8 tiles, transpose cost amortized across the tile rows.
  *
- *   For M == 1 (decode GEMV) we fall back to the scalar + OMP
- *   rac_fused_linear which reads weight in the natural [N, K] layout. GCC
- *   auto-vectorizes the inner loop under -march=native, so we still get
- *   AVX2 FMAs, just without the per-call transpose. ~20x faster on
- *   decode for TinyLlama.
- *
- *   For M >= 2 the transpose is amortized across MR=8 rows in the AVX2
- *   micro-kernel and the HAL path wins by 2-8x.
+ *   M == 1 (decode GEMV): do NOT fall through to rac_fused_linear —
+ *     that kernel parallelizes across M, so at M=1 only a single thread
+ *     does work while the others idle (one-core-at-100% symptom). And
+ *     do NOT route to rac_hal_fused_linear — it transposes the [N,K]
+ *     weight into a fresh malloc every call (46 MB for TinyLlama FFN).
+ *     Instead use an in-bench parallel-N GEMV: each thread computes a
+ *     contiguous chunk of output rows via a vectorized dot product.
+ *     All cores busy, no transpose, no malloc.
  */
+static inline float _bench_apply_act(float s, rac_activation act) {
+    switch (act) {
+        case RAC_ACT_RELU: return s > 0.0f ? s : 0.0f;
+        case RAC_ACT_GELU: return 0.5f * s * (1.0f + erff(s * 0.7071067811865f));
+        case RAC_ACT_SILU: return s / (1.0f + expf(-s));
+        default:           return s;
+    }
+}
+
+static inline void bench_gemv(
+    const float *input,       /* [K] */
+    const float *weight,      /* [N, K] row-major */
+    const float *bias,        /* [N] or NULL */
+    float *output,            /* [N] */
+    int N, int K, rac_activation act)
+{
+    /* Parallel across N. Each thread gets ~N/nproc rows. Inner loop is
+     * a K-element dot product, auto-vectorized to AVX2/AVX-512 FMA
+     * under -march=native. No transpose. */
+    #pragma omp parallel for schedule(static)
+    for (int j = 0; j < N; j++) {
+        const float *w_row = weight + (size_t)j * K;
+        float s = 0.0f;
+        #pragma omp simd reduction(+:s)
+        for (int k = 0; k < K; k++) s += input[k] * w_row[k];
+        if (bias) s += bias[j];
+        output[j] = _bench_apply_act(s, act);
+    }
+}
+
 static inline void bench_fused_linear(
     const float *input, const float *weight, const float *bias,
     float *output, int M, int N, int K, rac_activation act)
 {
-    if (M <= 1) {
-        rac_config cfg = rac_default_config();
-        rac_fused_linear(input, weight, bias, output, M, N, K, act, &cfg);
+    if (M == 1) {
+        bench_gemv(input, weight, bias, output, N, K, act);
     } else {
-        bench_fused_linear(input, weight, bias, output, M, N, K, act);
+        rac_hal_fused_linear(input, weight, bias, output, M, N, K, act);
     }
 }
 
