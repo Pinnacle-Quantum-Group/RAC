@@ -204,25 +204,35 @@ static void rmsnorm(const float *x, const float *scale, float *out,
     }
 }
 
-/* Scaled dot-product attention for a single (possibly-replicated) head. */
+/* Scaled dot-product attention for a single (possibly-replicated) head.
+ * OpenMP-parallel over T for each of the three phases — dominates the
+ * tinyllama prefill wall-clock at T=128, nh=32. */
 static void attention_head(const float *q, const float *k, const float *v,
                            float *out, float *scratch,
                            int T, int d_head) {
     const float scale = 1.0f / sqrtf((float)d_head);
+
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) {
+        float *row = scratch + (size_t)i * T;
         for (int j = 0; j <= i; j++) {
             float s = 0.0f;
             for (int h = 0; h < d_head; h++) s += q[i*d_head+h] * k[j*d_head+h];
-            scratch[i*T + j] = s * scale;
+            row[j] = s * scale;
         }
-        for (int j = i+1; j < T; j++) scratch[i*T + j] = -1e30f;
+        for (int j = i+1; j < T; j++) row[j] = -1e30f;
     }
+
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) rac_softmax(scratch + i*T, scratch + i*T, T);
+
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < T; i++) {
-        for (int h = 0; h < d_head; h++) out[i*d_head+h] = 0.0f;
+        float *orow = out + (size_t)i * d_head;
+        for (int h = 0; h < d_head; h++) orow[h] = 0.0f;
         for (int j = 0; j < T; j++) {
             float s = scratch[i*T+j];
-            for (int h = 0; h < d_head; h++) out[i*d_head+h] += s * v[j*d_head+h];
+            for (int h = 0; h < d_head; h++) orow[h] += s * v[j*d_head+h];
         }
     }
 }
