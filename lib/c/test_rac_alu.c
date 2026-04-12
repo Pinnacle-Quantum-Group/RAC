@@ -221,13 +221,30 @@ int main(void) {
     /* ── 12b. Extended-range exp via argument reduction ──────────────── */
     HEADER("12b. Argument-reduced exp");
     {
+        /* Runtime invariant: RAC_K_HYP_RECIP must be the reciprocal of K_HYP.
+         * If this ever trips, someone edited one constant without the other. */
+        CHECK("K_HYP * K_HYP_RECIP ≈ 1",
+              fabsf(RAC_K_HYP * RAC_K_HYP_RECIP - 1.0f) < 0.01f);
+
         float xs[] = {-20.0f, -5.0f, -1.5f, -0.5f, 0.0f, 0.5f, 1.5f, 5.0f, 20.0f};
         int fails = 0;
         for (size_t i = 0; i < sizeof(xs)/sizeof(xs[0]); i++) {
             float lib = expf(xs[i]);
             float alu = rac_alu_exp(xs[i]);
             float rel = (lib != 0.0f) ? fabsf(alu - lib) / fabsf(lib) : 0.0f;
-            if (rel > 0.05f) { fails++; printf("  x=%+6.2f rel=%.3e\n", xs[i], rel); }
+            if (rel > 0.05f) {
+                fails++;
+                printf("  x=%+6.2f alu=%-14g libm=%-14g rel=%.3e\n",
+                       xs[i], (double)alu, (double)lib, rel);
+            }
+        }
+        if (fails > 0) {
+            printf("  HINT: rel~0.31 across all inputs => hyperbolic gain applied\n"
+                   "        the wrong direction. Check rac_alu_exp uses\n"
+                   "        RAC_ALU_K_HYP_RECIP (≈1.207), NOT RAC_ALU_K_HYP_INV.\n"
+                   "        Also: if you got this after upgrading source, REBUILD\n"
+                   "        the test binary — a stale .o from before the fix shows\n"
+                   "        exactly this symptom.\n");
         }
         CHECK("exp range [-20, 20] within 5%% relative error", fails == 0);
     }

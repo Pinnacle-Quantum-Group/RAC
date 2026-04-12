@@ -55,7 +55,13 @@ extern "C" {
 #define RAC_ALU_ITERS       RAC_ITERS
 #define RAC_ALU_K           RAC_K
 #define RAC_ALU_K_INV       RAC_K_INV
+
+/* Hyperbolic CORDIC gain: K_HYP ≈ 0.828 (< 1 for this CORDIC sequence).
+ * K_HYP_INV ≈ 1.207 is its mathematical inverse — multiply hyperbolic
+ * CORDIC output by K_HYP_INV to recover cosh/sinh without gain scaling. */
+#define RAC_ALU_K_HYP       RAC_K_HYP
 #define RAC_ALU_K_HYP_INV   RAC_K_HYP_INV
+#define RAC_ALU_K_HYP_RECIP RAC_K_HYP_INV  /* alias for clarity */
 
 /* ── Mode / direction / opcode enums ─────────────────────────────────────── */
 
