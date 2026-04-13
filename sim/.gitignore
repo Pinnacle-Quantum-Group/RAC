@@ -8,6 +8,7 @@ ref_outputs.hex
 # GEMM cosim artifacts
 gemm_weights.hex
 gemm_input.hex
+gemm_input_batch.hex
 gemm_golden.hex
 gemm.csv
 rtl_gemm_outputs.hex

@@ -185,6 +185,77 @@ def glu_ns_per_op(bank_size: int = RTL_ENGINES_PER_BANK) -> float:
     return 1e9 / (RTL_FMAX_MHZ * 1e6 * bank_size)
 
 
+# ── GLU measured: run the rac_dsp C reference as a 4th column ───────────
+# This gives EMPIRICAL numbers for the RAC-DSP path by running the bit-
+# exact software mirror of rac_dsp.v. Not a hardware measurement (that
+# requires Vivado synth + physical FPGA), but it IS the same CORDIC
+# algorithm running on the same host — apples to apples with the CPU
+# scalar column at least.
+
+def find_rac_systolic_ref() -> str | None:
+    """Locate the sim/rac_systolic_ref binary or source."""
+    candidates = [
+        HERE.parent / "sim" / "rac_systolic_ref",
+    ]
+    for c in candidates:
+        if c.exists() and os.access(str(c), os.X_OK):
+            return str(c)
+    return None
+
+
+def time_glu_empirical_sgemm(binary: str, M: int, N: int, K: int,
+                              reps: int) -> tuple[float, float] | None:
+    """Drive the rac_systolic_ref binary with random W,x and time it.
+    Returns (ms_per_call, gflops) or None on error."""
+    import subprocess
+    import tempfile
+    import random
+    sim_dir = pathlib.Path(binary).parent
+
+    # Generate a minimal test case via gen_gemm_vectors.py
+    gen = sim_dir / "gen_gemm_vectors.py"
+    if not gen.exists(): return None
+
+    # Emit N×N weights + K activations into sim_dir's standard files
+    try:
+        subprocess.run(
+            [sys.executable, str(gen),
+             "--n", str(N), "--k", str(K),
+             "--out-dir", str(sim_dir)],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+
+    # Pick input file (batch if K>1)
+    input_file = ("gemm_input_batch.hex" if K > 1 else "gemm_input.hex")
+
+    args = [
+        binary, str(N),
+        str(sim_dir / "gemm_weights.hex"),
+        str(sim_dir / input_file),
+        str(sim_dir / "cordic_coarse_lut.mem"),
+        str(sim_dir / "cordic_atan.mem"),
+        str(sim_dir / "cordic_atanh.mem"),
+        str(K),
+    ]
+
+    # Warm up (JIT + cache)
+    try:
+        subprocess.run(args, check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        return None
+
+    t0 = time.monotonic_ns()
+    for _ in range(reps):
+        subprocess.run(args, check=True, capture_output=True)
+    elapsed = (time.monotonic_ns() - t0) / 1e9
+    # Each call is a full N×N × K·N GEMM: 2·N·N·K flops per call
+    # (CORDIC-equivalent; real GLU silicon has the same op count)
+    flops = 2.0 * N * N * K * reps
+    return elapsed / reps * 1000.0, flops / elapsed / 1e9
+
+
 # ── Table rendering ──────────────────────────────────────────────────────
 
 def fmt_ns(x):
@@ -291,6 +362,24 @@ def main():
     if torch and not args.skip_gpu:
         gpu_ms, gpu_gf, gpu_tag2 = time_gpu_sgemm(torch, rac_torch, M, N, K, args.sgemm_reps)
         print(f"    GPU {gpu_tag2:<22}  {gpu_ms:8.2f} ms/call   {gpu_gf:8.1f} GFLOPS")
+
+    # Empirical RAC-DSP row: run sim/rac_systolic_ref at a feasible size
+    # (the binary's per-call overhead makes large N slow, so cap at 16).
+    sys_ref = find_rac_systolic_ref()
+    if sys_ref:
+        small_N = min(16, M)
+        small_K = min(4, M)
+        result = time_glu_empirical_sgemm(sys_ref, small_N, small_N,
+                                           small_K, args.sgemm_reps)
+        if result:
+            r_ms, r_gf = result
+            print(f"    RAC-DSP C ref ({small_N}x{small_K}):  "
+                  f"{r_ms:8.2f} ms/call   {r_gf:8.1f} GFLOPS")
+            print(f"                           (bit-exact rac_dsp.v mirror; "
+                  f"not an FPGA measurement)")
+    else:
+        print(f"    RAC-DSP C ref:           (not built — run `cd sim && make gemm`)")
+
     glu_ms = (2.0 * M * N * K) / (RTL_SGEMM_BANK_GOPS * 1e9) * 1000.0
     print(f"    GLU native CORDIC bank: {glu_ms:8.2f} ms/call   "
           f"{RTL_SGEMM_BANK_GOPS:8.1f} GFLOPS  (432-engine projection)")
