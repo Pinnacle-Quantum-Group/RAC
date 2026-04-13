@@ -29,7 +29,7 @@ module tb_rac_dsp;
 
     localparam integer WIDTH    = 64;
     localparam integer MAX_VECS = 256;
-    localparam integer LATENCY  = 9;      // matches rac_dsp §4
+    localparam integer LATENCY  = 12;     // 1 input + 1 coarse + 9 residual + 1 out
 
     reg clk = 0;
     always #5 clk = ~clk;

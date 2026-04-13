@@ -23,11 +23,34 @@
 #include <inttypes.h>
 #include <string.h>
 #include <errno.h>
+#define _USE_MATH_DEFINES
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-#define WIDTH         64
-#define LUT_BITS      10
-#define RESIDUAL      6
-#define LUT_SIZE      (1 << LUT_BITS)
+#define WIDTH          64
+#define LUT_BITS       10
+#define RESIDUAL       9          /* iters in residual stage */
+#define RESIDUAL_START 8          /* first residual shift (overlaps coarse by 2) */
+#define LUT_SIZE       (1 << LUT_BITS)
+
+/*
+ * Why RESIDUAL_START = 8 (overlap coarse by 2) instead of LUT_BITS = 10:
+ *
+ * Worst-case residual input |z_res| ≤ bucket_half_width + coarse_leftover
+ *                                   = π/(2·LUT_SIZE) + atan(2^-(LUT_BITS-1))
+ *                                   ≈ 1.53e-3 + 1.95e-3 = 3.49e-3
+ *
+ * CORDIC convergence requires the residual's Σatan(2^-i) for i ≥ START
+ * to exceed this bound. Starting at shift 8:
+ *   Σ atan(2^-8..2^-15) ≈ 7.7e-3   — plenty of margin.
+ * Starting at shift 10 (no overlap):
+ *   Σ atan(2^-10..2^-15) ≈ 1.95e-3 — FAILS to converge.
+ *
+ * The overlap "costs" 2 extra pipeline stages (RESIDUAL went 6 → 8) but
+ * buys guaranteed convergence for any input in the folded range.
+ */
 
 typedef int64_t  q_t;
 typedef uint64_t qu_t;
@@ -57,26 +80,21 @@ static void quadrant_fold(q_t *x, q_t *y, q_t *z) {
     *z = zz;
 }
 
-/* LUT index: top LUT_BITS of z_folded, biased by LUT_SIZE/2. */
+/* LUT index: map Q32.32 radian angle to one of LUT_SIZE buckets covering
+ * [-π/2, +π/2]. For a synthesizable RTL implementation this needs a
+ * shift-add decomposition of (LUT_SIZE / π) — that's a TODO in
+ * rac_dsp.v. For the C reference we use a plain float conversion,
+ * which establishes the mathematical contract.
+ *
+ * Bucket k covers [(k-LUT_SIZE/2)·π/LUT_SIZE,  (k-LUT_SIZE/2+1)·π/LUT_SIZE].
+ * So idx = floor((theta + π/2) / (π/LUT_SIZE)) = floor((theta/π + 0.5) * LUT_SIZE). */
 static int lut_idx_of(q_t z_folded) {
-    /* Extract bits [WIDTH-2 : WIDTH-1-LUT_BITS]; 1 bit below sign,
-     * LUT_BITS wide. */
-    uint64_t uz  = (uint64_t)z_folded;
-    int      idx = (int)((uz >> (WIDTH - 1 - LUT_BITS)) & (LUT_SIZE - 1));
-    idx = (idx + LUT_SIZE / 2) & (LUT_SIZE - 1);
+    double theta = (double)z_folded / (double)(1LL << 32);
+    double frac  = theta / M_PI + 0.5;                /* [0, 1] for θ ∈ [-π/2, π/2] */
+    int    idx   = (int)floor(frac * LUT_SIZE);
+    if (idx < 0)          idx = 0;
+    if (idx >= LUT_SIZE)  idx = LUT_SIZE - 1;
     return idx;
-}
-
-/* z_residual: zero the top LUT_BITS of z_folded, sign-extended. */
-static q_t z_residual_of(q_t z_folded) {
-    qu_t mask = (1ULL << (WIDTH - 1 - LUT_BITS)) - 1;
-    qu_t bits = ((uint64_t)z_folded) & mask;
-    /* sign-extend from bit (WIDTH-2-LUT_BITS) */
-    int shift = WIDTH - 1 - LUT_BITS;
-    if (bits & (1ULL << (shift - 1))) {
-        bits |= ~((1ULL << shift) - 1);
-    }
-    return (q_t)bits;
 }
 
 /* Load a hex-format LUT from $readmemh-style file.
@@ -103,51 +121,72 @@ static int load_hex_lut(const char *path, uint64_t *out, int expected) {
 static uint64_t coarse_lut[LUT_SIZE];
 static q_t      atanh_tab[RESIDUAL];
 
-/* atan(2^-i) in Q32.32 — for i ≥ LUT_BITS these match (2^-i) to
- * within the LSB, so we compute on the fly. */
-static q_t atan_circ(int phys_shift) {
-    q_t one = (q_t)0x0000000100000000LL;
-    return one >> phys_shift;
+/* Per-iteration circular-CORDIC atan constants, Q32.32.
+ *   atan(2^-i) at small i is computed via libm; cached so the hot
+ *   loop doesn't repeat the atan() call. */
+static q_t atan_circ_coarse(int i) {
+    /* tangent of a power-of-two — exact enough for spec purposes. */
+    double a = atan(ldexp(1.0, -i));
+    return (q_t)round(a * (double)(1LL << 32));
 }
 
-/* One rac_dsp evaluation at full precision. */
+/* One rac_dsp CGLUT evaluation at full precision.
+ *
+ * Flow:
+ *   1. Quadrant fold: reduce z to (-π/2, π/2], flipping (x,y) if needed
+ *   2. Coarse stage: look up LUT_BITS direction bits for the bucket
+ *      containing z, apply them as shift-adds to (x,y), track the
+ *      cumulative rotation angle z_applied
+ *   3. Residual: dynamic CORDIC at shifts RESIDUAL_START..RESIDUAL_START+RESIDUAL-1
+ *      driving (z_input_folded - z_applied) toward zero
+ */
 static void dsp_eval(q_t x_in, q_t y_in, q_t z_in, int op,
                      q_t *x_out, q_t *y_out, q_t *z_out) {
     q_t x = x_in, y = y_in, z = z_in;
     quadrant_fold(&x, &y, &z);
 
-    int idx = lut_idx_of(z);
-    uint64_t d_vec = coarse_lut[idx];
-
-    /* 10-stage combinational shift-add chain. */
-    for (int i = 0; i < LUT_BITS; i++) {
-        int d_pos = ((d_vec >> i) & 1u) == 1u;
-        q_t y_sh  = asr(y, i);
-        q_t x_sh  = asr(x, i);
-        if (d_pos) {
-            q_t xn = x - y_sh;
-            q_t yn = y + x_sh;
-            x = xn; y = yn;
-        } else {
-            q_t xn = x + y_sh;
-            q_t yn = y - x_sh;
-            x = xn; y = yn;
-        }
-    }
-
-    z = z_residual_of(z);
-
-    /* 6 residual CORDIC iterations. Only circular rotation/projection
-     * exercised here (op 0b000 / 0b001). Hyperbolic path omitted for
-     * brevity — easy to add, see rac_alu.c::_alu_run_hyp_rot. */
     int hyperbolic = (op == 3) ? 1 : 0;
     int vectoring  = (op == 2) ? 1 : 0;
+
+    /* ── Coarse stage ──
+     * Look up direction bits for the bucket containing z. Apply them
+     * to (x,y) while tracking z_applied = sum of ±atan(2^-i) over the
+     * LUT_BITS directions. Skip for vectoring mode (which computes
+     * direction from y sign dynamically, not from a precomputed LUT). */
+    q_t z_applied = 0;
+    if (!vectoring) {
+        int idx = lut_idx_of(z);
+        uint64_t d_vec = coarse_lut[idx];
+        for (int i = 0; i < LUT_BITS; i++) {
+            int d_pos = ((d_vec >> i) & 1u) == 1u;
+            q_t y_sh = asr(y, i);
+            q_t x_sh = asr(x, i);
+            q_t atan_i = atan_circ_coarse(i);
+            if (d_pos) {
+                q_t xn = x - y_sh;
+                q_t yn = y + x_sh;
+                x = xn; y = yn;
+                z_applied += atan_i;
+            } else {
+                q_t xn = x + y_sh;
+                q_t yn = y - x_sh;
+                x = xn; y = yn;
+                z_applied -= atan_i;
+            }
+        }
+        z = z - z_applied;   /* residual = input - what coarse actually did */
+    }
+
+    /* ── Residual stage ──
+     * RESIDUAL iterations at shifts starting at RESIDUAL_START (may
+     * overlap coarse range by a few iters for convergence margin). */
     for (int i = 0; i < RESIDUAL; i++) {
-        int phys = LUT_BITS + i;
+        int phys = RESIDUAL_START + i;
         int d_positive = vectoring ? (y < 0) : (z >= 0);
         q_t x_sh = asr(x, phys);
         q_t y_sh = asr(y, phys);
-        q_t atan_const = hyperbolic ? atanh_tab[i] : atan_circ(phys);
+        q_t atan_const =
+            hyperbolic ? atanh_tab[i] : atan_circ_coarse(phys);
 
         q_t x_next, y_next, z_next;
         if (hyperbolic) {

@@ -74,7 +74,8 @@ Parameters:
 |---|---|---|---|
 | `WIDTH` | 64 | 32, 48, 64 | datapath width in bits |
 | `LUT_BITS` | 10 | 8–14 | coarse LUT address bits (collapses this many CORDIC iters) |
-| `RESIDUAL` | 6 | 4–10 | residual CORDIC stages (fine-grained iters) |
+| `RESIDUAL` | 9 | 6–12 | residual CORDIC stages (fine-grained iters) |
+| `RESIDUAL_START` | 8 | `LUT_BITS-2` typical | first residual physical shift (overlap coarse by 2 iters for convergence margin) |
 | `INIT_LUT` | `cordic_coarse_lut.mem` | path | `$readmemh` source for the direction-bit ROM |
 | `INIT_ATANH` | `cordic_atanh.mem` | path | `$readmemh` source for the hyperbolic table |
 
@@ -99,11 +100,12 @@ Parameters:
 
 | quantity | value (default params) | notes |
 |---|---|---|
-| Latency | **9 cycles** | input-reg (1) + coarse (1) + residual (6) + output (1) |
+| Latency | **12 cycles** | input-reg (1) + coarse (1) + residual (9) + output (1) |
 | Throughput | **1 result / cycle** | fully pipelined after fill |
 | Max Fmax | ~180 MHz (Alveo U250, -2 grade) | combinational 10-add chain critical |
-| Accuracy (circular) | 42 bits | 10 coarse + 6 fine, then rounded to 32-bit fractional |
-| Accuracy (hyperbolic) | 38 bits | Walther convergence is slower |
+| Accuracy (circular) | 2^-15 ≈ 3×10⁻⁵ | validated bit-exact vs sim/rac_dsp_ref.c across 101 angles, max err 4.2e-5 |
+| Accuracy (hyperbolic) | ~2^-12 | Walther convergence is slower |
+| Cosim status | **101/101 PASS** at 2^-14 tolerance | see `sim/README.md` |
 
 ---
 

@@ -55,45 +55,57 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lut-bits", type=int, default=10,
                     help="coarse LUT address bits (default 10 → 1024 entries)")
-    ap.add_argument("--residual", type=int, default=6,
-                    help="residual CORDIC stages (default 6)")
+    ap.add_argument("--residual", type=int, default=8,
+                    help="residual CORDIC stages (default 8)")
+    ap.add_argument("--residual-start", type=int, default=None,
+                    help="first residual physical shift. Default = "
+                         "LUT_BITS-2 (overlap coarse by 2 for convergence "
+                         "margin — see RAC-DSP-DATASHEET.md §4)")
     ap.add_argument("--out-dir", default=str(pathlib.Path(__file__).parent))
     args = ap.parse_args()
+
+    if args.residual_start is None:
+        args.residual_start = args.lut_bits - 2
 
     out_dir = pathlib.Path(args.out_dir)
     lut_size = 1 << args.lut_bits
 
     # ── Coarse direction-bit LUT ───────────────────────────────────────
-    # Buckets cover [-π/2, +π/2]. Bucket k's target angle is
-    # (k - lut_size/2) · π / lut_size (so index lut_size/2 is θ = 0).
+    # Buckets cover [-π/2, +π/2]. Bucket k's CENTER angle is
+    #   (k - lut_size/2 + 0.5) · π / lut_size
+    # so every angle within ±(π/2)/lut_size of a bucket center lands in
+    # that bucket. Using bucket centers (not edges) means the residual
+    # CORDIC converges quickly — typical residual |z| < π/(2·lut_size).
     lut_path = out_dir / "cordic_coarse_lut.mem"
     with open(lut_path, "w") as f:
         f.write("// rac_dsp coarse direction-bit LUT\n")
         f.write(f"// lut_bits={args.lut_bits} → {lut_size} entries\n")
         f.write(f"// each line = {args.lut_bits}-bit CORDIC direction sequence\n")
-        f.write("// indexed so entry (lut_size/2) corresponds to θ=0\n")
+        f.write("// target angle = bucket center, so residual converges fast\n")
         hex_digits = max(1, (args.lut_bits + 3) // 4)
         for k in range(lut_size):
-            theta = (k - lut_size / 2) * math.pi / lut_size
+            theta = (k - lut_size / 2 + 0.5) * math.pi / lut_size
             d = cordic_dirs_for_angle(theta, args.lut_bits)
             f.write(f"{d:0{hex_digits}x}\n")
     print(f"wrote {lut_path} ({lut_size} entries)")
 
     # ── Residual atanh constants (Q32.32) ──────────────────────────────
-    # Shift i runs from args.lut_bits to args.lut_bits + args.residual - 1.
+    # Shift i runs from args.residual_start to residual_start + residual - 1.
     atanh_path = out_dir / "cordic_atanh.mem"
     one_q = 1 << 32
     with open(atanh_path, "w") as f:
-        f.write("// rac_dsp residual atanh constants, Q32.32 signed\n")
+        f.write(f"// rac_dsp residual atanh constants, Q32.32 signed\n")
+        f.write(f"// residual_start={args.residual_start} residual={args.residual}\n")
+        f.write(f"// shifts: {args.residual_start}..{args.residual_start + args.residual - 1}\n")
         for stage in range(args.residual):
-            shift = args.lut_bits + stage
+            shift = args.residual_start + stage
             v = math.atanh(2.0 ** -shift)
             q = int(round(v * one_q))
             # 64-bit signed → 16 hex chars
             if q < 0:
                 q = (1 << 64) + q
             f.write(f"{q:016x}\n")
-    print(f"wrote {atanh_path} ({args.residual} entries)")
+    print(f"wrote {atanh_path} ({args.residual} entries, shifts {args.residual_start}..{args.residual_start+args.residual-1})")
 
     # ── Summary ────────────────────────────────────────────────────────
     print()

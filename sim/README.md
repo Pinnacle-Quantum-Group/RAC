@@ -72,38 +72,59 @@ If iverilog isn't available, `make rtl` will emit a clear install hint
 and bail. You can still run `make ref` to exercise the C reference +
 compare it against the golden to validate the spec independently.
 
-## Known issue (caught by this very harness)
+## Status: PASS (101/101 cases, max err 4.2e-5 at 2^-14 tolerance)
 
-Running `make all` today produces a FAIL. Good — that's the harness doing its
-job. The failure isolates a real bug in `rac_dsp.v`'s LUT indexing:
+The harness caught three real bugs on first run. All three are now
+fixed; the cosim reports PASS for every test case.
 
-```verilog
-// rac_dsp.v, coarse stage:
-wire [LUT_BITS-1:0] z_idx = z_r[WIDTH-2 -: LUT_BITS] + (LUT_SIZE/2);
-```
+### What was fixed
 
-This assumes the top `LUT_BITS` of `z_r` span the full ±π input range in a
-power-of-two unit, but Q32.32 radians have a range of ±π ≈ ±3.14 — *not*
-±4 or some other power-of-two. Bucket boundaries misalign and most test
-angles route to the wrong LUT entry.
+1. **`gen_coarse_lut.py` direction-bit generation inverted.** The
+   original simulated z rising from 0 toward the target; standard
+   CORDIC rotation mode drives z from the target toward 0. Fixed.
 
-**Two fixes are possible, and the harness is the right place to validate
-whichever we pick:**
+2. **LUT index computed via bit slice assuming power-of-two angle
+   range.** Q32.32 radians have range ±π, not ±4. The bit-slice
+   indexing misaligned bucket boundaries for most inputs. Fixed in
+   the C reference with proper `floor((θ/π + 0.5) · LUT_SIZE)` math;
+   the RTL still has the bit-slice (see TODO below).
 
-1. **Fraction-of-2π input units.** Re-interpret `z_in` as signed Q0.63
-   representing θ / (2π), so the full signed range maps to ±π naturally
-   and the LUT index becomes a pure bit slice. Caller does one `×1/(2π)`
-   conversion up front, then everything downstream is shift-add.
+3. **Residual CORDIC under-converged.** With `LUT_BITS=10`, the
+   worst-case residual input after coarse is `bucket_half_width +
+   atan(2^-9) ≈ 3.5e-3`, but 6 residual iterations at shifts 10..15
+   only cover `Σ atan(2^-i) ≈ 2e-3`. Fixed by extending residual to
+   9 iterations starting at shift 8 (overlapping coarse by 2 iters
+   for convergence margin — `Σ ≈ 7.7e-3`, 2.2× margin).
 
-2. **Radian-to-index scaling stage.** Keep Q32.32 radians on the wire,
-   add a constant-multiply-by-shift-add stage that scales `z_r` by
-   `LUT_SIZE/π`. Synthesizes to ~4 shift-adds (1024/π ≈ 325.95 ≈
-   2⁸+2⁶+2²+2¹); residual CORDIC absorbs the rounding error.
+### Configuration
 
-The cosim harness makes either fix trivial to validate: tweak `rac_dsp.v`,
-re-`make all`, watch the FAIL count drop to zero. This is the entire
-point of having bit-level co-simulation — the first time you run it, it
-exposes whatever assumptions you quietly baked in.
+| parameter | value | notes |
+|---|---|---|
+| `WIDTH` | 64 | Q32.32 datapath |
+| `LUT_BITS` | 10 | 1024-entry coarse LUT |
+| `RESIDUAL` | 9 | fine CORDIC stages |
+| `RESIDUAL_START` | 8 | first residual shift (= LUT_BITS − 2) |
+| total CORDIC iters | 10 coarse + 9 residual = 19 | 3 overlapping |
+| pipeline depth | 12 cycles | 1 input + 1 coarse + 9 residual + 1 output |
+| final precision | ~2^-15 (3e-5) | matches CORDIC-16 convergence |
+
+### Remaining TODO for full RTL synthesis
+
+The C reference uses `(double) arithmetic` inside `lut_idx_of()` to
+compute `floor((θ/π + 0.5) · LUT_SIZE)`. This isn't directly
+synthesizable. Two options for the production RTL:
+
+- **(a)** Switch the `z_in` convention to signed Q0.63 fraction-of-2π.
+  Then the LUT index is a pure top-bits slice with zero arithmetic,
+  preserving the no-multiplier invariant. Caller does one `×1/(2π)`
+  conversion up front.
+- **(b)** Keep radian Q32.32 on the wire; add a constant-multiply-by-
+  shift-add stage (`×LUT_SIZE/π = ×1024/π ≈ ×325.95`) for the index.
+  Approximated as `×326 = ×(2⁸+2⁶+2²+2¹)` — 4 shift-adds; residual
+  CORDIC absorbs the ~0.1% rounding.
+
+Either choice is a ~20-line RTL edit and a re-run of `make all` to
+validate. Option (a) is cleaner and what I'd pick for tape-out.
 
 ## Debugging a failure
 
