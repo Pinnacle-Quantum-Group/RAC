@@ -17,7 +17,7 @@ CFLAGS   := -O2 -Wall -Wextra -std=c99
 PYTHON   := python3
 
 # LUT memory files — the testbench + C ref both read these
-LUT_MEMS := cordic_coarse_lut.mem cordic_atanh.mem
+LUT_MEMS := cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem
 
 .PHONY: all vectors rtl ref cosim clean deps
 
@@ -36,8 +36,9 @@ test_vectors.hex golden.hex: gen_vectors.py
 	$(PYTHON) gen_vectors.py
 
 # ── Symlink LUT .mem files from rtl/ so tb + C ref can $readmemh them ─
-$(LUT_MEMS): $(RTL_DIR)/cordic_coarse_lut.mem $(RTL_DIR)/cordic_atanh.mem
+$(LUT_MEMS): $(RTL_DIR)/cordic_coarse_lut.mem $(RTL_DIR)/cordic_atan.mem $(RTL_DIR)/cordic_atanh.mem
 	ln -sf $(RTL_DIR)/cordic_coarse_lut.mem .
+	ln -sf $(RTL_DIR)/cordic_atan.mem .
 	ln -sf $(RTL_DIR)/cordic_atanh.mem .
 
 # ── Build + run the RTL testbench ──────────────────────────────────────
@@ -56,7 +57,7 @@ rac_dsp_ref: rac_dsp_ref.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 ref_outputs.hex: rac_dsp_ref test_vectors.hex $(LUT_MEMS)
-	./rac_dsp_ref test_vectors.hex cordic_coarse_lut.mem cordic_atanh.mem > $@
+	./rac_dsp_ref test_vectors.hex cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem > $@
 
 # ── Cosim diff ─────────────────────────────────────────────────────────
 cosim: rtl_outputs.hex golden.hex

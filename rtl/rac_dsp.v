@@ -138,20 +138,23 @@ module rac_dsp #(
         $readmemh(INIT_LUT, dir_rom);
     end
 
-    // ── Residual atanh ROM (for hyperbolic mode only) ──────────────────
-    // Circular residual atan values are computed from shift amount; but
-    // atanh(2^-i) has a different numeric sequence so we keep a tiny
-    // ROM of RESIDUAL entries.
+    // ── atan ROM: atan(2^-i) / π in Q0.63 fraction-of-π ────────────
+    // One entry per CORDIC iteration. Coarse stage (shifts 0..LUT_BITS-1)
+    // uses these to track z_applied as it runs; residual stage (shifts
+    // RESIDUAL_START..RESIDUAL_START+RESIDUAL-1) uses them to drive
+    // the residual z toward zero. Values are emitted by
+    // rtl/gen_coarse_lut.py.
+    localparam integer ATAN_ROM_SIZE = RESIDUAL_START + RESIDUAL;
+    (* rom_style = "distributed" *)
+    reg signed [WIDTH-1:0] atan_rom  [0:ATAN_ROM_SIZE-1];
     (* rom_style = "distributed" *)
     reg signed [WIDTH-1:0] atanh_rom [0:RESIDUAL-1];
     initial begin
-        $readmemh(INIT_ATANH, atanh_rom);
+        $readmemh("cordic_atan.mem",  atan_rom);
+        $readmemh(INIT_ATANH,         atanh_rom);
     end
 
-    // atan(2^-i) for circular residual (iter = LUT_BITS .. LUT_BITS+RESIDUAL-1).
-    // Computed as a 64-bit Q32.32 constant per physical shift amount.
-    // For LUT_BITS=10..15, atan(2^-i) ≈ 2^-i to within LSB, so we reuse
-    // the shift amount directly — saves a ROM read on circular path.
+    // Stub kept for source compatibility (unused in the data path now).
     function automatic [WIDTH-1:0] atan_circ_const;
         input integer phys_shift;
         reg  signed [WIDTH-1:0] one_q;
@@ -168,22 +171,20 @@ module rac_dsp #(
     reg [2:0]               op_r;
     reg signed [WIDTH-1:0]  x_r, y_r, z_r;
 
-    localparam signed [WIDTH-1:0] PI_Q        = 64'sh00000003_243F6A88; // π
-    localparam signed [WIDTH-1:0] HALF_PI_Q   = 64'sh00000001_921FB544; // π/2
-    localparam signed [WIDTH-1:0] TWO_PI_Q    = 64'sh00000006_487ED510; // 2π
-    localparam signed [WIDTH-1:0] NEG_PI_Q    = -64'sh00000003_243F6A88;
-    localparam signed [WIDTH-1:0] NEG_HALF_PI = -64'sh00000001_921FB544;
-
-    wire signed [WIDTH-1:0] z_mod2pi =
-        (z_in >  PI_Q)       ? z_in - TWO_PI_Q :
-        (z_in <  NEG_PI_Q)   ? z_in + TWO_PI_Q :
-                                z_in;
-    // Flip (x,y) by half-turn if |θ| > π/2, and shift θ by ±π.
-    wire flip = (z_mod2pi > HALF_PI_Q) || (z_mod2pi < NEG_HALF_PI);
+    // ── Quadrant fold in Q0.63 fraction-of-π ────────────────────────
+    // z_in interpretation:  z_signed / 2^63 = θ / π
+    // Post-fold range: |θ| ≤ π/2, i.e. |z| ≤ 2^62.
+    // Fold condition: z is in quadrant 2 or 3, i.e. z[63] XOR z[62] == 1.
+    //   Q1 (z[63]=0, z[62]=0): pass              θ ∈ [0, π/2]
+    //   Q2 (z[63]=0, z[62]=1): XOR bit63, flipXY θ_old ∈ (π/2, π)   → new z ∈ (-2^62, 0)
+    //   Q3 (z[63]=1, z[62]=0): XOR bit63, flipXY θ_old ∈ (-π, -π/2] → new z ∈ (0, 2^62]
+    //   Q4 (z[63]=1, z[62]=1): pass              θ ∈ (-π/2, 0]
+    // XOR with 2^63 shifts θ by ±π (mod 2π). Combined with (x,y) flip,
+    // the reduced-angle rotation gives the same output as the full
+    // unreduced rotation.
+    wire flip = z_in[WIDTH-1] ^ z_in[WIDTH-2];
     wire signed [WIDTH-1:0] z_folded =
-        (z_mod2pi > HALF_PI_Q)   ? z_mod2pi - PI_Q :
-        (z_mod2pi < NEG_HALF_PI) ? z_mod2pi + PI_Q :
-                                   z_mod2pi;
+        flip ? (z_in ^ {1'b1, {(WIDTH-1){1'b0}}}) : z_in;
     wire signed [WIDTH-1:0] x_folded = flip ? -x_in : x_in;
     wire signed [WIDTH-1:0] y_folded = flip ? -y_in : y_in;
 
@@ -204,54 +205,54 @@ module rac_dsp #(
     end
 
     // ── Coarse combinational stage ─────────────────────────────────────
-    // Read the 10-bit direction vector from dir_rom[z_idx] where z_idx
-    // is the top LUT_BITS of z_r (treating z_r ∈ [-π/2, π/2] as a
-    // fraction of π — we scale by re-interpreting the bits).
+    // z_r is Q0.63 fraction-of-π, post-fold in (-2^62, 2^62].
+    // Scale up by 1 bit to span ±2^63 so the top LUT_BITS use the full
+    // signed range [-LUT_SIZE/2, LUT_SIZE/2]. Add LUT_SIZE/2 bias to
+    // get unsigned bucket index [0, LUT_SIZE).
     //
-    // Index formula: scale z_r by LUT_SIZE / π, quantise. In Q32.32,
-    // LUT_SIZE / π ≈ 325.95 for LUT_SIZE=1024. That's not a power of
-    // two, so a general multiplier would be needed. BUT for the coarse
-    // LUT we accept that the bucket boundaries are aligned to
-    // 2π/LUT_SIZE in z-bit units (i.e. we pretend z is parameterised on
-    // [0, 2π] mapped to [0, 2^WIDTH]). The residual CORDIC then corrects
-    // the small error introduced by this approximation.
-    wire [LUT_BITS-1:0] z_idx = z_r[WIDTH-2 -: LUT_BITS] + (LUT_SIZE/2);
-    wire [LUT_BITS-1:0] d_vec = dir_rom[z_idx];
+    // This is a pure bit slice + add — no multiplier anywhere on the
+    // LUT-index path. That's the whole point of switching z_in to
+    // fraction-of-π instead of radian Q32.32.
+    wire signed [WIDTH-1:0]   z_scaled = z_r <<< 1;
+    wire signed [LUT_BITS-1:0] z_idx_s = z_scaled[WIDTH-1 -: LUT_BITS];
+    wire [LUT_BITS-1:0]       z_idx    = $unsigned(z_idx_s) + (LUT_SIZE/2);
+    wire [LUT_BITS-1:0]       d_vec    = dir_rom[z_idx];
 
     // Apply 10 sign-controlled shift-adds combinationally. The math:
     //   for i in 0..LUT_BITS-1:
     //     s = d_vec[i] ? +1 : -1
     //     x' = x - s·(y >> i)
     //     y' = y + s·(x >> i)
-    //     (no z update — we just absorb the bucket angle into the LUT)
-    // Depth: 2·LUT_BITS adds on each of {x, y} chains.
+    //     z_applied += s · atan(2^-i)/π    ← tracks exact CORDIC rotation
+    // Depth: 2·LUT_BITS adds on {x, y} chains + LUT_BITS adds on z_applied.
     wire signed [WIDTH-1:0] x_chain [0:LUT_BITS];
     wire signed [WIDTH-1:0] y_chain [0:LUT_BITS];
+    wire signed [WIDTH-1:0] z_app   [0:LUT_BITS];
     assign x_chain[0] = x_r;
     assign y_chain[0] = y_r;
+    assign z_app  [0] = {WIDTH{1'b0}};
 
     generate genvar ci;
         for (ci = 0; ci < LUT_BITS; ci = ci + 1) begin : coarse_chain
-            wire d_neg = ~d_vec[ci];
+            wire d_pos = d_vec[ci];            // 1 = rotate by +atan(2^-ci)/π
             wire signed [WIDTH-1:0] y_sh = y_chain[ci] >>> ci;
             wire signed [WIDTH-1:0] x_sh = x_chain[ci] >>> ci;
-            assign x_chain[ci+1] = d_neg ? (x_chain[ci] + y_sh) : (x_chain[ci] - y_sh);
-            assign y_chain[ci+1] = d_neg ? (y_chain[ci] - x_sh) : (y_chain[ci] + x_sh);
+            wire signed [WIDTH-1:0] atan_q = atan_rom[ci];
+            // d=+1: x' = x - y_sh ; d=-1: x' = x + y_sh
+            assign x_chain[ci+1] = d_pos ? (x_chain[ci] - y_sh) : (x_chain[ci] + y_sh);
+            assign y_chain[ci+1] = d_pos ? (y_chain[ci] + x_sh) : (y_chain[ci] - x_sh);
+            assign z_app  [ci+1] = d_pos ? (z_app  [ci] + atan_q) : (z_app  [ci] - atan_q);
         end
     endgenerate
 
-    // Coarse-stage output register. z is not touched by the chain because
-    // the LUT absorbed the bucket angle; we pass the residual z for the
-    // fine CORDIC stages to finish aligning.
+    // Coarse-stage output register. Residual z = z_input_folded - z_applied;
+    // this carries both (input - bucket_center) AND the coarse CORDIC
+    // quantization error, so the downstream residual CORDIC cleans up both.
     reg                    valid_c;
     reg [2:0]              op_c;
     reg signed [WIDTH-1:0] x_c, y_c, z_c;
 
-    // Residual z: zero the top LUT_BITS of z_r, keeping low bits.
-    wire signed [WIDTH-1:0] z_residual = $signed({
-        {(LUT_BITS+1){z_r[WIDTH-1]}},
-        z_r[WIDTH-2-LUT_BITS : 0]
-    });
+    wire signed [WIDTH-1:0] z_residual = z_r - z_app[LUT_BITS];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -297,7 +298,7 @@ module rac_dsp #(
             wire signed [WIDTH-1:0] x_sh = x_pipe[i] >>> PHYS_SHIFT;
             wire signed [WIDTH-1:0] y_sh = y_pipe[i] >>> PHYS_SHIFT;
             wire signed [WIDTH-1:0] atan_const =
-                hyp_mode ? atanh_rom[i] : atan_circ_const(PHYS_SHIFT);
+                hyp_mode ? atanh_rom[i] : atan_rom[PHYS_SHIFT];
 
             // Circular: x' = x - d·y_sh ; Hyperbolic: x' = x + d·y_sh
             wire signed [WIDTH-1:0] x_next =
