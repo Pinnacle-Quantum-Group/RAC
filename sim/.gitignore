@@ -5,6 +5,14 @@ vectors.csv
 rtl_outputs.hex
 ref_outputs.hex
 
+# GEMM cosim artifacts
+gemm_weights.hex
+gemm_input.hex
+gemm_golden.hex
+gemm.csv
+rtl_gemm_outputs.hex
+ref_gemm_outputs.hex
+
 # Local symlinks to rtl/*.mem
 cordic_coarse_lut.mem
 cordic_atan.mem
@@ -13,5 +21,7 @@ cordic_atanh.mem
 # Build artifacts
 tb_rac_dsp
 rac_dsp_ref
+tb_rac_systolic_array
+rac_systolic_ref
 *.o
 *.vcd

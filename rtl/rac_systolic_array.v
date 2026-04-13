@@ -138,9 +138,24 @@ module rac_systolic_array #(
         end
     endgenerate
 
-    // Valid signal: simple shift register matching the pipeline depth
-    // (rac_dsp LATENCY + N row-propagation).
-    localparam integer TOTAL_LATENCY = 9 + N;   // 9 from rac_dsp + N for lattice
+    // Valid signal: simple shift register matching the pipeline depth.
+    //
+    // Timing breakdown for a weight-stationary NxN array with x entering
+    // at cycle 0 on the left edge:
+    //   1. East flow: x_in[r] reaches PE[r][c] at cycle c (one register
+    //      per column)
+    //   2. PE CORDIC: rac_dsp LATENCY cycles from input to x_proj
+    //   3. South accumulation: one register per row, so y_v[N][c] settles
+    //      at cycle c + rac_dsp.LATENCY + N
+    //   4. The rightmost output y_out[N-1] is thus valid at cycle
+    //      (N-1) + rac_dsp.LATENCY + N = 2N + rac_dsp.LATENCY - 1
+    //   5. All outputs are valid once the rightmost is (earlier columns
+    //      are stable for the leftward ones)
+    //
+    // With rac_dsp.LATENCY = 12 (see RAC-DSP-DATASHEET §4), total is
+    // 2N + 11.
+    localparam integer RAC_DSP_LATENCY = 12;
+    localparam integer TOTAL_LATENCY   = 2*N + RAC_DSP_LATENCY - 1;
     reg [TOTAL_LATENCY-1:0] valid_shift;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) valid_shift <= {TOTAL_LATENCY{1'b0}};

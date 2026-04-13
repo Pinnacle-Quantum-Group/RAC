@@ -19,7 +19,8 @@ PYTHON   := python3
 # LUT memory files — the testbench + C ref both read these
 LUT_MEMS := cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem
 
-.PHONY: all vectors rtl ref cosim clean deps
+.PHONY: all vectors rtl ref cosim clean deps \
+        gemm gemm-vectors gemm-rtl gemm-ref gemm-cosim
 
 all: cosim
 
@@ -53,8 +54,8 @@ rtl_outputs.hex: tb_rac_dsp test_vectors.hex $(LUT_MEMS)
 # ── Build + run the C reference ────────────────────────────────────────
 ref: ref_outputs.hex
 
-rac_dsp_ref: rac_dsp_ref.c
-	$(CC) $(CFLAGS) -o $@ $<
+rac_dsp_ref: rac_dsp_ref.c rac_dsp_core.c rac_dsp_core.h
+	$(CC) $(CFLAGS) -o $@ rac_dsp_ref.c rac_dsp_core.c -lm
 
 ref_outputs.hex: rac_dsp_ref test_vectors.hex $(LUT_MEMS)
 	./rac_dsp_ref test_vectors.hex cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem > $@
@@ -63,9 +64,48 @@ ref_outputs.hex: rac_dsp_ref test_vectors.hex $(LUT_MEMS)
 cosim: rtl_outputs.hex golden.hex
 	$(PYTHON) cosim.py $(COSIM_ARGS)
 
+# ─────────────────────────────────────────────────────────────────────
+#  GEMM cosim: validate rac_systolic_array via a 4×4 matrix-vector test
+# ─────────────────────────────────────────────────────────────────────
+
+gemm: gemm-cosim
+
+GEMM_N ?= 4
+
+gemm-vectors: gemm_weights.hex gemm_input.hex gemm_golden.hex
+
+gemm_weights.hex gemm_input.hex gemm_golden.hex: gen_gemm_vectors.py
+	$(PYTHON) gen_gemm_vectors.py --n $(GEMM_N)
+
+gemm-rtl: rtl_gemm_outputs.hex
+
+tb_rac_systolic_array: tb_rac_systolic_array.v \
+                       $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
+	$(IVERILOG) -o $@ tb_rac_systolic_array.v \
+	  $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
+
+rtl_gemm_outputs.hex: tb_rac_systolic_array \
+                     gemm_weights.hex gemm_input.hex $(LUT_MEMS)
+	$(VVP) tb_rac_systolic_array
+
+gemm-ref: ref_gemm_outputs.hex
+
+rac_systolic_ref: rac_systolic_ref.c rac_dsp_core.c rac_dsp_core.h
+	$(CC) $(CFLAGS) -o $@ rac_systolic_ref.c rac_dsp_core.c -lm
+
+ref_gemm_outputs.hex: rac_systolic_ref \
+                     gemm_weights.hex gemm_input.hex $(LUT_MEMS)
+	./rac_systolic_ref $(GEMM_N) gemm_weights.hex gemm_input.hex \
+	  cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem > $@
+
+gemm-cosim: rtl_gemm_outputs.hex gemm_golden.hex ref_gemm_outputs.hex
+	$(PYTHON) cosim_gemm.py $(COSIM_ARGS)
+
 # ── Cleanup ────────────────────────────────────────────────────────────
 clean:
-	rm -f tb_rac_dsp rac_dsp_ref \
+	rm -f tb_rac_dsp rac_dsp_ref tb_rac_systolic_array rac_systolic_ref \
 	      test_vectors.hex golden.hex vectors.csv \
 	      rtl_outputs.hex ref_outputs.hex \
+	      gemm_weights.hex gemm_input.hex gemm_golden.hex gemm.csv \
+	      rtl_gemm_outputs.hex ref_gemm_outputs.hex \
 	      $(LUT_MEMS)
