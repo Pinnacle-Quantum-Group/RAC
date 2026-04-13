@@ -169,7 +169,7 @@ module tb_rac_dsp;
         $fwrite(fout, "// format: x_q3232 y_q3232 z_q3232\n");
         for (i = 0; i < out_idx; i = i + 1) begin
             ux = out_x[i]; uy = out_y[i]; uz = out_z[i];
-            $fwrite(fout, "%016h %016h %016h\n", ux, uy, uz);
+            $fwrite(fout, "%016x %016x %016x\n", ux, uy, uz);
         end
         $fclose(fout);
         $display("wrote rtl_outputs.hex (%0d rows)", out_idx);

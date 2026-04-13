@@ -55,8 +55,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lut-bits", type=int, default=10,
                     help="coarse LUT address bits (default 10 → 1024 entries)")
-    ap.add_argument("--residual", type=int, default=8,
-                    help="residual CORDIC stages (default 8)")
+    ap.add_argument("--residual", type=int, default=9,
+                    help="residual CORDIC stages (default 9, matches rac_dsp.v)")
     ap.add_argument("--residual-start", type=int, default=None,
                     help="first residual physical shift. Default = "
                          "LUT_BITS-2 (overlap coarse by 2 for convergence "
