@@ -42,4 +42,18 @@ int  rac_load_all_roms(const char *coarse_lut_path,
 void rac_dsp_eval(rac_q_t x_in, rac_q_t y_in, rac_q_t z_in, int op,
                   rac_q_t *x_out, rac_q_t *y_out, rac_q_t *z_out);
 
+/* Batch helper: run N project-mode evaluations in a tight C loop.
+ * Inputs are parallel arrays of length `n`; outputs go into x_out[].
+ * Avoids Python ctypes overhead when timing from bench_three_paths.py. */
+void rac_dsp_project_batch(int n,
+                           const rac_q_t *xs, const rac_q_t *zs,
+                           rac_q_t       *x_out);
+
+/* Accumulated-sum variant: returns the column sum of N projections as
+ * a single scalar (y = Σ rac_dsp_project(xs[i], 0, zs[i]).x_out). This
+ * is exactly what each column of the systolic array computes — one
+ * call to this gives a full systolic-column-GEMM-equivalent unit. */
+rac_q_t rac_dsp_project_sum(int n,
+                            const rac_q_t *xs, const rac_q_t *zs);
+
 #endif  /* RAC_DSP_CORE_H */
