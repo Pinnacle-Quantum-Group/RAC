@@ -1,5 +1,5 @@
 // rac_dsp circular atan constants — Q0.63 fraction-of-π
-// 16 entries, one per iter (shift = index)
+// 17 entries, one per iter (shift = index)
 // stored_value * π = atan(2^-i) in radians
 2000000000000000
 12e4051d9df30800
@@ -17,3 +17,4 @@
 000145f306c172f2
 0000a2f9836ae911
 0000517cc1b6ba7c
+000028be60db85fc

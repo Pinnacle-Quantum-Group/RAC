@@ -1,5 +1,5 @@
 // rac_dsp residual atanh constants — Q0.63 fraction-of-π
-// residual_start=8 residual=8
+// residual_start=8 residual=9
 0028be6e7066aafc
 00145f322063682e
 000a2f986d38121a
@@ -8,3 +8,4 @@
 000145f306f7c61e
 0000a2f98371b377
 0000517cc1b793c8
+000028be60dba126
