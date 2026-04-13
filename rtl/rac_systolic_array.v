@@ -52,14 +52,25 @@ module rac_systolic_array #(
     input  wire signed [WIDTH-1:0]            weight_angle,
 
     // Left edge: activation vector, one element per row per cycle.
+    // Port is a flat bit-vector of N*WIDTH bits (Vivado synth doesn't
+    // allow unpacked-array ports; iverilog does, but we need portable
+    // RTL). Internally we unpack into an array for readability.
     input  wire                               x_valid_in,
-    input  wire signed [WIDTH-1:0]            x_in [0:N-1],
+    input  wire [N*WIDTH-1:0]                 x_in,
 
-    // Bottom edge: result vector, one element per column per cycle,
-    // valid after N + rac_dsp_LATENCY cycles from the corresponding input.
+    // Bottom edge: result vector, same flattened layout.
     output wire                               y_valid_out,
-    output wire signed [WIDTH-1:0]            y_out [0:N-1]
+    output wire [N*WIDTH-1:0]                 y_out
 );
+
+    // ── Unpack flat ports into internal arrays ────────────────────────
+    wire signed [WIDTH-1:0] x_in_arr  [0:N-1];
+    wire signed [WIDTH-1:0] y_out_arr [0:N-1];
+    genvar _u;
+    generate for (_u = 0; _u < N; _u = _u + 1) begin : unpack_ports
+        assign x_in_arr[_u] = $signed(x_in[(_u+1)*WIDTH-1 -: WIDTH]);
+        assign y_out[(_u+1)*WIDTH-1 -: WIDTH] = y_out_arr[_u];
+    end endgenerate
 
     // PE-local angle registers (the "weights")
     reg signed [WIDTH-1:0] pe_angle [0:N-1][0:N-1];
@@ -79,7 +90,7 @@ module rac_systolic_array #(
     generate genvar r, c;
         // Seed left edge with the input vector
         for (r = 0; r < N; r = r + 1) begin : seed_left
-            assign x_h[r][0] = x_in[r];
+            assign x_h[r][0] = x_in_arr[r];
         end
         // Seed top edge with zeros (partial sums start at 0)
         for (c = 0; c < N; c = c + 1) begin : seed_top
@@ -134,7 +145,7 @@ module rac_systolic_array #(
 
         // Bottom-edge output = y_v[N][0..N-1]
         for (c = 0; c < N; c = c + 1) begin : out_edge
-            assign y_out[c] = y_v[N][c];
+            assign y_out_arr[c] = y_v[N][c];
         end
     endgenerate
 
