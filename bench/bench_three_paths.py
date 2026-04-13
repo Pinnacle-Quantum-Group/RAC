@@ -20,8 +20,13 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, ctypes, os, pathlib, sys, time
+import argparse, ctypes, os, pathlib, sys, time, warnings
 
+# Quiet ROCm/hipBLASLt-on-unsupported-arch spam; it's benign.
+warnings.filterwarnings(
+    "ignore",
+    message=".*hipBLASLt on an unsupported architecture.*",
+)
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -290,12 +295,26 @@ def main():
     print(f"    GLU native CORDIC bank: {glu_ms:8.2f} ms/call   "
           f"{RTL_SGEMM_BANK_GOPS:8.1f} GFLOPS  (432-engine projection)")
 
+    # ── Break-even analysis ───────────────────────────────────────────
+    # For each op, compute how many GLU engines would match the GPU's
+    # per-element throughput. Useful for sizing an FPGA deployment.
+    print("\n  Break-even GLU engine count vs GPU SFU:")
+    glu_single_ns = 1e9 / (RTL_FMAX_MHZ * 1e6)     # 1 engine, 1 result/cycle
+    for r in rows:
+        name, _cpu_ns, gpu_ns, _glu_ns = r
+        if gpu_ns is None or gpu_ns <= 0:
+            continue
+        n_engines = max(1, int(round(glu_single_ns / gpu_ns)))
+        frac_u250 = n_engines * 0.2                # ~0.2% XCU250 LUTs per engine
+        print(f"    {name:<14} GPU {gpu_ns:>6.2f} ns → "
+              f"{n_engines:>4d} GLU engines  (~{frac_u250:.1f}% of XCU250)")
+
     print("\n  Interpretation:")
     print("    Same CORDIC math on three substrates. CPU carries FP throughput")
     print("    via AVX2 shift-add. GPU routes transcendentals through SFUs that")
     print("    sit idle during MAC-heavy tensor work. GLU is the theoretical")
     print("    endpoint — custom RTL with no instruction fetch, no decode,")
-    print("    one CORDIC iteration per clock.")
+    print("    one CORDIC iteration per clock, ZERO multipliers (see rtl/).")
 
 
 if __name__ == "__main__":
