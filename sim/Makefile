@@ -73,14 +73,29 @@ gemm: gemm-cosim
 GEMM_N ?= 4
 GEMM_K ?= 1
 
+# Config stamp: rewritten only when GEMM_N/GEMM_K actually change (thanks
+# to the cmp -s compare). Downstream targets (TB binary, vector files)
+# depend on this, so changing GEMM_N on the make command line correctly
+# forces a rebuild — without spuriously rebuilding when values haven't
+# changed.
+.PHONY: .force-config
+.force-config:
+
+.gemm-config: .force-config
+	@printf 'N=%s K=%s\n' '$(GEMM_N)' '$(GEMM_K)' > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then \
+	   mv $@.tmp $@ ; \
+	   echo "  [config] GEMM_N=$(GEMM_N) GEMM_K=$(GEMM_K)"; \
+	 else rm $@.tmp; fi
+
 gemm-vectors: gemm_weights.hex gemm_input.hex gemm_golden.hex
 
-gemm_weights.hex gemm_input.hex gemm_golden.hex: gen_gemm_vectors.py
+gemm_weights.hex gemm_input.hex gemm_golden.hex: gen_gemm_vectors.py .gemm-config
 	$(PYTHON) gen_gemm_vectors.py --n $(GEMM_N) --k $(GEMM_K)
 
 gemm-rtl: rtl_gemm_outputs.hex
 
-tb_rac_systolic_array: tb_rac_systolic_array.v \
+tb_rac_systolic_array: tb_rac_systolic_array.v .gemm-config \
                        $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
 	$(IVERILOG) -PN=$(GEMM_N) -PK=$(GEMM_K) -o $@ tb_rac_systolic_array.v \
 	  $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
@@ -116,4 +131,5 @@ clean:
 	      gemm_weights.hex gemm_input.hex gemm_input_batch.hex \
 	      gemm_golden.hex gemm.csv \
 	      rtl_gemm_outputs.hex ref_gemm_outputs.hex \
+	      .gemm-config \
 	      $(LUT_MEMS)
