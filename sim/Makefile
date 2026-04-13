@@ -97,7 +97,12 @@ gemm-rtl: rtl_gemm_outputs.hex
 
 tb_rac_systolic_array: tb_rac_systolic_array.v .gemm-config \
                        $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
-	$(IVERILOG) -PN=$(GEMM_N) -PK=$(GEMM_K) -o $@ tb_rac_systolic_array.v \
+	# iverilog -P requires the fully-qualified module.param form.
+	# `-PN=16` (no module prefix) is silently ignored — don't ask how
+	# that took me an hour to notice.
+	$(IVERILOG) -Ptb_rac_systolic_array.N=$(GEMM_N) \
+	            -Ptb_rac_systolic_array.K=$(GEMM_K) \
+	            -o $@ tb_rac_systolic_array.v \
 	  $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
 
 rtl_gemm_outputs.hex: tb_rac_systolic_array \
