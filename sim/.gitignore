@@ -1,0 +1,16 @@
+# Generated test vectors + outputs
+test_vectors.hex
+golden.hex
+vectors.csv
+rtl_outputs.hex
+ref_outputs.hex
+
+# Local symlinks to rtl/*.mem
+cordic_coarse_lut.mem
+cordic_atanh.mem
+
+# Build artifacts
+tb_rac_dsp
+rac_dsp_ref
+*.o
+*.vcd
