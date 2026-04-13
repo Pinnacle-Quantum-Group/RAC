@@ -26,5 +26,6 @@ tb_rac_dsp
 rac_dsp_ref
 tb_rac_systolic_array
 rac_systolic_ref
+librac_dsp_core.so
 *.o
 *.vcd

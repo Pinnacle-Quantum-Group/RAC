@@ -147,3 +147,26 @@ void rac_dsp_eval(rac_q_t x_in, rac_q_t y_in, rac_q_t z_in, int op,
 
     *x_out = x; *y_out = y; *z_out = z;
 }
+
+/* ── Batch helpers for efficient benchmarking ─────────────────────── */
+
+void rac_dsp_project_batch(int n,
+                           const rac_q_t *xs, const rac_q_t *zs,
+                           rac_q_t       *x_out) {
+    rac_q_t xo, yo, zo;
+    for (int i = 0; i < n; i++) {
+        rac_dsp_eval(xs[i], 0, zs[i], /*project*/ 1, &xo, &yo, &zo);
+        x_out[i] = xo;
+    }
+}
+
+rac_q_t rac_dsp_project_sum(int n,
+                            const rac_q_t *xs, const rac_q_t *zs) {
+    rac_q_t sum = 0;
+    rac_q_t xo, yo, zo;
+    for (int i = 0; i < n; i++) {
+        rac_dsp_eval(xs[i], 0, zs[i], /*project*/ 1, &xo, &yo, &zo);
+        sum += xo;
+    }
+    return sum;
+}

@@ -20,7 +20,8 @@ PYTHON   := python3
 LUT_MEMS := cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem
 
 .PHONY: all vectors rtl ref cosim clean deps \
-        gemm gemm-vectors gemm-rtl gemm-ref gemm-cosim
+        gemm gemm-vectors gemm-rtl gemm-ref gemm-cosim \
+        lib
 
 all: cosim
 
@@ -56,6 +57,15 @@ ref: ref_outputs.hex
 
 rac_dsp_ref: rac_dsp_ref.c rac_dsp_core.c rac_dsp_core.h
 	$(CC) $(CFLAGS) -o $@ rac_dsp_ref.c rac_dsp_core.c -lm
+
+# ── Shared library for Python ctypes consumers (bench_three_paths.py) ──
+# Provides rac_dsp_eval, rac_dsp_project_batch, rac_dsp_project_sum, and
+# rac_load_all_roms so in-process timing in Python can avoid the
+# per-call subprocess-spawn overhead of the rac_dsp_ref CLI binary.
+lib: librac_dsp_core.so
+
+librac_dsp_core.so: rac_dsp_core.c rac_dsp_core.h
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ rac_dsp_core.c -lm
 
 ref_outputs.hex: rac_dsp_ref test_vectors.hex $(LUT_MEMS)
 	./rac_dsp_ref test_vectors.hex cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem > $@
@@ -131,6 +141,7 @@ gemm-cosim: rtl_gemm_outputs.hex gemm_golden.hex ref_gemm_outputs.hex
 # ── Cleanup ────────────────────────────────────────────────────────────
 clean:
 	rm -f tb_rac_dsp rac_dsp_ref tb_rac_systolic_array rac_systolic_ref \
+	      librac_dsp_core.so \
 	      test_vectors.hex golden.hex vectors.csv \
 	      rtl_outputs.hex ref_outputs.hex \
 	      gemm_weights.hex gemm_input.hex gemm_input_batch.hex \

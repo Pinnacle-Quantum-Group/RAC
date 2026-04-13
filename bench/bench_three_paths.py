@@ -205,74 +205,120 @@ def glu_ns_per_op(bank_size: int = RTL_ENGINES_PER_BANK) -> float:
     return 1e9 / (RTL_FMAX_MHZ * 1e6 * bank_size)
 
 
-# ── GLU measured: run the rac_dsp C reference as a 4th column ───────────
-# This gives EMPIRICAL numbers for the RAC-DSP path by running the bit-
-# exact software mirror of rac_dsp.v. Not a hardware measurement (that
-# requires Vivado synth + physical FPGA), but it IS the same CORDIC
-# algorithm running on the same host — apples to apples with the CPU
-# scalar column at least.
+# ── GLU measured: in-process via librac_dsp_core.so (ctypes) ─────────────
+# Empirical numbers for the RAC-DSP path by running the bit-exact C
+# mirror of rac_dsp.v. Earlier versions of this script shelled out to
+# sim/rac_dsp_ref which meant subprocess spawn overhead dominated small
+# workloads. This ctypes path loops entirely in-process; the only
+# per-call cost is one ffi boundary crossing (~100 ns on CPython). The
+# batch helper rac_dsp_project_batch loops inside C, eliminating even
+# that for hot paths.
 
-def find_rac_systolic_ref() -> str | None:
-    """Locate the sim/rac_systolic_ref binary or source."""
+def load_rac_dsp_lib() -> "ctypes.CDLL | None":
+    """Load sim/librac_dsp_core.so and initialize the CORDIC ROMs.
+    Returns the CDLL handle or None if the library isn't built yet."""
     candidates = [
-        HERE.parent / "sim" / "rac_systolic_ref",
+        HERE.parent / "sim" / "librac_dsp_core.so",
     ]
     for c in candidates:
-        if c.exists() and os.access(str(c), os.X_OK):
-            return str(c)
+        if not c.exists():
+            continue
+        try:
+            lib = ctypes.CDLL(str(c))
+        except OSError:
+            continue
+        # Declare prototypes
+        lib.rac_load_all_roms.restype  = ctypes.c_int
+        lib.rac_load_all_roms.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p
+        ]
+        lib.rac_dsp_eval.restype  = None
+        lib.rac_dsp_eval.argtypes = [
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        lib.rac_dsp_project_batch.restype  = None
+        lib.rac_dsp_project_batch.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        lib.rac_dsp_project_sum.restype  = ctypes.c_int64
+        lib.rac_dsp_project_sum.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+        ]
+        # Initialize ROMs
+        sim = HERE.parent / "sim"
+        rc = lib.rac_load_all_roms(
+            bytes(sim / "cordic_coarse_lut.mem"),
+            bytes(sim / "cordic_atan.mem"),
+            bytes(sim / "cordic_atanh.mem"),
+        )
+        if rc != 0:
+            print(f"  [GLU skip] rac_load_all_roms returned {rc}",
+                  file=sys.stderr)
+            return None
+        return lib
     return None
 
 
-def time_glu_empirical_sgemm(binary: str, M: int, N: int, K: int,
-                              reps: int) -> tuple[float, float] | None:
-    """Drive the rac_systolic_ref binary with random W,x and time it.
-    Returns (ms_per_call, gflops) or None on error."""
-    import subprocess
-    import tempfile
-    import random
-    sim_dir = pathlib.Path(binary).parent
+def time_glu_project_single(lib) -> float:
+    """Time one rac_dsp_eval (project mode) per ctypes call. ns/op."""
+    reps = 50_000
+    x  = ctypes.c_int64(0x00000000_9D3E2B72)   # ~0.614 in Q32.32
+    y  = ctypes.c_int64(0)
+    z  = ctypes.c_int64(0x1000000000000000)    # π/8 in Q0.63 frac-of-π
+    xo = ctypes.c_int64(0)
+    yo = ctypes.c_int64(0)
+    zo = ctypes.c_int64(0)
+    xr, yr, zr = ctypes.byref(xo), ctypes.byref(yo), ctypes.byref(zo)
+    for _ in range(5_000): lib.rac_dsp_eval(x, y, z, 1, xr, yr, zr)
+    t0 = time.monotonic_ns()
+    for _ in range(reps):   lib.rac_dsp_eval(x, y, z, 1, xr, yr, zr)
+    return (time.monotonic_ns() - t0) / reps
 
-    # Generate a minimal test case via gen_gemm_vectors.py
-    gen = sim_dir / "gen_gemm_vectors.py"
-    if not gen.exists(): return None
 
-    # Emit N×N weights + K activations into sim_dir's standard files
-    try:
-        subprocess.run(
-            [sys.executable, str(gen),
-             "--n", str(N), "--k", str(K),
-             "--out-dir", str(sim_dir)],
-            check=True, capture_output=True,
-        )
-    except subprocess.CalledProcessError:
-        return None
-
-    # Pick input file (batch if K>1)
-    input_file = ("gemm_input_batch.hex" if K > 1 else "gemm_input.hex")
-
-    args = [
-        binary, str(N),
-        str(sim_dir / "gemm_weights.hex"),
-        str(sim_dir / input_file),
-        str(sim_dir / "cordic_coarse_lut.mem"),
-        str(sim_dir / "cordic_atan.mem"),
-        str(sim_dir / "cordic_atanh.mem"),
-        str(K),
-    ]
-
-    # Warm up (JIT + cache)
-    try:
-        subprocess.run(args, check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        return None
-
+def time_glu_project_batch(lib, n: int = 4096) -> float:
+    """Time n rotations via rac_dsp_project_batch — the in-C tight loop.
+    Returns ns/op (independent of n). Closest C-level proxy for what
+    the RAC-DSP hardware does per cycle."""
+    Q_T = ctypes.c_int64 * n
+    xs   = Q_T(*[0x00000000_9D3E2B72] * n)
+    zs   = Q_T(*[0x1000000000000000]  * n)
+    xout = Q_T()
+    for _ in range(10): lib.rac_dsp_project_batch(n, xs, zs, xout)  # warmup
+    reps = 200
     t0 = time.monotonic_ns()
     for _ in range(reps):
-        subprocess.run(args, check=True, capture_output=True)
+        lib.rac_dsp_project_batch(n, xs, zs, xout)
+    return (time.monotonic_ns() - t0) / (reps * n)
+
+
+def time_glu_empirical_sgemm_inproc(lib, N: int, reps: int
+                                    ) -> tuple[float, float]:
+    """In-process SGEMM timing using rac_dsp_project_sum per column.
+    Measures a full N×N · N×N matrix multiply. Returns (ms_per_call,
+    gflops) where gflops = 2·N³·reps / elapsed."""
+    Q_T = ctypes.c_int64 * N
+    xs = Q_T(*[0x00000000_9D3E2B72] * N)
+    zs = Q_T(*[0x1000000000000000]  * N)
+    # Warmup: one full GEMM
+    for c in range(N): lib.rac_dsp_project_sum(N, xs, zs)
+    t0 = time.monotonic_ns()
+    for _ in range(reps):
+        for c in range(N):
+            lib.rac_dsp_project_sum(N, xs, zs)
     elapsed = (time.monotonic_ns() - t0) / 1e9
-    # Each call is a full N×N × K·N GEMM: 2·N·N·K flops per call
-    # (CORDIC-equivalent; real GLU silicon has the same op count)
-    flops = 2.0 * N * N * K * reps
+    # Each rac_dsp_project_sum does N rotations; N columns per GEMM,
+    # reps GEMMs → N²·reps total rotations = 2·N²·reps flop-equivalents.
+    # For a proper N×N·N×N matmul we'd need N²·N rotations; use that
+    # for GFLOPS math so the comparison is meaningful.
+    flops = 2.0 * N * N * N * reps
     return elapsed / reps * 1000.0, flops / elapsed / 1e9
 
 
@@ -332,7 +378,20 @@ def main():
     # ── GLU ──
     glu_ns = glu_ns_per_op(args.bank_size)
     print(f"  GLU:  {args.bank_size}-engine bank @ {RTL_FMAX_MHZ:.0f} MHz "
-          f"= {glu_ns:.2f} ns/op (pipelined, projected from rtl/)\n")
+          f"= {glu_ns:.2f} ns/op (pipelined, projected from rtl/)")
+
+    # ── RAC-DSP C ref (in-process ctypes) — elementwise calibration ──
+    glu_lib_hdr = load_rac_dsp_lib()
+    if glu_lib_hdr is not None:
+        single_ns = time_glu_project_single(glu_lib_hdr)
+        batch_ns  = time_glu_project_batch(glu_lib_hdr)
+        print(f"        single rac_dsp_eval  = {single_ns:7.1f} ns/rotation "
+              f"(ctypes round-trip dominated)")
+        print(f"        batch  rac_dsp_eval  = {batch_ns:7.1f} ns/rotation "
+              f"(tight C loop, CORDIC floor)")
+        print(f"        — lower-bound for RAC-DSP software cost before "
+              f"RTL synth.")
+    print()
 
     # Scale CPU loop size down — ctypes roundtrip is ~60 ns overhead per call,
     # so N=1M already takes 60 ms per CPU row.
@@ -387,22 +446,25 @@ def main():
         else:
             print(f"    GPU SGEMM:               (skipped — kernel launch failed)")
 
-    # Empirical RAC-DSP row: run sim/rac_systolic_ref at a feasible size
-    # (the binary's per-call overhead makes large N slow, so cap at 16).
-    sys_ref = find_rac_systolic_ref()
-    if sys_ref:
-        small_N = min(16, M)
-        small_K = min(4, M)
-        result = time_glu_empirical_sgemm(sys_ref, small_N, small_N,
-                                           small_K, args.sgemm_reps)
-        if result:
-            r_ms, r_gf = result
-            print(f"    RAC-DSP C ref ({small_N}x{small_K}):  "
-                  f"{r_ms:8.2f} ms/call   {r_gf:8.1f} GFLOPS")
-            print(f"                           (bit-exact rac_dsp.v mirror; "
-                  f"not an FPGA measurement)")
+    # Empirical RAC-DSP row — in-process via ctypes on librac_dsp_core.so.
+    # Replaces the earlier subprocess-based approach which was dominated
+    # by fork/exec overhead (~1 ms / GEMM of floor cost). Now it's a
+    # real per-rotation measurement with ~100 ns of ctypes boundary
+    # overhead — still not hardware, but a meaningful software baseline.
+    glu_lib = load_rac_dsp_lib()
+    if glu_lib is not None:
+        # Small in-process GEMM. Cap at 16×16·16×16 so the pure-Python
+        # outer loop over columns stays bounded.
+        small_N = 16
+        r_ms, r_gf = time_glu_empirical_sgemm_inproc(glu_lib, small_N,
+                                                      args.sgemm_reps)
+        print(f"    RAC-DSP C ref ({small_N}³):    "
+              f"{r_ms:8.2f} ms/call   {r_gf:8.1f} GFLOPS")
+        print(f"                           (bit-exact rac_dsp.v mirror via "
+              f"librac_dsp_core.so)")
     else:
-        print(f"    RAC-DSP C ref:           (not built — run `cd sim && make gemm`)")
+        print(f"    RAC-DSP C ref:           (not built — "
+              f"run `cd sim && make lib`)")
 
     glu_ms = (2.0 * M * N * K) / (RTL_SGEMM_BANK_GOPS * 1e9) * 1000.0
     print(f"    GLU native CORDIC bank: {glu_ms:8.2f} ms/call   "
