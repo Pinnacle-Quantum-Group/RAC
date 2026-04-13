@@ -34,7 +34,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 def q3232(f: float) -> int:
-    """Convert float to signed 64-bit Q32.32 integer (round-half-even)."""
+    """Convert float to signed 64-bit Q32.32 integer (round-half-even).
+    Used for x_in, y_in, x_gold, y_gold (Cartesian coordinates)."""
     scaled = round(f * (1 << 32))
     # Clamp to int64 range
     if scaled >  (1 << 63) - 1: scaled =  (1 << 63) - 1
@@ -43,6 +44,16 @@ def q3232(f: float) -> int:
     if scaled < 0:
         scaled = scaled + (1 << 64)
     return scaled & ((1 << 64) - 1)
+
+
+def q063_frac_pi(theta: float) -> int:
+    """Convert angle in radians to signed 64-bit Q0.63 fraction-of-π.
+    z_signed_int / 2^63 = θ / π. Used for z_in (and z_gold = 0 after
+    rotation drives z to zero in RAC-DSP's encoding)."""
+    scaled = round(theta / math.pi * (1 << 63))
+    # Wrap mod 2^64 so θ just beyond ±π maps to the opposite extreme
+    scaled &= (1 << 64) - 1
+    return scaled
 
 
 def from_q3232(u: int) -> float:
@@ -83,10 +94,10 @@ def make_case(op: int, x: float, y: float, theta: float) -> dict:
         "op":      op,
         "x_in":    q3232(x_pre),
         "y_in":    q3232(y_pre),
-        "z_in":    q3232(theta),
+        "z_in":    q063_frac_pi(theta),   # Q0.63 fraction-of-π
         "x_gold":  q3232(gx),
         "y_gold":  q3232(gy),
-        "z_gold":  q3232(gz),
+        "z_gold":  q063_frac_pi(gz),      # z drives to 0, same encoding
         "x_f":     x, "y_f": y, "theta_f": theta,
         "gx_f":    gx, "gy_f": gy,
     }

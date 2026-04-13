@@ -89,22 +89,38 @@ def main():
             f.write(f"{d:0{hex_digits}x}\n")
     print(f"wrote {lut_path} ({lut_size} entries)")
 
-    # ── Residual atanh constants (Q32.32) ──────────────────────────────
-    # Shift i runs from args.residual_start to residual_start + residual - 1.
+    # ── atan / atanh ROMs in Q0.63 fraction-of-π ───────────────────────
+    # Encoding: stored value × π = angle in radians.
+    #   q = round(atan(2^-i) / π · 2^63)
+    # The z-pipeline inside rac_dsp operates in this fraction-of-π scale;
+    # keeping the constants in the same units is what makes the whole
+    # CORDIC multiplier-free at the gate level.
+
+    def q063_frac_pi(x: float) -> int:
+        scaled = int(round(x / math.pi * (1 << 63)))
+        if scaled < 0:
+            scaled += (1 << 64)
+        return scaled & ((1 << 64) - 1)
+
+    # Circular atan ROM — sized to cover both coarse and residual.
+    atan_rom_size = args.residual_start + args.residual
+    atan_path = out_dir / "cordic_atan.mem"
+    with open(atan_path, "w") as f:
+        f.write("// rac_dsp circular atan constants — Q0.63 fraction-of-π\n")
+        f.write(f"// {atan_rom_size} entries, one per iter (shift = index)\n")
+        f.write("// stored_value * π = atan(2^-i) in radians\n")
+        for i in range(atan_rom_size):
+            f.write(f"{q063_frac_pi(math.atan(2.0 ** -i)):016x}\n")
+    print(f"wrote {atan_path} ({atan_rom_size} entries, shifts 0..{atan_rom_size-1})")
+
+    # Residual atanh ROM — Walther hyperbolic, same fraction-of-π units.
     atanh_path = out_dir / "cordic_atanh.mem"
-    one_q = 1 << 32
     with open(atanh_path, "w") as f:
-        f.write(f"// rac_dsp residual atanh constants, Q32.32 signed\n")
+        f.write("// rac_dsp residual atanh constants — Q0.63 fraction-of-π\n")
         f.write(f"// residual_start={args.residual_start} residual={args.residual}\n")
-        f.write(f"// shifts: {args.residual_start}..{args.residual_start + args.residual - 1}\n")
         for stage in range(args.residual):
             shift = args.residual_start + stage
-            v = math.atanh(2.0 ** -shift)
-            q = int(round(v * one_q))
-            # 64-bit signed → 16 hex chars
-            if q < 0:
-                q = (1 << 64) + q
-            f.write(f"{q:016x}\n")
+            f.write(f"{q063_frac_pi(math.atanh(2.0 ** -shift)):016x}\n")
     print(f"wrote {atanh_path} ({args.residual} entries, shifts {args.residual_start}..{args.residual_start+args.residual-1})")
 
     # ── Summary ────────────────────────────────────────────────────────

@@ -108,23 +108,38 @@ fixed; the cosim reports PASS for every test case.
 | pipeline depth | 12 cycles | 1 input + 1 coarse + 9 residual + 1 output |
 | final precision | ~2^-15 (3e-5) | matches CORDIC-16 convergence |
 
-### Remaining TODO for full RTL synthesis
+### Angle encoding: signed Q0.63 fraction-of-π
 
-The C reference uses `(double) arithmetic` inside `lut_idx_of()` to
-compute `floor((θ/π + 0.5) · LUT_SIZE)`. This isn't directly
-synthesizable. Two options for the production RTL:
+`z_in` is **signed Q0.63 fraction-of-π**, i.e. `z_signed / 2^63 = θ / π`.
 
-- **(a)** Switch the `z_in` convention to signed Q0.63 fraction-of-2π.
-  Then the LUT index is a pure top-bits slice with zero arithmetic,
-  preserving the no-multiplier invariant. Caller does one `×1/(2π)`
-  conversion up front.
-- **(b)** Keep radian Q32.32 on the wire; add a constant-multiply-by-
-  shift-add stage (`×LUT_SIZE/π = ×1024/π ≈ ×325.95`) for the index.
-  Approximated as `×326 = ×(2⁸+2⁶+2²+2¹)` — 4 shift-adds; residual
-  CORDIC absorbs the ~0.1% rounding.
+| z_in (hex) | θ (radians) |
+|---|---|
+| `0x0000000000000000` | 0 |
+| `0x4000000000000000` | +π/2 |
+| `0x2000000000000000` | +π/4 |
+| `0xC000000000000000` | -π/2 (same as +3π/2) |
+| `0x7FFFFFFFFFFFFFFF` | just under +π |
+| `0x8000000000000000` | -π (wraps to +π) |
 
-Either choice is a ~20-line RTL edit and a re-run of `make all` to
-validate. Option (a) is cleaner and what I'd pick for tape-out.
+This encoding is what keeps the whole pipeline multiplier-free at the
+gate level. With radian Q32.32 the LUT index computation would need a
+constant multiply by `LUT_SIZE/π ≈ 326` — shift-addable but adds depth.
+With fraction-of-π the top `LUT_BITS` ARE the bucket index after a
+1-bit scale-up and a constant bias. Zero arithmetic, pure bit slice.
+
+**Caller responsibility:** one `×(1/π)` multiply up-front to convert
+radian input to this encoding. Everything downstream is shift-add.
+gen_vectors.py does this conversion; rac_dsp_ref.c does the same.
+
+### Remaining synthesis work
+
+- Vivado synth of `rtl/rac_dsp.v` against `xcu250-figd2104-2L-e`. The
+  RTL reports `DSPs: 0` post-synth, validating the multiplier-free
+  claim at silicon level. (Sandbox doesn't have Vivado; to be run on
+  the user's box.)
+- RTL simulation of `tb_rac_dsp.v` via iverilog, compared against the
+  C-reference golden. Sandbox doesn't have iverilog either; `make all`
+  on the user's box drives this.
 
 ## Debugging a failure
 

@@ -63,37 +63,42 @@ static inline q_t asr(q_t v, int n) {
     return ~(((qu_t)~v) >> n);
 }
 
-/* Q32.32 constants */
-#define PI_Q         ((q_t)0x00000003243F6A88LL)
-#define HALF_PI_Q    ((q_t)0x00000001921FB544LL)
-#define TWO_PI_Q     ((q_t)0x00000006487ED510LL)
+/*
+ * z is now SIGNED Q0.63 fraction-of-π:
+ *   z_signed / 2^63 = θ / π
+ * Full signed range [-2^63, +2^63) ↔ [-π, +π).
+ * Quadrant fold: flip iff z[63] XOR z[62] == 1 (angle in Q2 or Q3);
+ * fold operation is XOR with 2^63 (toggle MSB, shifts θ by ±π).
+ *
+ * x/y remain Q32.32 signed (Cartesian coordinates, not angles).
+ */
+#define SIGN_BIT_64  ((q_t)0x8000000000000000LL)
 
-/* Quadrant fold: reduce z to (-π/2, +π/2], flipping (x, y) when needed. */
+/* Quadrant fold (Q0.63 fraction-of-π):
+ *   Condition: z[63] XOR z[62] == 1 (angle in quadrant 2 or 3)
+ *   Action:    z XOR 2^63 (toggle MSB → shifts θ by ±π, auto-wraps)
+ *              Flip (x, y) sign simultaneously. */
 static void quadrant_fold(q_t *x, q_t *y, q_t *z) {
-    q_t zz = *z;
-    if (zz >  PI_Q)      zz -= TWO_PI_Q;
-    if (zz < -PI_Q)      zz += TWO_PI_Q;
-    int flip = 0;
-    if (zz >  HALF_PI_Q) { zz -= PI_Q; flip = 1; }
-    if (zz < -HALF_PI_Q) { zz += PI_Q; flip = 1; }
-    if (flip) { *x = -*x; *y = -*y; }
-    *z = zz;
+    uint64_t uz = (uint64_t)*z;
+    int msb    = (int)((uz >> 63) & 1u);
+    int next   = (int)((uz >> 62) & 1u);
+    if (msb ^ next) {
+        *z = (q_t)(uz ^ (uint64_t)SIGN_BIT_64);
+        *x = -*x;
+        *y = -*y;
+    }
 }
 
-/* LUT index: map Q32.32 radian angle to one of LUT_SIZE buckets covering
- * [-π/2, +π/2]. For a synthesizable RTL implementation this needs a
- * shift-add decomposition of (LUT_SIZE / π) — that's a TODO in
- * rac_dsp.v. For the C reference we use a plain float conversion,
- * which establishes the mathematical contract.
- *
- * Bucket k covers [(k-LUT_SIZE/2)·π/LUT_SIZE,  (k-LUT_SIZE/2+1)·π/LUT_SIZE].
- * So idx = floor((theta + π/2) / (π/LUT_SIZE)) = floor((theta/π + 0.5) * LUT_SIZE). */
+/* LUT index (pure bit slice, no libm, no multiply):
+ *   z_folded is Q0.63 fraction-of-π, in (-2^62, 2^62].
+ *   Shift left 1 bit → z_scaled spans (-2^63, 2^63], top LUT_BITS
+ *   give a signed [-LUT_SIZE/2, LUT_SIZE/2-1]. Bias by LUT_SIZE/2
+ *   for unsigned [0, LUT_SIZE). */
 static int lut_idx_of(q_t z_folded) {
-    double theta = (double)z_folded / (double)(1LL << 32);
-    double frac  = theta / M_PI + 0.5;                /* [0, 1] for θ ∈ [-π/2, π/2] */
-    int    idx   = (int)floor(frac * LUT_SIZE);
-    if (idx < 0)          idx = 0;
-    if (idx >= LUT_SIZE)  idx = LUT_SIZE - 1;
+    q_t z_scaled = z_folded << 1;
+    /* Extract top LUT_BITS as signed int: sign-extending arithmetic shift. */
+    int idx_signed = (int)(asr(z_scaled, WIDTH - LUT_BITS));
+    int idx = (idx_signed + LUT_SIZE / 2) & (LUT_SIZE - 1);
     return idx;
 }
 
@@ -119,16 +124,9 @@ static int load_hex_lut(const char *path, uint64_t *out, int expected) {
 
 /* Globals loaded at startup */
 static uint64_t coarse_lut[LUT_SIZE];
-static q_t      atanh_tab[RESIDUAL];
-
-/* Per-iteration circular-CORDIC atan constants, Q32.32.
- *   atan(2^-i) at small i is computed via libm; cached so the hot
- *   loop doesn't repeat the atan() call. */
-static q_t atan_circ_coarse(int i) {
-    /* tangent of a power-of-two — exact enough for spec purposes. */
-    double a = atan(ldexp(1.0, -i));
-    return (q_t)round(a * (double)(1LL << 32));
-}
+#define ATAN_ROM_SIZE (RESIDUAL_START + RESIDUAL)
+static q_t      atan_rom [ATAN_ROM_SIZE];    /* Q0.63 fraction-of-π */
+static q_t      atanh_tab[RESIDUAL];         /* Q0.63 fraction-of-π */
 
 /* One rac_dsp CGLUT evaluation at full precision.
  *
@@ -159,9 +157,9 @@ static void dsp_eval(q_t x_in, q_t y_in, q_t z_in, int op,
         uint64_t d_vec = coarse_lut[idx];
         for (int i = 0; i < LUT_BITS; i++) {
             int d_pos = ((d_vec >> i) & 1u) == 1u;
-            q_t y_sh = asr(y, i);
-            q_t x_sh = asr(x, i);
-            q_t atan_i = atan_circ_coarse(i);
+            q_t y_sh  = asr(y, i);
+            q_t x_sh  = asr(x, i);
+            q_t atan_i = atan_rom[i];       /* Q0.63 fraction-of-π */
             if (d_pos) {
                 q_t xn = x - y_sh;
                 q_t yn = y + x_sh;
@@ -186,7 +184,7 @@ static void dsp_eval(q_t x_in, q_t y_in, q_t z_in, int op,
         q_t x_sh = asr(x, phys);
         q_t y_sh = asr(y, phys);
         q_t atan_const =
-            hyperbolic ? atanh_tab[i] : atan_circ_coarse(phys);
+            hyperbolic ? atanh_tab[i] : atan_rom[phys];
 
         q_t x_next, y_next, z_next;
         if (hyperbolic) {
@@ -203,14 +201,18 @@ static void dsp_eval(q_t x_in, q_t y_in, q_t z_in, int op,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s test_vectors.hex coarse_lut.mem atanh.mem\n",
-                argv[0]);
+    if (argc < 5) {
+        fprintf(stderr,
+            "usage: %s test_vectors.hex coarse_lut.mem atan.mem atanh.mem\n",
+            argv[0]);
         return 1;
     }
     if (load_hex_lut(argv[2], coarse_lut, LUT_SIZE) < 0) return 2;
+    uint64_t atan_u[ATAN_ROM_SIZE];
+    if (load_hex_lut(argv[3], atan_u, ATAN_ROM_SIZE) < 0) return 3;
+    for (int i = 0; i < ATAN_ROM_SIZE; i++) atan_rom[i] = (q_t)atan_u[i];
     uint64_t atanh_u[RESIDUAL];
-    if (load_hex_lut(argv[3], atanh_u, RESIDUAL) < 0) return 3;
+    if (load_hex_lut(argv[4], atanh_u, RESIDUAL) < 0) return 4;
     for (int i = 0; i < RESIDUAL; i++) atanh_tab[i] = (q_t)atanh_u[i];
 
     FILE *vf = fopen(argv[1], "r");
