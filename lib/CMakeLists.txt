@@ -25,12 +25,16 @@ option(RAC_AVX2   "Enable AVX2/FMA intrinsics" ON)
 
 # ── Core C library ──────────────────────────────────────────────────────
 
-add_library(rac SHARED c/rac_cpu.c c/rac_alu.c c/rac_ucode.c c/rac_xrac.c c/rac_q8_0.c)
+set(RAC_CORE_SOURCES
+    c/rac_cpu.c c/rac_alu.c c/rac_ucode.c c/rac_xrac.c c/rac_q8_0.c
+    c/rac_blas_l1.c c/rac_blas_l2.c c/rac_blas_l3.c)
+
+add_library(rac SHARED ${RAC_CORE_SOURCES})
 target_include_directories(rac PUBLIC c/)
 target_link_libraries(rac m)
 target_compile_options(rac PRIVATE -O3 -march=native -Wall -Wextra)
 
-add_library(rac_static STATIC c/rac_cpu.c c/rac_alu.c c/rac_ucode.c c/rac_xrac.c c/rac_q8_0.c)
+add_library(rac_static STATIC ${RAC_CORE_SOURCES})
 target_include_directories(rac_static PUBLIC c/)
 target_link_libraries(rac_static m)
 target_compile_options(rac_static PRIVATE -O3 -march=native -Wall -Wextra)
@@ -58,7 +62,7 @@ if(RAC_AVX2)
 
     if(HAS_AVX2 AND HAS_FMA)
         enable_language(ASM)
-        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c c/rac_hal.c c/rac_q8_0.c c/rac_zen3_kern.S c/rac_avx512_kern.S)
+        add_library(rac_avx2 SHARED c/rac_cpu.c c/rac_avx2.c c/rac_hal.c c/rac_q8_0.c c/rac_zen3_kern.S c/rac_avx512_kern.S c/rac_blas_l1.c c/rac_blas_l2.c c/rac_blas_l3.c)
         target_include_directories(rac_avx2 PUBLIC c/)
         target_compile_options(rac_avx2 PRIVATE -O3 -mavx2 -mfma -march=native -Wall)
         target_link_libraries(rac_avx2 m)
@@ -118,6 +122,24 @@ if(TARGET rac_avx2)
     target_include_directories(test_rac_threads PRIVATE c/)
     target_link_libraries(test_rac_threads rac_avx2 m)
 endif()
+
+# RAC BLAS BVT — Levels 1, 2, 3. Each is a self-contained executable
+# linked against rac_static (which now bundles rac_blas_l1/l2/l3.c into
+# the core library). Tolerances: 1e-5 (L1), 1e-4 (L2), 1e-3 (L3).
+add_executable(test_rac_blas_l1 c/test_rac_blas_l1.c)
+target_include_directories(test_rac_blas_l1 PRIVATE c/)
+target_link_libraries(test_rac_blas_l1 rac_static m)
+add_test(NAME rac_blas_l1_bvt COMMAND test_rac_blas_l1)
+
+add_executable(test_rac_blas_l2 c/test_rac_blas_l2.c)
+target_include_directories(test_rac_blas_l2 PRIVATE c/)
+target_link_libraries(test_rac_blas_l2 rac_static m)
+add_test(NAME rac_blas_l2_bvt COMMAND test_rac_blas_l2)
+
+add_executable(test_rac_blas_l3 c/test_rac_blas_l3.c)
+target_include_directories(test_rac_blas_l3 PRIVATE c/)
+target_link_libraries(test_rac_blas_l3 rac_static m)
+add_test(NAME rac_blas_l3_bvt COMMAND test_rac_blas_l3)
 
 # RAC Adder + ALU BVT. rac_alu.c contains an AVX2+FMA fast path that
 # is compiled in automatically when -mavx2 -mfma are enabled via
@@ -221,7 +243,7 @@ add_test(NAME physics_bvt COMMAND test_rac_physics_bvt)
 
 install(TARGETS rac rac_static DESTINATION lib)
 install(TARGETS rac_physics rac_physics_static DESTINATION lib)
-install(FILES c/rac_cpu.h c/rac_alu.h c/rac_ucode.h c/rac_xrac.h c/rac_avx2.h c/rac_q8_0.h c/rac_physics.h DESTINATION include/rac)
+install(FILES c/rac_cpu.h c/rac_alu.h c/rac_ucode.h c/rac_xrac.h c/rac_avx2.h c/rac_q8_0.h c/rac_physics.h c/rac_blas.h DESTINATION include/rac)
 if(TARGET rac_avx2)
     install(TARGETS rac_avx2 DESTINATION lib)
 endif()
