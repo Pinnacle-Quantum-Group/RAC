@@ -28,6 +28,7 @@ pub mod cordic;
 pub mod matmul;
 pub mod activation;
 pub mod transformer;
+pub mod blas;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
@@ -40,6 +41,7 @@ pub use cordic::{rotate_n, project_n, polar_n, sincos, rsqrt, sigmoid};
 pub use matmul::{sgemm, matmul, fused_linear};
 pub use activation::{Activation, relu, gelu, silu, softmax_batch};
 pub use transformer::{layernorm, rmsnorm, rope_cache, rope_apply, scaled_dot_attention};
+pub use blas::{Op as BlasOp, UpLo as BlasUpLo, Diag as BlasDiag, Side as BlasSide};
 
 /// CORDIC constants
 pub const K_INV: f32 = 0.60725;
