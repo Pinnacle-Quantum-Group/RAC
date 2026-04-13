@@ -28,18 +28,26 @@ def atan(x):
 
 
 def cordic_dirs_for_angle(target: float, n_iters: int) -> int:
-    """Return an n_iters-bit int whose bit i is the d_i direction a
-    CORDIC rotation driver would take to approximate `target` starting
-    from z=0. d=1 means +1 (z decreases by atan(2^-i)); d=0 means -1."""
-    z = 0.0
+    """Return an n_iters-bit int encoding the CORDIC direction sequence
+    that rotates a vector by `target` radians.
+
+    CORDIC rotation-mode convention: z starts at `target` and is driven
+    toward zero. At iter i we pick d_i = sign(z) and update
+    z ← z - d_i · atan(2^-i). Bit i of the returned int is 1 iff d_i = +1.
+
+    Applying the same direction bits to (x, y) via
+        d = +1:  x' = x - y·2^-i,  y' = y + x·2^-i
+        d = -1:  x' = x + y·2^-i,  y' = y - x·2^-i
+    rotates (x, y) by `target` radians (with the standard CORDIC K gain)."""
+    z = target
     bits = 0
     for i in range(n_iters):
         step = atan(2 ** -i)
-        if z < target:
-            z += step
+        if z >= 0.0:
+            z -= step
             bits |= (1 << i)
         else:
-            z -= step
+            z += step
     return bits
 
 
