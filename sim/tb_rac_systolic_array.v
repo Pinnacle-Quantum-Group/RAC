@@ -48,13 +48,24 @@ module tb_rac_systolic_array;
     reg  [$clog2(N*N)-1:0]       weight_addr;
     reg  signed [WIDTH-1:0]      weight_angle;
 
-    // Activation
+    // Activation — TB keeps the unpacked-array convenience view;
+    // we pack/unpack into the module's flattened port at the boundary.
     reg                          x_valid_in;
     reg  signed [WIDTH-1:0]      x_in  [0:N-1];
+    wire [N*WIDTH-1:0]           x_in_flat;
+    genvar _pk;
+    generate for (_pk = 0; _pk < N; _pk = _pk + 1) begin : pack_x_in
+        assign x_in_flat[(_pk+1)*WIDTH-1 -: WIDTH] = x_in[_pk];
+    end endgenerate
 
     // Result
     wire                         y_valid_out;
+    wire [N*WIDTH-1:0]           y_out_flat;
     wire signed [WIDTH-1:0]      y_out [0:N-1];
+    genvar _uu;
+    generate for (_uu = 0; _uu < N; _uu = _uu + 1) begin : unpack_y_out
+        assign y_out[_uu] = $signed(y_out_flat[(_uu+1)*WIDTH-1 -: WIDTH]);
+    end endgenerate
 
     rac_systolic_array #(
         .N         (N),
@@ -68,9 +79,9 @@ module tb_rac_systolic_array;
         .weight_addr  (weight_addr),
         .weight_angle (weight_angle),
         .x_valid_in   (x_valid_in),
-        .x_in         (x_in),
+        .x_in         (x_in_flat),
         .y_valid_out  (y_valid_out),
-        .y_out        (y_out)
+        .y_out        (y_out_flat)
     );
 
     // ── Vector storage ───────────────────────────────────────────────
