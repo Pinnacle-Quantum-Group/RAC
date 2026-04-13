@@ -71,17 +71,18 @@ cosim: rtl_outputs.hex golden.hex
 gemm: gemm-cosim
 
 GEMM_N ?= 4
+GEMM_K ?= 1
 
 gemm-vectors: gemm_weights.hex gemm_input.hex gemm_golden.hex
 
 gemm_weights.hex gemm_input.hex gemm_golden.hex: gen_gemm_vectors.py
-	$(PYTHON) gen_gemm_vectors.py --n $(GEMM_N)
+	$(PYTHON) gen_gemm_vectors.py --n $(GEMM_N) --k $(GEMM_K)
 
 gemm-rtl: rtl_gemm_outputs.hex
 
 tb_rac_systolic_array: tb_rac_systolic_array.v \
                        $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
-	$(IVERILOG) -o $@ tb_rac_systolic_array.v \
+	$(IVERILOG) -PN=$(GEMM_N) -PK=$(GEMM_K) -o $@ tb_rac_systolic_array.v \
 	  $(RTL_DIR)/rac_systolic_array.v $(RTL_DIR)/rac_dsp.v
 
 rtl_gemm_outputs.hex: tb_rac_systolic_array \
@@ -93,10 +94,16 @@ gemm-ref: ref_gemm_outputs.hex
 rac_systolic_ref: rac_systolic_ref.c rac_dsp_core.c rac_dsp_core.h
 	$(CC) $(CFLAGS) -o $@ rac_systolic_ref.c rac_dsp_core.c -lm
 
+# Pick batch file when K > 1, else single-vector
 ref_gemm_outputs.hex: rac_systolic_ref \
                      gemm_weights.hex gemm_input.hex $(LUT_MEMS)
-	./rac_systolic_ref $(GEMM_N) gemm_weights.hex gemm_input.hex \
-	  cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem > $@
+	@if [ "$(GEMM_K)" -gt 1 ] && [ -f gemm_input_batch.hex ]; then \
+	  input_file=gemm_input_batch.hex; \
+	else \
+	  input_file=gemm_input.hex; \
+	fi; \
+	./rac_systolic_ref $(GEMM_N) gemm_weights.hex $$input_file \
+	  cordic_coarse_lut.mem cordic_atan.mem cordic_atanh.mem $(GEMM_K) > $@
 
 gemm-cosim: rtl_gemm_outputs.hex gemm_golden.hex ref_gemm_outputs.hex
 	$(PYTHON) cosim_gemm.py $(COSIM_ARGS)
@@ -106,6 +113,7 @@ clean:
 	rm -f tb_rac_dsp rac_dsp_ref tb_rac_systolic_array rac_systolic_ref \
 	      test_vectors.hex golden.hex vectors.csv \
 	      rtl_outputs.hex ref_outputs.hex \
-	      gemm_weights.hex gemm_input.hex gemm_golden.hex gemm.csv \
+	      gemm_weights.hex gemm_input.hex gemm_input_batch.hex \
+	      gemm_golden.hex gemm.csv \
 	      rtl_gemm_outputs.hex ref_gemm_outputs.hex \
 	      $(LUT_MEMS)

@@ -61,20 +61,26 @@ def q063_frac_pi(theta: float) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n",    type=int,               default=4)
+    ap.add_argument("--n",    type=int,               default=4,
+                    help="matrix dimension N (weights are N×N)")
+    ap.add_argument("--k",    type=int,               default=1,
+                    help="batch size K (# of input vectors). K>1 emits "
+                         "gemm_input_batch.hex with K·N values; TB runs "
+                         "a matrix-matrix multiply Y = W · X[:, 0..K-1]")
     ap.add_argument("--seed", type=lambda s: int(s,0), default=0xDEADBEEF)
     ap.add_argument("--out-dir", default=str(HERE))
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    N = args.n
+    N, K = args.n, args.k
 
     # Random W with |entries| ≤ 0.5
     W = [[rng.uniform(-0.5, 0.5) for _ in range(N)] for _ in range(N)]
-    # Random x with |entries| ≤ 0.5
-    x = [rng.uniform(-0.5, 0.5) for _ in range(N)]
-    # Golden y[c] = Σ_r W[r][c] * x[r]
-    y = [sum(W[r][c] * x[r] for r in range(N)) for c in range(N)]
+    # Random X (N × K, stored as K vectors of length N)
+    X = [[rng.uniform(-0.5, 0.5) for _ in range(N)] for _ in range(K)]
+    # Golden Y[k][c] = Σ_r W[r][c] * X[k][r]
+    Y = [[sum(W[r][c] * X[k][r] for r in range(N)) for c in range(N)]
+         for k in range(K)]
 
     out = pathlib.Path(args.out_dir)
 
@@ -84,36 +90,56 @@ def main():
         f.write("// each = Q0.63 fraction-of-π: acos(W[r][c]) / π · 2^63\n")
         for r in range(N):
             for c in range(N):
-                angle = math.acos(W[r][c])      # acos returns [0, π]
-                f.write(f"{q063_frac_pi(angle):016x}  // W[{r}][{c}]={W[r][c]:+.6f}\n")
+                angle = math.acos(W[r][c])
+                f.write(f"{q063_frac_pi(angle):016x}"
+                        f"  // W[{r}][{c}]={W[r][c]:+.6f}\n")
 
+    # Single-vector input (always written, K=1 default)
     with open(out / "gemm_input.hex", "w") as f:
-        f.write(f"// gemm input vector — N={N} entries\n")
-        f.write(f"// each = K_INV · x[r] in Q32.32 (pre-scaled for CORDIC gain)\n")
-        for r, xi in enumerate(x):
+        f.write(f"// gemm input vector — N={N} entries (first X column)\n")
+        f.write("// each = K_INV · x[r] in Q32.32 (pre-scaled for CORDIC gain)\n")
+        for r, xi in enumerate(X[0]):
             f.write(f"{q3232(xi * K_INV):016x}  // x[{r}]={xi:+.6f}\n")
 
+    # Batch input for matrix-matrix mode
+    if K > 1:
+        with open(out / "gemm_input_batch.hex", "w") as f:
+            f.write(f"// gemm batch input — K={K} vectors × N={N} entries\n")
+            f.write("// row-major (k*N + r), pre-scaled by K_INV\n")
+            for k in range(K):
+                for r, xi in enumerate(X[k]):
+                    f.write(f"{q3232(xi * K_INV):016x}"
+                            f"  // X[{k}][{r}]={xi:+.6f}\n")
+
+    # Golden output (K·N values)
     with open(out / "gemm_golden.hex", "w") as f:
-        f.write(f"// gemm golden output — N={N} entries\n")
-        f.write("// each = y[c] = Σ_r W[r][c] · x[r] in Q32.32\n")
-        for c, yc in enumerate(y):
-            f.write(f"{q3232(yc):016x}  // y[{c}]={yc:+.6f}\n")
+        f.write(f"// gemm golden output — K={K} × N={N} entries\n")
+        f.write("// each = Y[k][c] = Σ_r W[r][c] · X[k][r] in Q32.32\n")
+        for k in range(K):
+            for c, yc in enumerate(Y[k]):
+                f.write(f"{q3232(yc):016x}  // Y[{k}][{c}]={yc:+.6f}\n")
 
     with open(out / "gemm.csv", "w") as f:
-        f.write("# N=" + str(N) + "\n")
+        f.write(f"# N={N} K={K}\n")
         f.write("# weights row-major:\n")
         for r in range(N):
             f.write(",".join(f"{v:+.6f}" for v in W[r]) + "\n")
-        f.write("# input x:\n")
-        f.write(",".join(f"{v:+.6f}" for v in x) + "\n")
-        f.write("# golden y:\n")
-        f.write(",".join(f"{v:+.6f}" for v in y) + "\n")
+        f.write("# input batch (K rows, N cols):\n")
+        for k in range(K):
+            f.write(",".join(f"{v:+.6f}" for v in X[k]) + "\n")
+        f.write("# golden Y (K rows, N cols):\n")
+        for k in range(K):
+            f.write(",".join(f"{v:+.6f}" for v in Y[k]) + "\n")
 
-    print(f"  N={N}  seed={args.seed:#x}")
-    print(f"  weights:   {out / 'gemm_weights.hex'}  ({N*N} angles)")
-    print(f"  input:     {out / 'gemm_input.hex'}    ({N} values)")
-    print(f"  golden:    {out / 'gemm_golden.hex'}   ({N} values)")
-    print(f"  csv debug: {out / 'gemm.csv'}")
+    print(f"  N={N} K={K}  seed={args.seed:#x}")
+    print(f"  weights:         {out / 'gemm_weights.hex'}  ({N*N} angles)")
+    if K > 1:
+        print(f"  input (batch):   {out / 'gemm_input_batch.hex'}  "
+              f"({K*N} values = {K} × {N})")
+    print(f"  input (single):  {out / 'gemm_input.hex'}     ({N} values)")
+    print(f"  golden:          {out / 'gemm_golden.hex'}    "
+          f"({K*N} values)")
+    print(f"  csv debug:       {out / 'gemm.csv'}")
 
 
 if __name__ == "__main__":

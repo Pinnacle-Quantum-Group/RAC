@@ -56,36 +56,44 @@ int main(int argc, char **argv) {
     if (argc < 7) {
         fprintf(stderr,
             "usage: %s N weights.hex input.hex "
-            "coarse_lut.mem atan.mem atanh.mem\n",
+            "coarse_lut.mem atan.mem atanh.mem [K]\n"
+            "  If K > 1 and input.hex has K·N entries, runs matrix-matrix\n"
+            "  Y = W·X_batch; else single matrix-vector y = W·x.\n",
             argv[0]);
         return 1;
     }
     int N = atoi(argv[1]);
+    int K = (argc >= 8) ? atoi(argv[7]) : 1;
     if (N < 1 || N > 256) { fprintf(stderr, "bad N=%d\n", N); return 2; }
+    if (K < 1 || K > 256) { fprintf(stderr, "bad K=%d\n", K); return 2; }
 
     int rc = rac_load_all_roms(argv[4], argv[5], argv[6]);
     if (rc != 0) return rc + 2;
 
-    rac_q_t *W = calloc((size_t)N * N, sizeof(rac_q_t));
-    rac_q_t *x = calloc((size_t)N,     sizeof(rac_q_t));
-    rac_q_t *y = calloc((size_t)N,     sizeof(rac_q_t));
-    if (!W || !x || !y) { fprintf(stderr, "oom\n"); return 6; }
+    rac_q_t *W = calloc((size_t)N * N,     sizeof(rac_q_t));
+    rac_q_t *X = calloc((size_t)K * N,     sizeof(rac_q_t));
+    rac_q_t *Y = calloc((size_t)K * N,     sizeof(rac_q_t));
+    if (!W || !X || !Y) { fprintf(stderr, "oom\n"); return 6; }
 
     if (load_q_array(argv[2], W, N * N) < 0) {
         fprintf(stderr, "weights load failed\n"); return 7;
     }
-    if (load_q_array(argv[3], x, N) < 0) {
+    if (load_q_array(argv[3], X, K * N) < 0) {
         fprintf(stderr, "input load failed\n"); return 8;
     }
 
-    systolic_simulate(N, W, x, y);
-
-    printf("// rac_systolic_ref outputs — N=%d\n", N);
-    printf("// format: y[c] in Q32.32 signed\n");
-    for (int c = 0; c < N; c++) {
-        printf("%016" PRIx64 "\n", (uint64_t)y[c]);
+    for (int k = 0; k < K; k++) {
+        systolic_simulate(N, W, &X[k * N], &Y[k * N]);
     }
 
-    free(W); free(x); free(y);
+    printf("// rac_systolic_ref outputs — N=%d K=%d\n", N, K);
+    printf("// format: Y[k][c] in Q32.32 signed (K blocks of N)\n");
+    for (int k = 0; k < K; k++) {
+        for (int c = 0; c < N; c++) {
+            printf("%016" PRIx64 "\n", (uint64_t)Y[k * N + c]);
+        }
+    }
+
+    free(W); free(X); free(Y);
     return 0;
 }
