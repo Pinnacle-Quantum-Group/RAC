@@ -22,6 +22,13 @@ Usage:
 from __future__ import annotations
 import argparse, ctypes, os, pathlib, sys, time, warnings
 
+# ROCm / RDNA3 workaround: the stock torch ROCm wheels don't ship kernels
+# for gfx1102 (RX 7600 XT) or some newer consumer RDNA3 parts. Setting
+# HSA_OVERRIDE_GFX_VERSION re-targets the dispatch to the closest
+# supported arch (gfx1100 = RX 7900 XTX) whose kernels are ABI-compatible.
+# Must be set BEFORE `import torch`; respect any user override.
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+
 # Quiet ROCm/hipBLASLt-on-unsupported-arch spam; it's benign.
 warnings.filterwarnings(
     "ignore",
@@ -132,42 +139,55 @@ def try_load_gpu():
 
 
 def time_gpu_elementwise(torch, fn, n):
-    """Time an elementwise op on GPU across a large tensor."""
-    x = torch.randn(n, device="cuda", dtype=torch.float32)
-    torch.cuda.synchronize()
-    # warmup
-    for _ in range(3):
-        _ = fn(x)
-    torch.cuda.synchronize()
-    t0 = time.monotonic_ns()
-    for _ in range(10):
-        _ = fn(x)
-    torch.cuda.synchronize()
-    elapsed_ns = (time.monotonic_ns() - t0) / 10
-    return elapsed_ns / n   # ns/element
+    """Time an elementwise op on GPU across a large tensor.
+
+    Returns ns/element on success, None if the GPU kernel can't launch
+    (common on RDNA3 consumer cards without HSA_OVERRIDE_GFX_VERSION set
+    to a supported arch). One failing op doesn't kill the whole bench."""
+    try:
+        x = torch.randn(n, device="cuda", dtype=torch.float32)
+        torch.cuda.synchronize()
+        for _ in range(3):
+            _ = fn(x)
+        torch.cuda.synchronize()
+        t0 = time.monotonic_ns()
+        for _ in range(10):
+            _ = fn(x)
+        torch.cuda.synchronize()
+        elapsed_ns = (time.monotonic_ns() - t0) / 10
+        return elapsed_ns / n
+    except RuntimeError as e:
+        msg = str(e).splitlines()[0]
+        print(f"  [GPU skip] {msg[:80]}", file=sys.stderr)
+        return None
 
 
 def time_gpu_sgemm(torch, rac_torch, M, N, K, reps):
-    a = torch.randn(M, K, device="cuda", dtype=torch.float32)
-    b = torch.randn(K, N, device="cuda", dtype=torch.float32)
-    # RAC path if available
-    if rac_torch is not None and rac_torch._rac_available():
-        matmul = rac_torch.rac_matmul
-        tag = "rac_torch SFU"
-    else:
-        matmul = torch.matmul
-        tag = "torch.matmul (hipBLAS/cuBLAS)"
-    torch.cuda.synchronize()
-    for _ in range(3):
-        _ = matmul(a, b)
-    torch.cuda.synchronize()
-    t0 = time.monotonic_ns()
-    for _ in range(reps):
-        _ = matmul(a, b)
-    torch.cuda.synchronize()
-    elapsed = (time.monotonic_ns() - t0) / 1e9
-    gflops = 2.0 * M * N * K * reps / elapsed / 1e9
-    return elapsed / reps * 1000.0, gflops, tag
+    """Returns (ms_per_call, gflops, tag) or None on GPU kernel failure."""
+    try:
+        a = torch.randn(M, K, device="cuda", dtype=torch.float32)
+        b = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        if rac_torch is not None and rac_torch._rac_available():
+            matmul = rac_torch.rac_matmul
+            tag = "rac_torch SFU"
+        else:
+            matmul = torch.matmul
+            tag = "torch.matmul (hipBLAS/cuBLAS)"
+        torch.cuda.synchronize()
+        for _ in range(3):
+            _ = matmul(a, b)
+        torch.cuda.synchronize()
+        t0 = time.monotonic_ns()
+        for _ in range(reps):
+            _ = matmul(a, b)
+        torch.cuda.synchronize()
+        elapsed = (time.monotonic_ns() - t0) / 1e9
+        gflops = 2.0 * M * N * K * reps / elapsed / 1e9
+        return elapsed / reps * 1000.0, gflops, tag
+    except RuntimeError as e:
+        msg = str(e).splitlines()[0]
+        print(f"  [GPU SGEMM skip] {msg[:80]}", file=sys.stderr)
+        return None
 
 
 # ── GLU path (projected from RTL spec) ───────────────────────────────────
@@ -360,8 +380,12 @@ def main():
     cpu_ms, cpu_gf = time_cpu_sgemm(lib, M, N, K, args.sgemm_reps)
     print(f"    CPU AVX2+FMA CORDIC:   {cpu_ms:8.2f} ms/call   {cpu_gf:8.1f} GFLOPS")
     if torch and not args.skip_gpu:
-        gpu_ms, gpu_gf, gpu_tag2 = time_gpu_sgemm(torch, rac_torch, M, N, K, args.sgemm_reps)
-        print(f"    GPU {gpu_tag2:<22}  {gpu_ms:8.2f} ms/call   {gpu_gf:8.1f} GFLOPS")
+        res = time_gpu_sgemm(torch, rac_torch, M, N, K, args.sgemm_reps)
+        if res is not None:
+            gpu_ms, gpu_gf, gpu_tag2 = res
+            print(f"    GPU {gpu_tag2:<22}  {gpu_ms:8.2f} ms/call   {gpu_gf:8.1f} GFLOPS")
+        else:
+            print(f"    GPU SGEMM:               (skipped — kernel launch failed)")
 
     # Empirical RAC-DSP row: run sim/rac_systolic_ref at a feasible size
     # (the binary's per-call overhead makes large N slow, so cap at 16).
