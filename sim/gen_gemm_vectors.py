@@ -101,15 +101,21 @@ def main():
         for r, xi in enumerate(X[0]):
             f.write(f"{q3232(xi * K_INV):016x}  // x[{r}]={xi:+.6f}\n")
 
-    # Batch input for matrix-matrix mode
+    # Batch input for matrix-matrix mode; remove any stale batch file
+    # from a previous K>1 run when the current K==1 (otherwise the TB
+    # auto-detects batch mode and uses wrong dimensions).
+    batch_path = out / "gemm_input_batch.hex"
     if K > 1:
-        with open(out / "gemm_input_batch.hex", "w") as f:
+        with open(batch_path, "w") as f:
             f.write(f"// gemm batch input — K={K} vectors × N={N} entries\n")
             f.write("// row-major (k*N + r), pre-scaled by K_INV\n")
             for k in range(K):
                 for r, xi in enumerate(X[k]):
                     f.write(f"{q3232(xi * K_INV):016x}"
                             f"  // X[{k}][{r}]={xi:+.6f}\n")
+    else:
+        if batch_path.exists():
+            batch_path.unlink()
 
     # Golden output (K·N values)
     with open(out / "gemm_golden.hex", "w") as f:

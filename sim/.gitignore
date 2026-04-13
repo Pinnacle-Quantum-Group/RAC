@@ -13,6 +13,8 @@ gemm_golden.hex
 gemm.csv
 rtl_gemm_outputs.hex
 ref_gemm_outputs.hex
+.gemm-config
+.gemm-config.tmp
 
 # Local symlinks to rtl/*.mem
 cordic_coarse_lut.mem
