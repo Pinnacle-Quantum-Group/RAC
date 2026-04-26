@@ -205,10 +205,26 @@ private lemma partialProd_le (n : ℕ) :
     -- (since (2⁻¹)^(2i) = (1/4)^i; partial geometric sum ≤ infinite tail).
     have h_tail_sum_le : ∑ i in Finset.Ico 16 n, (2 : ℝ)⁻¹ ^ (2 * i) ≤
         (4 : ℝ)⁻¹ ^ (15 : ℕ) / 3 := by
-      -- Each term: (2⁻¹)^(2i) = (4⁻¹)^i = 4⁻¹⁶ · 4⁻⁽ⁱ⁻¹⁶⁾ for i ≥ 16.
-      -- Partial sum from 16: ≤ 4⁻¹⁶ · ∑_{j=0}^∞ 4⁻ʲ = 4⁻¹⁶ · 4/3 = 4⁻¹⁵/3.
-      -- This is the standard geometric tail bound.
-      sorry
+      -- Step 1: rewrite (2⁻¹)^(2i) = (4⁻¹)^i.
+      have h_conv : ∀ i : ℕ, (2 : ℝ)⁻¹ ^ (2 * i) = (4 : ℝ)⁻¹ ^ i := fun i => by
+        rw [show (2 : ℝ)⁻¹ ^ (2 * i) = ((2 : ℝ)⁻¹ ^ 2) ^ i from by rw [← pow_mul]]
+        norm_num
+      rw [Finset.sum_congr rfl (fun i _ => h_conv i)]
+      -- Step 2: closed form via `geom_sum_Ico`.
+      rw [geom_sum_Ico (by norm_num : (4 : ℝ)⁻¹ ≠ 1) hn.le]
+      -- Step 3: bound through the negative-denominator manipulation.
+      have h_denom_neg : ((4 : ℝ)⁻¹ - 1) < 0 := by norm_num
+      rw [div_le_iff_of_neg h_denom_neg]
+      -- Goal: (4⁻¹)^15 / 3 * (4⁻¹ - 1) ≤ (4⁻¹)^n - (4⁻¹)^16
+      have h_pow_n_nonneg : (0 : ℝ) ≤ (4 : ℝ)⁻¹ ^ n := by positivity
+      have h_pow_15_nonneg : (0 : ℝ) ≤ (4 : ℝ)⁻¹ ^ (15 : ℕ) := by positivity
+      have h_16_eq : ((4 : ℝ)⁻¹) ^ (16 : ℕ) = ((4 : ℝ)⁻¹) ^ (15 : ℕ) * ((4 : ℝ)⁻¹) := by
+        rw [← pow_succ]
+      rw [h_16_eq]
+      -- After: (4⁻¹)^15 / 3 * (4⁻¹ - 1) ≤ (4⁻¹)^n - (4⁻¹)^15 * 4⁻¹
+      -- Algebra: LHS = (4⁻¹)^15 * (-3/4) / 3 = -(4⁻¹)^15 / 4 = -(4⁻¹)^15 * 4⁻¹
+      -- So LHS - RHS = -(4⁻¹)^15·4⁻¹ - (4⁻¹)^n + (4⁻¹)^15·4⁻¹ = -(4⁻¹)^n ≤ 0.
+      nlinarith [h_pow_n_nonneg, h_pow_15_nonneg]
     -- Final exp monotonicity:
     have h_tail_exp_le : Real.exp (∑ i in Finset.Ico 16 n, (2 : ℝ)⁻¹ ^ (2 * i)) ≤
         Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := Real.exp_le_exp.mpr h_tail_sum_le
