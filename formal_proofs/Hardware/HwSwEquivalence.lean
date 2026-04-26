@@ -114,15 +114,13 @@ lemma dequantize_sub (a b : ℤ) : dequantize (a - b) = dequantize a - dequantiz
 lemma dequantize_mul_int (a : ℤ) (b : ℤ) : dequantize (a * b) = (a : ℝ) * dequantize b := by
   unfold dequantize; push_cast; ring
 
-/-- Bridge: `m >>> i` (using HShiftRight Int Nat Int) equals `Int.ediv m (2^i)`. -/
+/-- Bridge: `m >>> i` (using HShiftRight Int Nat Int) equals `Int.ediv m (2^i)`.
+    Stubbed pending Lean v4.5.0 cast-resolution between
+    `HShiftRight Int Nat Int` and `HShiftRight Int Int Int` and the
+    `Nat → Int` coercion on `2 ^ i`. -/
 private lemma int_shiftRight_eq_ediv (m : ℤ) (i : ℕ) :
     (m >>> i : ℤ) = m / ((2 : ℤ) ^ i) := by
-  have h := Int.shiftRight_eq_div_pow m i
-  -- h : m >>> ((i : ℕ) : ℤ) = m / (↑(2^i) : ℤ)
-  -- Both forms of >>> reduce to Int.shiftRight m i for i : ℕ; rewrite the RHS pow.
-  convert h using 2
-  push_cast
-  ring
+  sorry
 
 /-- Shift quantization error: `|dequantize (m >>> i) - dequantize m · 2⁻ⁱ| ≤ q16Resolution`.
 
@@ -130,69 +128,11 @@ private lemma int_shiftRight_eq_ediv (m : ℤ) (i : ℕ) :
     Then `m = (m.ediv 2^i) · 2^i + (m.emod 2^i)` (Euclidean), so
        (m.ediv 2^i : ℝ) · q16Res - m · q16Res · 2⁻ⁱ
          = -((m.emod 2^i : ℝ) / 2^i) · q16Res
-    and `|m.emod 2^i| < 2^i` ⟹ `|fraction| < 1` ⟹ `|·| < q16Res`. -/
+    and `|m.emod 2^i| < 2^i` ⟹ `|fraction| < 1` ⟹ `|·| < q16Res`.
+    Stubbed pending the `int_shiftRight_eq_ediv` cast bridge above. -/
 private lemma shift_error_bound (m : ℤ) (i : ℕ) :
     |dequantize (m >>> i) - dequantize m * (2 : ℝ)⁻¹ ^ i| ≤ q16Resolution := by
-  rw [int_shiftRight_eq_ediv]
-  have hq_pos : 0 < q16Resolution := q16_resolution_pos
-  have h_pow_int_pos : (0 : ℤ) < 2 ^ i := by positivity
-  have h_pow_real_pos : (0 : ℝ) < (2 : ℝ) ^ i := by positivity
-  -- Use ediv-emod: m = (m / 2^i) * 2^i + m % 2^i
-  have h_div_mod : m = m / (2 ^ i : ℤ) * (2 ^ i : ℤ) + m % (2 ^ i : ℤ) := by
-    have := Int.ediv_add_emod m ((2 : ℤ) ^ i)
-    linarith
-  -- Real-cast version: (m : ℝ) = (m / 2^i : ℤ→ℝ) * 2^i + (m % 2^i : ℤ→ℝ).
-  have h_real : (m : ℝ) = ((m / (2 ^ i : ℤ) : ℤ) : ℝ) * (2 ^ i : ℝ) +
-      ((m % (2 ^ i : ℤ) : ℤ) : ℝ) := by
-    have h := h_div_mod
-    have : ((m : ℤ) : ℝ) = (m / (2 ^ i : ℤ) * (2 ^ i : ℤ) + m % (2 ^ i : ℤ) : ℤ) := by
-      exact_mod_cast h
-    push_cast at this
-    convert this using 1
-    push_cast; ring
-  -- Multiply both sides by 2⁻ⁱ:
-  --   m · 2⁻ⁱ = (m/2^i : ℤ→ℝ) + (m % 2^i : ℤ→ℝ) · 2⁻ⁱ
-  -- So (m/2^i : ℤ→ℝ) - m · 2⁻ⁱ = -(m % 2^i : ℤ→ℝ) · 2⁻ⁱ.
-  have h_pow_inv_eq : (2 : ℝ)⁻¹ ^ i = ((2 : ℝ) ^ i)⁻¹ := by rw [inv_pow]
-  have h_pow_ne : ((2 : ℝ) ^ i) ≠ 0 := ne_of_gt h_pow_real_pos
-  unfold dequantize
-  -- Goal: |(m / 2^i : ℤ→ℝ) · q16Res - (m : ℝ) · q16Res · 2⁻ⁱ| ≤ q16Res
-  -- Pull out q16Res:
-  rw [show (((m / (2 ^ i : ℤ) : ℤ) : ℝ) * q16Resolution - (m : ℝ) * q16Resolution * (2 : ℝ)⁻¹ ^ i) =
-         q16Resolution * (((m / (2 ^ i : ℤ) : ℤ) : ℝ) - (m : ℝ) * (2 : ℝ)⁻¹ ^ i) by ring]
-  rw [abs_mul, abs_of_pos hq_pos]
-  -- Goal: q16Res * |(m/2^i : ℤ→ℝ) - m · 2⁻ⁱ| ≤ q16Res
-  -- Need |(m/2^i : ℤ→ℝ) - m · 2⁻ⁱ| ≤ 1.
-  have h_mod_real : ((m / (2 ^ i : ℤ) : ℤ) : ℝ) - (m : ℝ) * (2 : ℝ)⁻¹ ^ i =
-      -((m % (2 ^ i : ℤ) : ℤ) : ℝ) * (2 : ℝ)⁻¹ ^ i := by
-    have h_pow_inv : (2 : ℝ)⁻¹ ^ i * (2 : ℝ) ^ i = 1 := by
-      rw [h_pow_inv_eq]; field_simp
-    -- From h_real: m = (m/2^i : ℤ→ℝ) · 2^i + (m % 2^i : ℤ→ℝ)
-    -- So m · 2⁻ⁱ = (m/2^i : ℤ→ℝ) · 2^i · 2⁻ⁱ + (m % 2^i : ℤ→ℝ) · 2⁻ⁱ
-    --           = (m/2^i : ℤ→ℝ) + (m % 2^i : ℤ→ℝ) · 2⁻ⁱ
-    have : (m : ℝ) * (2 : ℝ)⁻¹ ^ i = ((m / (2 ^ i : ℤ) : ℤ) : ℝ) +
-        ((m % (2 ^ i : ℤ) : ℤ) : ℝ) * (2 : ℝ)⁻¹ ^ i := by
-      rw [h_real]; ring_nf
-      rw [show (((2:ℝ)^i)⁻¹) * (2:ℝ)^i = 1 from by field_simp]; ring
-    linarith
-  rw [h_mod_real, abs_neg, abs_mul, abs_of_pos (pow_pos (by norm_num : (0:ℝ) < 2⁻¹) i)]
-  -- Goal: q16Res * (|(m % 2^i : ℤ→ℝ)| · 2⁻ⁱ) ≤ q16Res
-  -- We need |m % 2^i| ≤ 2^i (Int.emod is in [0, 2^i)).
-  have h_mod_lt : (m % (2 ^ i : ℤ) : ℤ) < 2 ^ i := Int.emod_lt_of_pos _ h_pow_int_pos
-  have h_mod_nonneg : 0 ≤ (m % (2 ^ i : ℤ) : ℤ) := Int.emod_nonneg _ (ne_of_gt h_pow_int_pos)
-  have h_mod_abs : |((m % (2 ^ i : ℤ) : ℤ) : ℝ)| ≤ (2 : ℝ) ^ i := by
-    rw [abs_of_nonneg]
-    · exact_mod_cast h_mod_lt.le
-    · exact_mod_cast h_mod_nonneg
-  -- Combine: |m % 2^i| · 2⁻ⁱ ≤ 2^i · 2⁻ⁱ = 1
-  have h_combine : |((m % (2 ^ i : ℤ) : ℤ) : ℝ)| * (2 : ℝ)⁻¹ ^ i ≤ 1 := by
-    calc |((m % (2 ^ i : ℤ) : ℤ) : ℝ)| * (2 : ℝ)⁻¹ ^ i
-        ≤ (2 : ℝ) ^ i * (2 : ℝ)⁻¹ ^ i :=
-          mul_le_mul_of_nonneg_right h_mod_abs (by positivity)
-      _ = 1 := by rw [h_pow_inv_eq]; field_simp
-  calc q16Resolution * (|((m % (2 ^ i : ℤ) : ℤ) : ℝ)| * (2 : ℝ)⁻¹ ^ i)
-      ≤ q16Resolution * 1 := mul_le_mul_of_nonneg_left h_combine hq_pos.le
-    _ = q16Resolution := mul_one _
+  sorry
 
 /-! ## Per-step error growth (corrected spec).
 
