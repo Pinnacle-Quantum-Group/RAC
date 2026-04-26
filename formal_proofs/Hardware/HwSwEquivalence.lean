@@ -100,34 +100,91 @@ def stateError (hw : HwState) (sw : SwState) : ℝ :=
 
 /-! ## 5. Per-Step Error Growth -/
 
-/-- Per-step error growth: HW vs SW state error grows by ≤ 3·q16Resolution.
+/-! ## Helper lemmas: dequantize linearity. -/
 
-    PROOF SKETCH (~50-100 lines, deferred):
-    Each component (x, y, z) of `stateError`'s `max` chain decomposes as:
-      Δx' = (dequantize(s.x) - sw.x)
-          + (sw.y · 2⁻ⁱ - dequantize(s.y >>> i))
-    where `s.y >>> i` (arithmetic right shift on ℤ) introduces a
-    rounding error ≤ q16Resolution per shift, and the residual
-    `sw.y · 2⁻ⁱ - dequantize(s.y) · 2⁻ⁱ ≤ 2⁻ⁱ · ε ≤ ε`.
+lemma dequantize_add (a b : ℤ) : dequantize (a + b) = dequantize a + dequantize b := by
+  unfold dequantize; push_cast; ring
 
-    Three sources of q16Resolution-level error (one per component
-    update) sum to the `3 · q16Resolution` slack.
+lemma dequantize_neg (a : ℤ) : dequantize (-a) = -dequantize a := by
+  unfold dequantize; push_cast; ring
 
-    Subtle prereq: HW and SW must agree on the σ sign decision, which
-    holds when `|dequantize(hw.z) - sw.z| < |sw.z|` — automatic from
-    `h_init` away from sign flip points. The fully rigorous proof needs:
-      * `dequantize_add` linearity lemma
-      * `Int.shiftRight_eq_div` (HW shift = ℤ-division by 2ⁱ)
-      * `quantize_div_pow_two_error` (quantization error of shift)
-      * triangle inequality on the 3-component max.
+lemma dequantize_sub (a b : ℤ) : dequantize (a - b) = dequantize a - dequantize b := by
+  rw [sub_eq_add_neg, dequantize_add, dequantize_neg, ← sub_eq_add_neg]
 
-    Tractable but substantial. Stubbed. -/
+lemma dequantize_mul_int (a : ℤ) (b : ℤ) : dequantize (a * b) = (a : ℝ) * dequantize b := by
+  unfold dequantize; push_cast; ring
+
+/-! ## Per-step error growth (corrected spec).
+
+    SPEC FIX (round 27): the original conclusion `≤ ε + 3·q16Resolution`
+    is FALSE without further hypotheses:
+
+    1. SIGN AGREEMENT: HW computes `(hw.z ≥ 0)` over ℤ, SW computes
+       `(sw.z ≥ 0)` over ℝ.  When `dequantize(hw.z)` and `sw.z` straddle
+       zero (within ε), the sigma decisions diverge and a single CORDIC
+       step can swing the residual by up to `2 · |atanEntry|` (≈ π/2),
+       far exceeding the `q16Resolution` budget.
+
+       Fix: add precondition `h_sign : (hw.z ≥ 0) ↔ (sw.z ≥ 0)`.
+
+    2. MULTIPLICATIVE GROWTH: the `(s.y >>> i)` shift introduces
+       `2⁻ⁱ · |dequantize hw.y - sw.y| ≤ 2⁻ⁱ · ε ≤ ε` of error from
+       scaling the existing component-y error.  The total per-step
+       growth is therefore `2ε + 3·q16Resolution`, not `ε + 3·q16Resolution`.
+
+       Fix: weaken the conclusion bound from `ε + 3·q16Resolution` to
+       `2·ε + 3·q16Resolution`.
+
+    PROOF (substantial, ~80 lines, partial):
+    With sigma agreement + corrected bound, the chain is:
+      Δz_new = (Δz_init) - σ · (Δatan)             ≤ ε + q16Res/2
+      Δx_new = (Δx_init) + σ · (Δshift_y + Δscale_y)
+             where |Δshift_y| ≤ q16Res (round-to-floor of arithmetic
+             right shift on ℤ via `Int.shiftRight_eq_div_pow`)
+             and  |Δscale_y| ≤ 2⁻ⁱ · ε ≤ ε
+             so |Δx_new| ≤ ε + q16Res + ε = 2ε + q16Res
+      Δy_new: symmetric to Δx_new with hw.x ↔ hw.y, sw.x ↔ sw.y
+              ⟹ |Δy_new| ≤ 2ε + q16Res
+    max ≤ 2ε + q16Res ≤ 2ε + 3·q16Res. ✓
+
+    The full proof needs explicit `Int.shiftRight_eq_div_pow` chain for
+    the shift quantization error bound, which is several intermediate
+    Lean steps.  Stubbed at the shift-error claim. -/
 theorem hw_sw_step_error_bound (hw : HwState) (sw : SwState) (i : ℕ)
     (atanEntry : ℤ) (atanVal : ℝ)
     (h_init : stateError hw sw ≤ ε)
-    (h_atan : |dequantize atanEntry - atanVal| ≤ q16Resolution / 2) :
+    (h_atan : |dequantize atanEntry - atanVal| ≤ q16Resolution / 2)
+    (h_sign : (hw.z ≥ 0) ↔ (sw.z ≥ 0)) :
     stateError (hwCordicStep hw i atanEntry) (swCordicStep sw i atanVal) ≤
-    ε + 3 * q16Resolution := by
+    2 * ε + 3 * q16Resolution := by
+  -- Extract per-component bounds from h_init.
+  have hq_pos : 0 < q16Resolution := q16_resolution_pos
+  unfold stateError at h_init ⊢
+  -- h_init : max (|Δx|) (max (|Δy|) (|Δz|)) ≤ ε
+  -- Need 3 component bounds:
+  have h_init_x : |dequantize hw.x - sw.x| ≤ ε := le_trans (le_max_left _ _) h_init
+  have h_init_y : |dequantize hw.y - sw.y| ≤ ε := by
+    have := le_max_right (|dequantize hw.x - sw.x|)
+                          (max (|dequantize hw.y - sw.y|) (|dequantize hw.z - sw.z|))
+    have := le_trans (le_max_left _ _) (le_trans this h_init)
+    exact this
+  have h_init_z : |dequantize hw.z - sw.z| ≤ ε := by
+    have := le_max_right (|dequantize hw.x - sw.x|)
+                          (max (|dequantize hw.y - sw.y|) (|dequantize hw.z - sw.z|))
+    exact le_trans (le_max_right _ _) (le_trans this h_init)
+  -- Sigma agreement
+  have h_sigma_eq : (if (hw.z : ℤ) ≥ 0 then (1:ℤ) else -1) =
+                    (if (sw.z : ℝ) ≥ 0 then (1:ℤ) else -1) := by
+    by_cases h : hw.z ≥ 0
+    · simp [h, h_sign.mp h]
+    · push_neg at h
+      have h_int : ¬(hw.z ≥ 0) := not_le.mpr h
+      have h_real : ¬(sw.z ≥ 0) := fun hsw => h_int (h_sign.mpr hsw)
+      simp [h_int, h_real]
+  -- The remainder of the proof needs the shift-error bound:
+  -- |dequantize(hw.y >>> i) - dequantize hw.y · 2⁻ⁱ| ≤ q16Resolution
+  -- which requires explicit Int.shiftRight_eq_div_pow analysis.
+  -- Stubbed.
   sorry
 
 /-! ## 6. Total N-Step Equivalence -/
