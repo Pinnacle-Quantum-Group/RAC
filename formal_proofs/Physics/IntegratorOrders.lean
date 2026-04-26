@@ -17,11 +17,28 @@ theorem verlet_exact_const_force (x0 v0 a : ℝ) (dt : ℝ) :
     let (x1, v1) := verlet_step x0 v0 a dt
     x1 = x0 + v0*dt + a*dt^2/2 := by simp [verlet_step]
 
-theorem euler_energy_drift (x v k dt : ℝ) :
+/-- Euler-step energy drift on a harmonic oscillator (a = -k·x).
+    EXACT: `E1 - E0 = (dt²/2) · (k²x² + k·v²)`.
+
+    SPEC FIX: original bound `4·max(|v|,|k·x|)²·dt²` was FALSE for
+    large k. Counterexample: k=100, v=1, x=0.01 gives M=max(1,1)=1,
+    RHS=4·dt², but LHS=(dt²/2)·(1+100)=50.5·dt² ≫ 4·dt².
+
+    The correct bound must scale with `k`.  Using `max(|v|, √k·|x|)`
+    (the natural symplectic norm — equivalent to bounding |v| and
+    ω·|x| where ω = √k) gives a clean dimensionally-consistent
+    bound `(dt² · k / 2) · (k·x² + v²) ≤ (dt² · k) · M²`. With M
+    bounding both |v| and √k·|x|, restate as below (k ≥ 0 added
+    so √k makes sense and the harmonic oscillator interpretation
+    holds). -/
+theorem euler_energy_drift (x v k dt : ℝ) (hk : 0 ≤ k) :
     let E0 := v^2/2 + k*x^2/2
     let (x1, v1) := euler_step x v (-k*x) dt
     let E1 := v1^2/2 + k*x1^2/2
-    |E1 - E0| ≤ 4 * (max (|v|) (|k*x|))^2 * dt^2 := by sorry
+    E1 - E0 = (dt^2 / 2) * (k^2 * x^2 + k * v^2) := by
+  -- Direct algebraic computation. (Equality — tighter than any inequality.)
+  simp only [euler_step]
+  ring
 
 end RAC.Physics.Integrators
 end

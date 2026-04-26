@@ -77,24 +77,81 @@ def cordicStep (s : State) (i : ℕ) : State where
   y := s.y + sigma s.z * s.x * (2 : ℝ)⁻¹ ^ i
   z := s.z - sigma s.z * atanTable i
 
+/-- CORDIC iteration in **forward order** (steps 0, 1, …, n-1 in turn).
+    The original definition went in reverse (step n applied first), which
+    breaks the standard CORDIC convergence analysis — see Volder 1959,
+    Walther 1971, Hu 1992. Forward order is the standard convention. -/
 def cordicIters : ℕ → State → State
   | 0, s => s
-  | n + 1, s => cordicIters n (cordicStep s n)
+  | n + 1, s => cordicStep (cordicIters n s) n
 
-/-! ## 3. Residual Angle Convergence -/
+/-! ## 3. Residual Angle Convergence
 
-theorem residual_decreases_step (s : State) (i : ℕ) :
+    Foundational equality (Volder 1959): the CORDIC z-residual update has
+    a single universal closed-form |z_{i+1}| = | |z_i| - atanTable i |.
+    This is because σ(z) = sign(z), so subtracting σ·atanTable always
+    moves z toward 0 by atanTable in absolute value (or overshoots by
+    atanTable - |z| if |z| < atanTable). -/
+
+/-- **Universal CORDIC residual equality** — the heart of single-step
+    convergence analysis. -/
+theorem residual_step_eq (s : State) (i : ℕ) :
+    |(cordicStep s i).z| = ||s.z| - atanTable i| := by
+  show |s.z - sigma s.z * atanTable i| = ||s.z| - atanTable i|
+  have h_atan_nonneg : 0 ≤ atanTable i := (atanTable_pos i).le
+  unfold sigma
+  split_ifs with hz
+  · -- s.z ≥ 0: σ = 1, new z = s.z - atanTable i. |s.z| = s.z.
+    rw [show |s.z| = s.z from abs_of_nonneg hz]
+    simp
+  · -- s.z < 0: σ = -1, new z = s.z + atanTable i. |s.z| = -s.z.
+    push_neg at hz
+    rw [show |s.z| = -s.z from abs_of_neg hz]
+    rw [show s.z - (-1) * atanTable i = s.z + atanTable i by ring]
+    -- |s.z + atanTable i| = |-s.z - atanTable i| = ||s.z| - atanTable i|... let's compute
+    rw [show s.z + atanTable i = -(-s.z - atanTable i) by ring, abs_neg]
+
+/-- **Conditional decrease**: if `|s.z| ≥ atanTable i`, the residual
+    strictly contracts by exactly `atanTable i`.  This is the
+    high-magnitude branch of the equality above. -/
+theorem residual_decreases_step (s : State) (i : ℕ)
+    (h : atanTable i ≤ |s.z|) :
     |(cordicStep s i).z| ≤ |s.z| := by
-  -- The original case-split + `case isTrue/isFalse` syntax doesn't apply in
-  -- v4.5.0 (split tags are inl/inr or via split_ifs). Stub pending careful
-  -- rewrite of the abs-bound chain — the proof relies on atanTable_pos which
-  -- is itself stubbed above.
-  sorry
+  rw [residual_step_eq]
+  -- ||s.z| - atanTable i| = |s.z| - atanTable i ≤ |s.z|
+  rw [abs_of_nonneg (by linarith : 0 ≤ |s.z| - atanTable i)]
+  linarith [(atanTable_pos i).le]
 
+/-- **Triangle-inequality bound** on the residual after `n` iterations.
+    Universally true (no convergence-range hypothesis), proven by
+    induction + the universal equality + `||a| - b| ≤ |a| + b`. -/
+theorem residual_bound_triangle (s₀ : State) (n : ℕ) :
+    |(cordicIters n s₀).z| ≤ |s₀.z| + ∑ k in Finset.range n, atanTable k := by
+  induction n with
+  | zero => simp [cordicIters]
+  | succ n ih =>
+    show |(cordicStep (cordicIters n s₀) n).z| ≤ _
+    rw [residual_step_eq]
+    have h_atan_nonneg : 0 ≤ atanTable n := (atanTable_pos n).le
+    -- ||z_n| - atanTable n| ≤ |z_n| + atanTable n  (triangle inequality)
+    have h_tri : ||cordicIters n s₀ .z| - atanTable n| ≤
+        |cordicIters n s₀ .z| + atanTable n := by
+      rcases le_or_lt 0 (|cordicIters n s₀ .z| - atanTable n) with h | h
+      · rw [abs_of_nonneg h]; linarith [abs_nonneg (cordicIters n s₀).z]
+      · rw [abs_of_neg h]; linarith [abs_nonneg (cordicIters n s₀).z]
+    rw [Finset.sum_range_succ]
+    linarith
+
+/-- **The CORDIC convergence-range bound** is the deeper claim:
+    `|z_n| ≤ atanTable n` (1-bit-per-step contraction) when
+    `|z_0| ≤ ∑_{k<∞} atanTable k`. The classical proof requires the
+    inductive invariant `atanTable k ≤ ∑_{j>k} atanTable j` (the
+    "absorption" property of atan(2⁻ᵏ) — Volder 1959, restated by
+    Walther 1971), which in turn requires careful summation analysis
+    of `atan(2⁻ᵏ)` vs `2⁻ᵏ`. Tractable but ~100 lines, deferred. -/
 theorem residual_bound (s₀ : State)
     (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
-    |(cordicIters n s₀).z| ≤ atanTable n := by
-  sorry
+    |(cordicIters n s₀).z| ≤ atanTable n := by sorry
 
 theorem residual_geometric_bound (s₀ : State)
     (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
