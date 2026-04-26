@@ -24,11 +24,12 @@ theorem singleStepError_pos (k : ℕ) : 0 < singleStepError k := by
 theorem singleStepError_decreasing : StrictAnti singleStepError := by
   intro i j hij
   unfold singleStepError
-  exact pow_lt_pow_right (by norm_num : (2:ℝ)⁻¹ < 1) (by norm_num : 0 < (2:ℝ)⁻¹) hij
+  exact pow_lt_pow_right_of_lt_one (by norm_num : (0:ℝ) < (2:ℝ)⁻¹)
+    (by norm_num : (2:ℝ)⁻¹ < 1) hij
 
 theorem singleStepError_le_one (k : ℕ) : singleStepError k ≤ 1 := by
   unfold singleStepError
-  exact pow_le_one₀ (by norm_num) (by norm_num)
+  exact pow_le_one k (by norm_num) (by norm_num)
 
 /-! ## 2. Chained Error Accumulation -/
 
@@ -37,9 +38,11 @@ def chainedError (n k : ℕ) : ℝ := ↑n * singleStepError k
 theorem chainedError_bound (n k : ℕ) :
     chainedError n k = ↑n * (2 : ℝ)⁻¹ ^ k := by
   unfold chainedError singleStepError
+  rfl
 
 theorem chainedError_nonneg (n k : ℕ) : 0 ≤ chainedError n k := by
-  unfold chainedError; exact mul_nonneg (Nat.cast_nonneg) (le_of_lt (singleStepError_pos k))
+  unfold chainedError
+  exact mul_nonneg (Nat.cast_nonneg _) (le_of_lt (singleStepError_pos k))
 
 /-! ## 3. Error Decreases with More Iterations -/
 
@@ -63,7 +66,7 @@ theorem triangle_inequality_chain (errors : Fin n → ℝ)
     (hbound : ∀ i, |errors i| ≤ singleStepError k) :
     |composedError errors| ≤ ↑n * singleStepError k := by
   unfold composedError
-  calc |∑ i, errors i| ≤ ∑ i, |errors i| := norm_sum_le_of_le _ (fun i _ => le_refl _)
+  calc |∑ i, errors i| ≤ ∑ i, |errors i| := Finset.abs_sum_le_sum_abs _ _
     _ ≤ ∑ i : Fin n, singleStepError k := Finset.sum_le_sum (fun i _ => hbound i)
     _ = ↑n * singleStepError k := by simp [Finset.sum_const, Finset.card_fin]
 

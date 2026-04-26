@@ -67,7 +67,7 @@ theorem batch_identity (pairs : Fin n → ℝ × ℝ) :
 theorem batch_inverse (pairs : Fin n → ℝ × ℝ) (angles : Fin n → ℝ) :
     batchRotate (batchRotate pairs angles) (fun i => -angles i) = pairs := by
   rw [batch_composition]
-  simp [add_neg_cancel]
+  simp [add_neg_self]
   exact batch_identity pairs
 
 /-! ## 8. Inner Product via Batch Rotation -/

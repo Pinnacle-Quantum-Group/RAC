@@ -47,7 +47,7 @@ theorem attention_weights_le_one (scores : Fin n → ℝ)
     attentionWeights scores hpos i ≤ 1 := by
   unfold attentionWeights
   apply div_le_one_of_le
-  · exact le_sum_of_subset_of_nonneg (Finset.subset_univ {i})
+  · exact Finset.sum_le_sum_of_subset_of_nonneg (Finset.subset_univ {i})
       (fun j _ _ => le_of_lt (hpos j)) |>.trans (by simp)
   · exact Finset.sum_nonneg fun j _ => le_of_lt (hpos j)
 
