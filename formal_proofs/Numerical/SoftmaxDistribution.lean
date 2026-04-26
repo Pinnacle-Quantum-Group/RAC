@@ -18,7 +18,8 @@ theorem softmax_pos {f : Fin n → ℝ} (hf : ∀ i, 0 < f i) (hn : 0 < n) (i : 
 theorem softmax_sum_eq_one {f : Fin n → ℝ} (hf : ∀ i, 0 < f i) (hn : 0 < n) :
     ∑ i, softmax f hf i = 1 := by
   unfold softmax
-  rw [Finset.sum_div]
+  -- Goal parses as `∑ i, (f i / total) = 1`; collapse to a single division.
+  rw [← Finset.sum_div]
   exact div_self (ne_of_gt (Finset.sum_pos (fun j _ => hf j) ⟨⟨0, hn⟩, mem_univ _⟩))
 
 theorem softmax_le_one {f : Fin n → ℝ} (hf : ∀ i, 0 < f i) (hn : 0 < n) (i : Fin n) :
