@@ -1,7 +1,1 @@
-lib/build/
-build-cov/
-lib/rust/target/
-lib/rust/Cargo.lock
-*.gcda
-*.gcno
-*.gcov
+.lake/
