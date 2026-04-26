@@ -23,11 +23,13 @@ import Mathlib.Analysis.SpecialFunctions.Trigonometric.Arctan
 import Mathlib.Data.Real.Basic
 import Mathlib.Tactic
 import RAC.Cordic.ArctanFacts
+import RAC.Trig.ArctanBounds
 
 noncomputable section
 
 open Real BigOperators  -- BigOperators needed for `∑` notation
 open RAC.Cordic.ArctanFacts
+open RAC.Trig.ArctanBounds
 
 namespace RAC.Cordic.Convergence
 
@@ -174,63 +176,151 @@ private lemma atanTable_le_J_succ (n m : ℕ) : atanTable m ≤ J n (m+1) := by
     Finset.sum_nonneg (fun k _ => (atanTable_pos k).le)
   linarith
 
-/-- Step relation: subtracting `atanTable m` from `J n m` lands within `J n (m+1)`.
-    Two cases:
-      m = 0: J n 0 - atanTable 0 = ∑_{k<n+1} - atanTable 0
-                                = ∑_{k ∈ Ico 1 (n+1)} ≤ J n 1 = atanTable 0 + ∑_{Ico 1 (n+1)}.
-      m ≥ 1: J n m - atanTable m = atanTable (m-1) + ∑_{Ico m (n+1)} - atanTable m
-                                  = atanTable (m-1) + ∑_{Ico (m+1) (n+1)}
-                                  ≤ atanTable m + ∑_{Ico (m+1) (n+1)} = J n (m+1)
-                                  by `atanTable_strictMono` ⟹ atanTable (m-1) ≥ atanTable m.
-    Wait — atanTable is strictly anti, so atanTable (m-1) > atanTable m. So the
-    direction is reversed; we'd need atanTable (m-1) ≤ atanTable m, FALSE.
+/-! ### Helpers for the convergence-range bound
 
-    Correct argument: just bound `J n m - atanTable m ≤ J n (m+1)` using the
-    sum-shift identity for m ≥ 1. We have:
-      J n m       = atanTable (m-1) + ∑_{Ico m (n+1)} atanTable k
-                  = atanTable (m-1) + atanTable m + ∑_{Ico (m+1) (n+1)} atanTable k
-      J n (m+1)   = atanTable m + ∑_{Ico (m+1) (n+1)} atanTable k
-      So J n m - atanTable m = atanTable (m-1) + ∑_{Ico (m+1) (n+1)}
-                              = atanTable (m-1) + (J n (m+1) - atanTable m)
-      Need: atanTable (m-1) - atanTable m ≤ 0, FALSE.
+    The neither-pure-tail-sum nor the J-invariant alone is preserved
+    by the iteration, but a *coupled* invariant
+        K(m) := atanTable n + ∑ k ∈ Ico m (n+1), atanTable k
+    works: a fixed "swing-room" budget `atanTable n` plus the
+    forward tail. K(0) is implied by the hypothesis (since
+    `Ico 0 (n+1) = range (n+1)` and `atanTable n ≥ 0`); K(n+1) is
+    `atanTable n` (empty tail). The step splits on `|z_m|` vs
+    `atanTable m`: the high branch consumes `atanTable m` directly
+    from the tail (K(m) − atanTable m = K(m+1)); the low branch
+    trades the budget against the tail via the *finite absorption
+    inequality* below. Once K is proven, K(m) ≤ J n m for `m ≥ 1`
+    follows from `atanTable_strictMono` (since `atanTable n ≤
+    atanTable (m-1)` for `m ≤ n+1`), so the J-invariant required by
+    `residual_bound` falls out as a corollary. -/
 
-    The bound `J n m - atanTable m ≤ J n (m+1)` is therefore generally FALSE
-    for m ≥ 1.  However, in the induction we only NEED this when |z_m| ≥
-    atanTable m, in which case the resulting |z_{m+1}| = |z_m| - atanTable m
-    is bounded by `|z_m| ≤ J n m`.  The DESIRED bound is just |z_{m+1}| ≤ J n (m+1),
-    which we get by the alternative chain: `|z_m| - atanTable m ≤ J n m - atanTable m`
-    needs to land ≤ J n (m+1).  Since this fails strictly, we must instead use
-    the FACT that |z_m| ≤ ∑_{Ico m (n+1)} atanTable k (a TIGHTER invariant
-    than J n m for m ≥ 1) — which is the standard CORDIC invariant.
+/-- One step of geometric absorption: `atanTable k ≤ 2 · atanTable (k+1)`.
+    Direct re-statement of `arctan_inv_two_pow_succ_ge_half` in terms
+    of the local `atanTable` definition. -/
+private lemma atanTable_le_two_mul_succ (k : ℕ) :
+    atanTable k ≤ 2 * atanTable (k + 1) := by
+  have h := arctan_inv_two_pow_succ_ge_half k
+  -- h : arctan ((2:ℝ)⁻¹^k) / 2 ≤ arctan ((2:ℝ)⁻¹^(k+1))
+  change arctan ((2 : ℝ)⁻¹ ^ k) ≤ 2 * arctan ((2 : ℝ)⁻¹ ^ (k + 1))
+  linarith
 
-    Restating: the cleanest invariant is the TAIL SUM:
-      I(m) := ∑ k ∈ Ico m (n+1), atanTable k    for 0 ≤ m ≤ n+1.
-    Then I(0) = ∑_{k<n+1} atanTable k (hypothesis), I(n+1) = 0.
-    Step: |z_{m+1}| = ||z_m| - atanTable m| ≤ ?
-      Case |z_m| ≥ atanTable m: |z_m| - atanTable m ≤ I(m) - atanTable m = I(m+1) ✓
-      Case |z_m| < atanTable m: atanTable m - |z_m| ≤ atanTable m. Need ≤ I(m+1).
-        ⟹ need ABSORPTION: atanTable m ≤ I(m+1) = ∑_{Ico (m+1) (n+1)} atanTable k.
-        This is the Volder absorption — TRUE for the FULL infinite tail, but
-        the FINITE tail Ico (m+1) (n+1) may not absorb when m is close to n.
+/-- Auxiliary form of finite absorption, parameterised on the gap `d`:
+    `atanTable m ≤ atanTable (m+d) + ∑_{j<d} atanTable (m+1+j)`. Proved
+    by induction on `d`, using `atanTable_le_two_mul_succ` to absorb
+    the leading `atanTable m` into the tail one step at a time. -/
+private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
+    atanTable m ≤ atanTable (m + d) +
+        ∑ j in Finset.range d, atanTable (m + 1 + j) := by
+  intro d
+  induction d with
+  | zero =>
+    intro m
+    have h1 : (m + 0 : ℕ) = m := Nat.add_zero m
+    rw [h1, Finset.sum_range_zero, add_zero]
+  | succ d ih =>
+    intro m
+    have hstep : atanTable m ≤ atanTable (m + 1) + atanTable (m + 1) := by
+      have := atanTable_le_two_mul_succ m
+      linarith
+    have hih := ih (m + 1)
+    have h_idx : m + (d + 1) = (m + 1) + d := by omega
+    have h_sum_split :
+        ∑ j in Finset.range (d + 1), atanTable (m + 1 + j) =
+          atanTable (m + 1) +
+          ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
+      rw [Finset.sum_range_succ']
+      have h_inner : ∑ j in Finset.range d, atanTable (m + 1 + (j + 1)) =
+                     ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
+        refine Finset.sum_congr rfl (fun j _ => ?_)
+        congr 1
+        omega
+      have h_z : atanTable (m + 1 + 0) = atanTable (m + 1) := rfl
+      rw [h_inner, h_z, add_comm]
+    rw [h_idx, h_sum_split]
+    linarith
 
-    Specifically at m = n: I(m+1) = I(n+1) = 0, so Case 2 demands atanTable n ≤ 0,
-    FALSE. So the invariant I(m) FAILS at the boundary.
+/-- **Finite absorption** (Volder's "K-range" inequality):
+    for `m ≤ n`, `atanTable m ≤ atanTable n + ∑_{k=m+1}^{n} atanTable k`.
+    The crucial inequality that lets the convergence proof trade
+    swing-room against the forward tail in the under-shoot branch. -/
+private lemma atanTable_absorption {m n : ℕ} (hmn : m ≤ n) :
+    atanTable m ≤ atanTable n + ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k := by
+  have h := atanTable_absorption_aux (n - m) m
+  have h_idx : m + (n - m) = n := by omega
+  rw [h_idx] at h
+  have h_reidx : ∑ j in Finset.range (n - m), atanTable (m + 1 + j)
+               = ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k := by
+    rw [Finset.sum_Ico_eq_sum_range]
+    have h_len : n + 1 - (m + 1) = n - m := by omega
+    rw [h_len]
+    refine Finset.sum_congr rfl (fun j _ => ?_)
+    congr 1
+    omega
+  rw [h_reidx] at h
+  exact h
 
-    Resolution: use the J n m form (with the extra atanTable (m-1) buffer),
-    accepting that the invariant is LOOSER but lands at atanTable n at m = n+1. -/
+/-- Inductive proof of the J-invariant: `|z_m| ≤ J n m` for all `m ≤ n+1`.
+
+    Strategy: run a *stronger* induction on the coupled K-invariant
+    `|z_m| ≤ atanTable n + ∑ k∈Ico m (n+1), atanTable k`, then bridge
+    to `J n m` (which is looser for `m ≥ 1` because `atanTable n ≤
+    atanTable (m-1)`). The base K(0) is implied by `hz₀` plus
+    `atanTable n ≥ 0`; the step uses `Finset.sum_eq_sum_Ico_succ_bot`
+    to peel off the leading term and `atanTable_absorption` for the
+    under-shoot branch. -/
 private lemma residual_invariant (s₀ : State) (n : ℕ)
     (hz₀ : |s₀.z| ≤ ∑ k in Finset.range (n+1), atanTable k) :
     ∀ m, m ≤ n+1 → |(cordicIters m s₀).z| ≤ J n m := by
-  -- Spec-correctness analysis (above) shows the J-invariant cannot be cleanly
-  -- preserved with the available primitives.  The proof requires a deeper
-  -- reformulation — likely tracking BOTH a tail-sum bound AND a "swing
-  -- absorption" budget.  Beyond the scope of routine induction.
-  --
-  -- ALL FOUNDATIONAL PRIMITIVES ARE IN PLACE (arctan_lb, arctan_ub,
-  -- arctan_half_ge, residual_step_eq, J definition, J_at_n_succ,
-  -- atanTable_le_J_succ).  The remaining work is selecting/proving the
-  -- right invariant — an open question per the analysis above.
-  sorry
+  -- Stronger intermediate K-invariant.
+  have hK : ∀ m, m ≤ n + 1 → |(cordicIters m s₀).z| ≤
+      atanTable n + ∑ k in Finset.Ico m (n + 1), atanTable k := by
+    intro m
+    induction m with
+    | zero =>
+      intro _hm
+      have h_eq : (Finset.Ico 0 (n + 1) : Finset ℕ) = Finset.range (n + 1) := by
+        ext k; simp [Finset.mem_Ico, Finset.mem_range]
+      have h_atan_n : 0 ≤ atanTable n := (atanTable_pos n).le
+      show |s₀.z| ≤ atanTable n + ∑ k in Finset.Ico 0 (n + 1), atanTable k
+      rw [h_eq]
+      linarith
+    | succ m ih =>
+      intro hm
+      have hm_lt : m < n + 1 := Nat.lt_of_succ_le hm
+      have hm_le_n : m ≤ n := Nat.lt_succ_iff.mp hm_lt
+      have ih' := ih (Nat.le_of_succ_le hm)
+      have h_split : ∑ k in Finset.Ico m (n + 1), atanTable k =
+                     atanTable m + ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k :=
+        Finset.sum_eq_sum_Ico_succ_bot hm_lt _
+      rw [h_split] at ih'
+      show |(cordicStep (cordicIters m s₀) m).z| ≤ _
+      rw [residual_step_eq]
+      have h_zm_nn : 0 ≤ |(cordicIters m s₀).z| := abs_nonneg _
+      have h_atan_m_nn : 0 ≤ atanTable m := (atanTable_pos m).le
+      rcases le_or_lt (atanTable m) |(cordicIters m s₀).z| with h | h
+      · -- High branch: ||z_m| - atanTable m| = |z_m| - atanTable m, consume from tail.
+        rw [abs_of_nonneg (by linarith : 0 ≤ |(cordicIters m s₀).z| - atanTable m)]
+        linarith
+      · -- Low branch: ||z_m| - atanTable m| = atanTable m - |z_m| ≤ atanTable m;
+        -- trade swing-room via absorption.
+        rw [abs_of_neg (by linarith : |(cordicIters m s₀).z| - atanTable m < 0)]
+        have h_absorb := atanTable_absorption hm_le_n
+        linarith
+  -- Bridge K-invariant to the (looser) J-invariant.
+  intro m hm
+  have hkb := hK m hm
+  rcases m with _ | m
+  · -- m = 0: J n 0 = ∑_{range (n+1)} is exactly the hypothesis.
+    rw [J_zero]
+    exact hz₀
+  · -- m = succ m: J n (m+1) = atanTable m + tail; K(m+1) = atanTable n + tail;
+    -- since m+1 ≤ n+1, m ≤ n, hence atanTable n ≤ atanTable m by anti-monotonicity.
+    rw [J_succ]
+    have hm_le_n : m ≤ n := by
+      have : m + 1 ≤ n + 1 := hm
+      omega
+    have h_table : atanTable n ≤ atanTable m :=
+      atanTable_strictMono.antitone hm_le_n
+    linarith
 
 /-- Main theorem (corrected spec): after `n+1` CORDIC iterations from a
     state whose |z| is bounded by the (n+1)-truncated atan-sum, the

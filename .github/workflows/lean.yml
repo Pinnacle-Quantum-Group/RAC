@@ -42,19 +42,32 @@ jobs:
           lake build 2>&1 | tee -a /tmp/build.log
 
       - name: Comment build log on PR if failed
-        if: steps.lake_build.outcome == 'failure' && github.event_name == 'pull_request'
+        if: steps.lake_build.outcome == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           {
             echo '### Lake build failed (last 300 lines)'
             echo '```'
             tail -300 /tmp/build.log
             echo '```'
           } > /tmp/comment.md
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
-            --body-file /tmp/comment.md
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          else
+            # On push events, look up the PR whose head is this branch.
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            PR_NUMBER=$(gh pr list --head "$BRANCH" --repo "${{ github.repository }}" \
+              --json number --jq '.[0].number' || true)
+          fi
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            gh pr comment "$PR_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/comment.md
+          else
+            echo "No PR found for branch; skipping comment."
+          fi
 
       - name: Fail step if lake build failed
         if: steps.lake_build.outcome == 'failure'
