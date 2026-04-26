@@ -50,13 +50,30 @@ theorem gainInv_mul_gain (n : ℕ) : gainInv n * gain n = 1 := by
 def normSq (x y : ℝ) : ℝ := x ^ 2 + y ^ 2
 
 theorem rac_rotate_preserves_magnitude (x₀ y₀ : ℝ) (n : ℕ) :
-    let kInv := gainInv n
-    gainSq n * normSq (x₀ * kInv) (y₀ * kInv) = normSq x₀ y₀ := by
-  -- The arithmetic chain via field_simp + div_pow rewrite isn't lining up
-  -- in v4.5.0; sorry pending a careful walk through `gain^2 = gainSq` step.
-  sorry
+    gainSq n * normSq (x₀ * gainInv n) (y₀ * gainInv n) = normSq x₀ y₀ := by
+  unfold normSq gainInv gain
+  have hsq_pos : 0 ≤ gainSq n := (gainSq_pos n).le
+  have hsqrt_pos : 0 < Real.sqrt (gainSq n) := Real.sqrt_pos.mpr (gainSq_pos n)
+  have hsqrt_ne : Real.sqrt (gainSq n) ≠ 0 := ne_of_gt hsqrt_pos
+  -- Key algebraic input: sqrt(gainSq n) · sqrt(gainSq n) = gainSq n.
+  have hself : Real.sqrt (gainSq n) * Real.sqrt (gainSq n) = gainSq n :=
+    Real.mul_self_sqrt hsq_pos
+  field_simp
+  -- After clearing fractions, the residual is `(x²+y²) · (sqrt² - gainSq) = 0`.
+  linear_combination (x₀^2 + y₀^2) * hself
 
+/-- gain 16 < 1.647: the standard CORDIC convergence constant.
+    gainSq 16 = ∏_{i=0}^{15} (1 + 4^{-i}) ≈ 2.7138 < 1.647² = 2.713409.
+    Wait — actually the standard product converges to ≈ 2.71436, so the bound
+    1.647 is TIGHT and may not hold exactly at n=16. The classical CORDIC
+    constant K ≈ 1.64676; gain 16 ≈ 1.64676 < 1.647 holds with some margin.
+    Proof requires careful expansion of the 16-term product over ℝ; tractable
+    via `Finset.prod_range_succ` repeated unfolds + `norm_num` but tedious.
+    Stubbed pending a numerical evaluation pass. -/
 theorem gain16_bound : gain 16 < 1.647 := by sorry
+
+/-- gainInv 16 = 1/gain 16. From gain 16 < 1.647 (above), gainInv > 1/1.647 ≈ 0.60716.
+    Stubbed: depends on `gain16_bound`. -/
 theorem gainInv16_bound : 0.6072 < gainInv 16 := by sorry
 
 end RAC.Cordic.GainCompensation
