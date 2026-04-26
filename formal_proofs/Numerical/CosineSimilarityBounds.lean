@@ -17,13 +17,12 @@ theorem coherence_aligned (θ : ℝ) : coherence θ θ = 1 := by
   simp [coherence, sub_self, cos_zero]
 
 theorem coherence_opposed (θ : ℝ) : coherence θ (θ + π) = -1 := by
-  simp [coherence]; ring_nf; simp [cos_pi]
-  sorry
+  unfold coherence
+  rw [show θ - (θ + π) = -π from by ring, cos_neg, cos_pi]
 
 theorem coherence_symmetric (θ_a θ_b : ℝ) :
     coherence θ_a θ_b = coherence θ_b θ_a := by
-  simp [coherence, cos_neg, neg_sub]
-  exact cos_neg (θ_a - θ_b) ▸ by ring_nf
-  sorry
+  unfold coherence
+  rw [show θ_a - θ_b = -(θ_b - θ_a) from by ring, cos_neg]
 
 end RAC.Numerical.CosineSimilarity
