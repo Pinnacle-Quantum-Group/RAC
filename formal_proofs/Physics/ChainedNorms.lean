@@ -10,7 +10,6 @@ theorem chained_norm3 (x y z : ℝ) (hxy : 0 ≤ x^2 + y^2) :
 
 theorem chained_norm4 (x y z w : ℝ) (hxy : 0 ≤ x^2+y^2) (hxyz : 0 ≤ x^2+y^2+z^2) :
     sqrt (sqrt (sqrt (x^2+y^2)^2 + z^2)^2 + w^2) = sqrt (x^2+y^2+z^2+w^2) := by
-  rw [sq_sqrt (by positivity), sq_sqrt hxy]; ring_nf
-  sorry
+  rw [sq_sqrt hxy, sq_sqrt hxyz]
 
 end RAC.Physics.ChainedNorms

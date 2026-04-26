@@ -23,6 +23,9 @@ theorem softmax_sum_eq_one {f : Fin n → ℝ} (hf : ∀ i, 0 < f i) (hn : 0 < n
 
 theorem softmax_le_one {f : Fin n → ℝ} (hf : ∀ i, 0 < f i) (hn : 0 < n) (i : Fin n) :
     softmax f hf i ≤ 1 := by
-  sorry
+  unfold softmax
+  apply div_le_one_of_le
+  · exact Finset.single_le_sum (f := f) (fun j _ => le_of_lt (hf j)) (Finset.mem_univ i)
+  · exact le_of_lt (Finset.sum_pos (fun j _ => hf j) ⟨i, Finset.mem_univ _⟩)
 
 end RAC.Numerical.Softmax
