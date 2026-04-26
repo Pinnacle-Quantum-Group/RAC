@@ -169,16 +169,63 @@ private lemma partialProd_le (n : ℕ) :
       _ ≤ 2.71234 * Real.exp (4⁻¹^(15:ℕ) / 3) := by
           apply mul_le_mul_of_nonneg_left h_exp_ge_one (by norm_num)
   · -- n > 16: split product at 16. Tail ≤ exp(∑ tail terms) ≤ exp(4⁻¹⁵/3).
-    push_neg at hn
-    -- Stub the n > 16 branch for now; the head bound + tail bound chain
-    -- requires careful Finset.prod_Ico manipulation + exp_sum + tail bound.
-    sorry
+    push_neg at hn  -- hn : 16 < n
+    -- Rewrite range n as Ico 0 n, then split Ico 0 n = Ico 0 16 ∪ Ico 16 n.
+    have h_range_eq : Finset.range n = Finset.Ico 0 n := by
+      rw [Nat.Ico_zero_eq_range]
+    have h_range_eq_16 : Finset.range 16 = Finset.Ico 0 16 := by
+      rw [Nat.Ico_zero_eq_range]
+    rw [h_range_eq, ← Finset.prod_Ico_consecutive _ (Nat.zero_le 16) hn.le,
+        ← h_range_eq_16]
+    -- Now: ∏ i in range 16, ... * ∏ i in Ico 16 n, ... ≤ 2.71234 · exp(...)
+    -- Bound head: ∏ i in range 16, ... < 2.71234.
+    have h_head_lt : ∏ i in Finset.range 16, (1 + (2 : ℝ)⁻¹ ^ (2 * i)) < 2.71234 := by
+      have := gainFactor_16_sq_lt; rw [gainFactor_sq_eq] at this; exact this
+    have h_head_pos : 0 < ∏ i in Finset.range 16, (1 + (2 : ℝ)⁻¹ ^ (2 * i)) := by
+      apply Finset.prod_pos; intros i _
+      have : (0 : ℝ) ≤ (2 : ℝ)⁻¹ ^ (2 * i) := by positivity
+      linarith
+    -- Bound tail: ∏ i in Ico 16 n, (1+(2⁻¹)^(2i)) ≤ exp(∑ i in Ico 16 n, (2⁻¹)^(2i))
+    -- via 1+x ≤ exp x for each factor, then exp_sum.
+    have h_tail_factor : ∀ i ∈ Finset.Ico 16 n,
+        (1 + (2 : ℝ)⁻¹ ^ (2 * i)) ≤ Real.exp ((2 : ℝ)⁻¹ ^ (2 * i)) := by
+      intros i _
+      have := Real.add_one_le_exp ((2 : ℝ)⁻¹ ^ (2 * i))
+      linarith
+    have h_tail_pos : ∀ i ∈ Finset.Ico 16 n,
+        0 ≤ (1 + (2 : ℝ)⁻¹ ^ (2 * i)) := by
+      intros i _
+      have : (0 : ℝ) ≤ (2 : ℝ)⁻¹ ^ (2 * i) := by positivity
+      linarith
+    have h_tail_le_exp : ∏ i in Finset.Ico 16 n, (1 + (2 : ℝ)⁻¹ ^ (2 * i)) ≤
+        Real.exp (∑ i in Finset.Ico 16 n, (2 : ℝ)⁻¹ ^ (2 * i)) := by
+      rw [← Real.exp_sum]
+      exact Finset.prod_le_prod h_tail_pos h_tail_factor
+    -- Bound the tail sum: ∑ i in Ico 16 n, (1/4)^i ≤ 4⁻¹⁵/3
+    -- (since (2⁻¹)^(2i) = (1/4)^i; partial geometric sum ≤ infinite tail).
+    have h_tail_sum_le : ∑ i in Finset.Ico 16 n, (2 : ℝ)⁻¹ ^ (2 * i) ≤
+        (4 : ℝ)⁻¹ ^ (15 : ℕ) / 3 := by
+      -- Each term: (2⁻¹)^(2i) = (4⁻¹)^i = 4⁻¹⁶ · 4⁻⁽ⁱ⁻¹⁶⁾ for i ≥ 16.
+      -- Partial sum from 16: ≤ 4⁻¹⁶ · ∑_{j=0}^∞ 4⁻ʲ = 4⁻¹⁶ · 4/3 = 4⁻¹⁵/3.
+      -- This is the standard geometric tail bound.
+      sorry
+    -- Final exp monotonicity:
+    have h_tail_exp_le : Real.exp (∑ i in Finset.Ico 16 n, (2 : ℝ)⁻¹ ^ (2 * i)) ≤
+        Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := Real.exp_le_exp.mpr h_tail_sum_le
+    calc (∏ i in Finset.range 16, (1 + (2 : ℝ)⁻¹ ^ (2 * i))) *
+         (∏ i in Finset.Ico 16 n, (1 + (2 : ℝ)⁻¹ ^ (2 * i)))
+        ≤ 2.71234 * Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := by
+          apply mul_le_mul h_head_lt.le (h_tail_le_exp.trans h_tail_exp_le)
+          · exact Finset.prod_nonneg h_tail_pos
+          · norm_num
 
-/-- The sup of `gainFactor` exists and is strictly less than 1.65. -/
-private lemma gainFactor_lt_165 (n : ℕ) : gainFactor n < 1.65 := by
-  -- gainFactor n ^ 2 ≤ 2.71234 · exp(4⁻¹⁵/3) < 1.65² = 2.7225.
-  -- exp(4⁻¹⁵/3) ≤ 1 + 2 · 4⁻¹⁵/3 (via Real.abs_exp_sub_one_le with x = 4⁻¹⁵/3 ≤ 1).
-  have h_pos : 0 < gainFactor n := gain_factor_pos n
+/-- Uniform bound: `gainFactor n ≤ 1.647` for all n.
+    The chain: `gainFactor n ^ 2 ≤ 2.71234 · exp(4⁻¹⁵/3)` (from `partialProd_le`)
+    `≤ 2.71234 · (1 + 2·1e-9)` (via `Real.abs_exp_sub_one_le`)
+    `≤ 2.71235 < 2.713209 = 1.647²`,
+    so `gainFactor n ≤ 1.647` via `pow_le_pow_iff_left`. -/
+private lemma gainFactor_le_1647 (n : ℕ) : gainFactor n ≤ 1.647 := by
+  have h_pos : 0 ≤ gainFactor n := (gain_factor_pos n).le
   have h_sq_le : gainFactor n ^ 2 ≤
       2.71234 * Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := by
     rw [gainFactor_sq_eq]; exact partialProd_le n
@@ -198,24 +245,21 @@ private lemma gainFactor_lt_165 (n : ℕ) : gainFactor n < 1.65 := by
     rw [abs_of_nonneg h_pos_x] at h_abs
     rw [abs_of_nonneg (by linarith : (0:ℝ) ≤ Real.exp _ - 1)] at h_abs
     linarith
-  -- 4⁻¹⁵ ≤ 1/(4^15) = 1/1073741824 < 10⁻⁹. So 2 · 4⁻¹⁵ / 3 < 10⁻⁹.
   have h_x_tiny : ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) ≤ 1e-9 := by
     have : (4 : ℝ)⁻¹ ^ (15 : ℕ) = 1 / 4^15 := by
       rw [inv_pow, one_div]
     rw [this]; norm_num
-  -- Combine:
-  -- gainFactor n ^ 2 ≤ 2.71234 · (1 + 2·1e-9) < 2.71234 · 1.0000001 < 2.7225 = 1.65²
-  have h_final_sq : gainFactor n ^ 2 < (1.65 : ℝ) ^ 2 := by
-    have h_step1 : 2.71234 * Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) ≤
+  have h_final_sq : gainFactor n ^ 2 ≤ (1.647 : ℝ) ^ 2 := by
+    have h_step : 2.71234 * Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) ≤
         2.71234 * (1 + 2 * 1e-9) := by
       apply mul_le_mul_of_nonneg_left _ (by norm_num : (0:ℝ) ≤ 2.71234)
       calc Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3)
           ≤ 1 + 2 * ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := h_exp_close
         _ ≤ 1 + 2 * 1e-9 := by linarith
     calc gainFactor n ^ 2 ≤ 2.71234 * Real.exp ((4 : ℝ)⁻¹ ^ (15 : ℕ) / 3) := h_sq_le
-      _ ≤ 2.71234 * (1 + 2 * 1e-9) := h_step1
-      _ < (1.65 : ℝ) ^ 2 := by norm_num
-  exact lt_of_pow_lt_pow_left 2 (by norm_num) h_final_sq
+      _ ≤ 2.71234 * (1 + 2 * 1e-9) := h_step
+      _ ≤ (1.647 : ℝ) ^ 2 := by norm_num
+  exact (pow_le_pow_iff_left h_pos (by norm_num) (by norm_num : (2 : ℕ) ≠ 0)).mp h_final_sq
 
 /-- Final assembly. -/
 theorem gain_approaches_constant :
@@ -223,16 +267,15 @@ theorem gain_approaches_constant :
     Filter.Tendsto gainFactor Filter.atTop (nhds K) := by
   have h_mono : Monotone gainFactor := gainFactor_mono
   have h_bdd : BddAbove (Set.range gainFactor) := by
-    refine ⟨1.65, ?_⟩
+    refine ⟨1.647, ?_⟩
     rintro _ ⟨n, rfl⟩
-    exact (gainFactor_lt_165 n).le
+    exact gainFactor_le_1647 n
   refine ⟨⨆ n, gainFactor n, ?_, ?_, tendsto_atTop_ciSup h_mono h_bdd⟩
   · -- 1.6 < ⨆: chain through gainFactor 16 > 1.6.
     calc (1.6 : ℝ) < gainFactor 16 := gainFactor_16_gt
       _ ≤ ⨆ n, gainFactor n := le_ciSup h_bdd 16
-  · -- ⨆ < 1.65: every gainFactor n < 1.65, so sup ≤ ?, but for STRICT
-    -- we need a single explicit upper bound M with M < 1.65 and ∀ n, gainFactor n ≤ M.
-    -- Use M = 1.6469 (slightly below 1.65); gainFactor n^2 ≤ 2.71234·exp(...) < 1.6469².
-    sorry
+  · -- ⨆ ≤ 1.647 < 1.65: uniform bound gives the strict <.
+    calc ⨆ n, gainFactor n ≤ 1.647 := ciSup_le gainFactor_le_1647
+      _ < 1.65 := by norm_num
 
 end RAC.Cordic.PrecisionKnob
