@@ -26,12 +26,11 @@ theorem project_pi (vx vy : ℝ) : project vx vy π = -vx := by
 theorem mac_equivalence (a b : ℝ) :
     let angle_b := if b ≥ 0 then (0 : ℝ) else π
     project a 0 angle_b * |b| = a * b := by
-  simp only
+  show project a 0 (if b ≥ 0 then (0 : ℝ) else π) * |b| = a * b
   by_cases h : b ≥ 0
-  · simp [h, project_zero, abs_of_nonneg h]
+  · rw [if_pos h, project_zero, abs_of_nonneg h]
   · push_neg at h
-    have hnle : ¬ (b ≥ 0) := not_le.mpr h
-    simp [hnle, project_pi, abs_of_neg h]
+    rw [if_neg (not_le.mpr h), project_pi, abs_of_neg h]
     ring
 
 def racInner (a b : Fin n → ℝ) : ℝ :=
