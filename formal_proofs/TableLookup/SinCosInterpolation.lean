@@ -37,7 +37,10 @@ theorem interp_error_bound : step_size ^ 2 / 8 < 8e-5 := by
   -- so linarith can chain with h_pi_sq.
   have h_const : (8e-5 : ℝ) * 131072 = 10.48576 := by norm_num
   rw [h_const]
-  linarith [h_pi_sq]
+  -- linarith doesn't auto-compare two decimal literals; spell out
+  -- 9.9225 < 10.48576 explicitly.
+  have h_lit : (9.9225 : ℝ) < 10.48576 := by norm_num
+  linarith [h_pi_sq, h_lit]
 
 /-- Any θ wraps into [0, 2π) preserving cos and sin.  Use `Real.toIocMod`-
     style construction.  For now we exhibit `θ - 2π · ⌊θ/(2π)⌋`. -/
