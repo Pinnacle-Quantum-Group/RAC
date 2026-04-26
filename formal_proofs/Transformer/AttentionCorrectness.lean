@@ -10,7 +10,8 @@ def softmax_weights (scores : Fin n → ℝ) (hpos : ∀ i, 0 < exp (scores i)) 
 theorem weights_sum_one (scores : Fin n → ℝ) (hn : 0 < n)
     (hpos : ∀ i, 0 < exp (scores i)) :
     ∑ i, softmax_weights scores hpos i = 1 := by
-  unfold softmax_weights; rw [Finset.sum_div]
+  unfold softmax_weights
+  rw [← Finset.sum_div]
   exact div_self (ne_of_gt (Finset.sum_pos (fun j _ => hpos j) ⟨⟨0, hn⟩, mem_univ _⟩))
 
 theorem weights_nonneg (scores : Fin n → ℝ) (hpos : ∀ i, 0 < exp (scores i)) (i : Fin n) :

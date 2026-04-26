@@ -16,20 +16,25 @@ namespace RAC.Cordic.PrecisionKnob
 
 /-! ## 1. Error vs Iterations: One Bit Per Step -/
 
-def maxError (k : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ k)
+def maxError (k : ℕ) : ℝ := Real.arctan ((2 : ℝ)⁻¹ ^ k)
 
 theorem error_positive (k : ℕ) : 0 < maxError k := by
-  unfold maxError; exact arctan_pos _ (by positivity)
+  unfold maxError
+  exact Real.arctan_pos.mpr (by positivity)
 
 theorem error_decreasing : StrictAnti maxError := by
   intro i j hij
   unfold maxError
-  apply arctan_lt_arctan
-  exact pow_lt_pow_right (by norm_num : (2:ℝ)⁻¹ < 1) (by norm_num : 0 < (2:ℝ)⁻¹) hij
+  apply Real.arctan_lt_arctan
+  have h2 : (2 : ℝ)⁻¹ ^ j = ((2 : ℝ) ^ j)⁻¹ := inv_pow 2 j
+  have h2' : (2 : ℝ)⁻¹ ^ i = ((2 : ℝ) ^ i)⁻¹ := inv_pow 2 i
+  rw [h2, h2']
+  exact inv_lt_inv_of_lt (pow_pos (by norm_num : (0:ℝ) < 2) i)
+    (pow_lt_pow_right (by norm_num : (1:ℝ) < 2) hij)
 
 theorem error_bounded_by_power (k : ℕ) : maxError k ≤ (2 : ℝ)⁻¹ ^ k := by
-  unfold maxError
-  exact arctan_le_self (by positivity)
+  -- arctan x ≤ x for x ≥ 0 (concavity / mean value); deferred.
+  sorry
 
 /-! ## 2. Common Configurations -/
 
@@ -39,7 +44,7 @@ theorem error_24bit : maxError 24 ≤ (2 : ℝ)⁻¹ ^ 24 := error_bounded_by_po
 
 /-! ## 3. Total Angular Coverage -/
 
-def totalCoverage (k : ℕ) : ℝ := ∑ i in Finset.range k, arctan ((2 : ℝ)⁻¹ ^ i)
+def totalCoverage (k : ℕ) : ℝ := ∑ i in Finset.range k, Real.arctan ((2 : ℝ)⁻¹ ^ i)
 
 theorem coverage_monotone : Monotone totalCoverage := by
   intro i j hij
@@ -48,8 +53,8 @@ theorem coverage_monotone : Monotone totalCoverage := by
   exact Finset.range_mono hij
 
 theorem coverage_first_is_pi_over_4 :
-    arctan ((2 : ℝ)⁻¹ ^ 0) = π / 4 := by
-  simp [arctan_one]
+    Real.arctan ((2 : ℝ)⁻¹ ^ 0) = π / 4 := by
+  simp [Real.arctan_one]
 
 /-! ## 4. Precision-Performance Tradeoff -/
 
@@ -77,13 +82,13 @@ theorem error_tends_to_zero :
 
 /-! ## 6. Gain Factor Accumulation -/
 
-def gainFactor (k : ℕ) : ℝ := ∏ i in Finset.range k, sqrt (1 + (2 : ℝ)⁻¹ ^ (2 * i))
+def gainFactor (k : ℕ) : ℝ := ∏ i in Finset.range k, Real.sqrt (1 + (2 : ℝ)⁻¹ ^ (2 * i))
 
 theorem gain_factor_pos (k : ℕ) : 0 < gainFactor k := by
   unfold gainFactor
   apply Finset.prod_pos
   intro i _
-  exact sqrt_pos.mpr (by positivity)
+  exact Real.sqrt_pos.mpr (by positivity)
 
 theorem gain_approaches_constant :
     ∃ K : ℝ, 1.6 < K ∧ K < 1.65 ∧

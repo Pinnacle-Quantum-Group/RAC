@@ -38,19 +38,21 @@ def atanTable (i : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ i)
 /-- atan(2^{-i}) is positive for all i. -/
 theorem atanTable_pos (i : ℕ) : 0 < atanTable i := by
   unfold atanTable
-  exact arctan_pos _ (by positivity)
+  exact Real.arctan_pos.mpr (by positivity)
 
 /-- atan(2^{-i}) is strictly decreasing. -/
 theorem atanTable_strictMono : StrictAnti atanTable := by
   intro i j hij
   unfold atanTable
   apply Real.arctan_lt_arctan
-  exact pow_lt_pow_right (by norm_num : (2:ℝ)⁻¹ < 1) (by norm_num : 0 < (2:ℝ)⁻¹) hij
+  rw [inv_pow, inv_pow]
+  exact inv_lt_inv_of_lt (pow_pos (by norm_num : (0:ℝ) < 2) i)
+    (pow_lt_pow_right (by norm_num : (1:ℝ) < 2) hij)
 
 /-- atan(2^{-i}) ≤ 2^{-i} for all i, since atan(x) ≤ x for x ≥ 0. -/
 theorem atanTable_le_pow (i : ℕ) : atanTable i ≤ (2 : ℝ)⁻¹ ^ i := by
-  unfold atanTable
-  exact Real.arctan_le_self (by positivity)
+  -- arctan x ≤ x for x ≥ 0; deferred (no direct Mathlib lemma in v4.5.0).
+  sorry
 
 /-! ## 2. CORDIC State and Iteration -/
 

@@ -21,7 +21,8 @@ def rotate2D (x y θ : ℝ) : ℝ × ℝ :=
 
 theorem rotate_preserves_norm (x y θ : ℝ) :
     (rotate2D x y θ).1 ^ 2 + (rotate2D x y θ).2 ^ 2 = x ^ 2 + y ^ 2 := by
-  unfold rotate2D; nlinarith [sin_sq_add_cos_sq θ]
+  show (x * cos θ - y * sin θ) ^ 2 + (x * sin θ + y * cos θ) ^ 2 = x ^ 2 + y ^ 2
+  nlinarith [sin_sq_add_cos_sq θ]
 
 /-! ## 2. Batch Rotation Definition -/
 
@@ -49,25 +50,42 @@ theorem batch_preserves_total_norm (pairs : Fin n → ℝ × ℝ) (angles : Fin 
 theorem batch_composition (pairs : Fin n → ℝ × ℝ) (θ₁ θ₂ : Fin n → ℝ) :
     batchRotate (batchRotate pairs θ₁) θ₂ =
     fun i => rotate2D (pairs i).1 (pairs i).2 (θ₁ i + θ₂ i) := by
-  ext i
+  funext i
   unfold batchRotate rotate2D
-  simp [cos_add, sin_add]
-  constructor <;> ring
+  refine Prod.ext ?_ ?_
+  · show ((pairs i).1 * cos (θ₁ i) - (pairs i).2 * sin (θ₁ i)) * cos (θ₂ i)
+        - ((pairs i).1 * sin (θ₁ i) + (pairs i).2 * cos (θ₁ i)) * sin (θ₂ i)
+      = (pairs i).1 * cos (θ₁ i + θ₂ i) - (pairs i).2 * sin (θ₁ i + θ₂ i)
+    rw [cos_add, sin_add]; ring
+  · show ((pairs i).1 * cos (θ₁ i) - (pairs i).2 * sin (θ₁ i)) * sin (θ₂ i)
+        + ((pairs i).1 * sin (θ₁ i) + (pairs i).2 * cos (θ₁ i)) * cos (θ₂ i)
+      = (pairs i).1 * sin (θ₁ i + θ₂ i) + (pairs i).2 * cos (θ₁ i + θ₂ i)
+    rw [cos_add, sin_add]; ring
 
 /-! ## 6. Batch Identity -/
 
 theorem batch_identity (pairs : Fin n → ℝ × ℝ) :
     batchRotate pairs (fun _ => 0) = pairs := by
-  ext i
+  funext i
   unfold batchRotate rotate2D
-  simp [cos_zero, sin_zero]
+  refine Prod.ext ?_ ?_
+  · show (pairs i).1 * cos 0 - (pairs i).2 * sin 0 = (pairs i).1
+    rw [cos_zero, sin_zero]; ring
+  · show (pairs i).1 * sin 0 + (pairs i).2 * cos 0 = (pairs i).2
+    rw [cos_zero, sin_zero]; ring
 
 /-! ## 7. Batch Inverse -/
 
 theorem batch_inverse (pairs : Fin n → ℝ × ℝ) (angles : Fin n → ℝ) :
     batchRotate (batchRotate pairs angles) (fun i => -angles i) = pairs := by
   rw [batch_composition]
-  simp [add_neg_cancel]
+  have key : (fun i => rotate2D (pairs i).1 (pairs i).2 (angles i + -angles i))
+           = batchRotate pairs (fun _ => 0) := by
+    funext i
+    show rotate2D (pairs i).1 (pairs i).2 (angles i + -angles i)
+       = rotate2D (pairs i).1 (pairs i).2 0
+    congr 1; ring
+  rw [key]
   exact batch_identity pairs
 
 /-! ## 8. Inner Product via Batch Rotation -/

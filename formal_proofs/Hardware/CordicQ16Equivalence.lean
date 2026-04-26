@@ -2,7 +2,7 @@
 import Mathlib
 namespace RAC.Hardware.CordicQ16
 
-def half_lsb : ℝ := (2 : ℝ)^(-(17 : ℤ))
+noncomputable def half_lsb : ℝ := (2 : ℝ)^(-(17 : ℤ))
 
 theorem pipeline_error_bound : 16 * half_lsb + half_lsb = 17 * half_lsb := by ring
 

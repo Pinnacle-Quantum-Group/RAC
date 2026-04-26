@@ -20,11 +20,19 @@ def ropeRotate (x y θ : ℝ) : ℝ × ℝ :=
 
 theorem rope_preserves_norm (x y θ : ℝ) :
     (ropeRotate x y θ).1 ^ 2 + (ropeRotate x y θ).2 ^ 2 = x ^ 2 + y ^ 2 := by
-  unfold ropeRotate; simp; nlinarith [sin_sq_add_cos_sq θ, cos_sq_add_sin_sq θ]
+  show (x * cos θ - y * sin θ) ^ 2 + (x * sin θ + y * cos θ) ^ 2 = x ^ 2 + y ^ 2
+  nlinarith [sin_sq_add_cos_sq θ]
 
 theorem rope_invertible (x y θ : ℝ) :
     ropeRotate (ropeRotate x y θ).1 (ropeRotate x y θ).2 (-θ) = (x, y) := by
-  unfold ropeRotate; simp [cos_neg, sin_neg]; constructor <;> nlinarith [sin_sq_add_cos_sq θ]
+  show ((x * cos θ - y * sin θ) * cos (-θ) - (x * sin θ + y * cos θ) * sin (-θ),
+        (x * cos θ - y * sin θ) * sin (-θ) + (x * sin θ + y * cos θ) * cos (-θ)) = (x, y)
+  rw [cos_neg, sin_neg]
+  refine Prod.ext ?_ ?_
+  · show (x * cos θ - y * sin θ) * cos θ - (x * sin θ + y * cos θ) * (-sin θ) = x
+    nlinarith [sin_sq_add_cos_sq θ]
+  · show (x * cos θ - y * sin θ) * (-sin θ) + (x * sin θ + y * cos θ) * cos θ = y
+    nlinarith [sin_sq_add_cos_sq θ]
 
 /-! ## 2. Attention Weights Form Valid Distribution -/
 
@@ -39,16 +47,17 @@ theorem attention_weights_nonneg (scores : Fin n → ℝ)
 theorem attention_weights_sum_one (scores : Fin n → ℝ) (hn : 0 < n)
     (hpos : ∀ i, 0 < exp (scores i)) :
     ∑ i, attentionWeights scores hpos i = 1 := by
-  unfold attentionWeights; rw [Finset.sum_div]
+  unfold attentionWeights
+  rw [← Finset.sum_div]
   exact div_self (ne_of_gt (Finset.sum_pos (fun j _ => hpos j) ⟨⟨0, hn⟩, mem_univ _⟩))
 
 theorem attention_weights_le_one (scores : Fin n → ℝ)
-    (hpos : ∀ i, 0 < exp (scores i)) (hn : 0 < n) (i : Fin n) :
+    (hpos : ∀ i, 0 < exp (scores i)) (_hn : 0 < n) (i : Fin n) :
     attentionWeights scores hpos i ≤ 1 := by
   unfold attentionWeights
   apply div_le_one_of_le
-  · exact le_sum_of_subset_of_nonneg (Finset.subset_univ {i})
-      (fun j _ _ => le_of_lt (hpos j)) |>.trans (by simp)
+  · exact Finset.single_le_sum (f := fun j => exp (scores j))
+      (fun j _ => le_of_lt (hpos j)) (Finset.mem_univ i)
   · exact Finset.sum_nonneg fun j _ => le_of_lt (hpos j)
 
 /-! ## 3. Scaling Factor Normalization -/
@@ -62,11 +71,18 @@ theorem scaling_normalizes (d_k : ℝ) (hd : 0 < d_k) :
 def layerNormOutput (x : Fin n → ℝ) (μ σ : ℝ) (hσ : σ > 0) (i : Fin n) : ℝ :=
   (x i - μ) / σ
 
-theorem layerNorm_mean_zero (x : Fin n → ℝ) (hn : 0 < n) (σ : ℝ) (hσ : σ > 0)
-    (hμ : (∑ i, x i) / n = (∑ i, x i) / n) :
-    ∑ i, layerNormOutput x ((∑ i, x i) / ↑n) σ hσ i =
-    (∑ i, x i - (∑ i, x i)) / σ := by
-  sorry
+theorem layerNorm_mean_zero (x : Fin n → ℝ) (hn : 0 < n) (σ : ℝ) (hσ : σ > 0) :
+    ∑ i, layerNormOutput x ((∑ i, x i) / ↑n) σ hσ i = 0 := by
+  unfold layerNormOutput
+  rw [← Finset.sum_div]
+  have hsum : ∑ i, (x i - (∑ j, x j) / ↑n) = 0 := by
+    have : ∀ i ∈ (Finset.univ : Finset (Fin n)),
+        x i - (∑ j, x j) / ↑n = x i + (-((∑ j, x j) / ↑n)) := fun _ _ => by ring
+    rw [Finset.sum_congr rfl this, Finset.sum_add_distrib, Finset.sum_const,
+        Finset.card_univ, Fintype.card_fin]
+    have hn' : (↑n : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (Nat.pos_iff_ne_zero.mp hn)
+    field_simp
+  rw [hsum, zero_div]
 
 /-! ## 5. Full Pipeline: RoPE preserves structure through attention -/
 

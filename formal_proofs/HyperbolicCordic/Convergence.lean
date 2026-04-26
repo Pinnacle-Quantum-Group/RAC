@@ -11,7 +11,11 @@ def walther_schedule (n : Nat) : List Nat :=
 
 def direction (z : Real) : Real := if z >= 0 then 1 else -1
 
-structure HypCordicState where x : Real; y : Real; z : Real deriving Inhabited
+structure HypCordicState where
+  x : Real
+  y : Real
+  z : Real
+  deriving Inhabited
 
 def hyp_cordic_step (s : HypCordicState) (i : Nat) : HypCordicState :=
   let d := direction s.z
@@ -24,15 +28,25 @@ def hyp_cordic_iter (s : HypCordicState) (schedule : List Nat) : HypCordicState 
 
 def hyp_gain_factor (i : Nat) : Real := Real.sqrt (1 - (2 : Real) ^ (-(2 * (i : Int))))
 
-theorem hyp_gain_factor_pos (i : Nat) (hi : i >= 1) :
+theorem hyp_gain_factor_pos (i : Nat) (hi : i ≥ 1) :
     0 < hyp_gain_factor i ∧ hyp_gain_factor i < 1 := by
-  constructor
-  · unfold hyp_gain_factor; apply Real.sqrt_pos_of_pos
-    have : (2 : Real) ^ (-(2 * (i : Int))) < 1 := zpow_lt_one_of_neg (by norm_num) (by omega)
+  -- 0 < 2^(-2i) < 1 since exponent is negative for i ≥ 1
+  have hexp_neg : -(2 * (i : Int)) < 0 := by
+    have : (1 : Int) ≤ (i : Int) := by exact_mod_cast hi
     linarith
-  · unfold hyp_gain_factor; rw [show (1:Real) = Real.sqrt 1 from Real.sqrt_one.symm]
-    apply Real.sqrt_lt_sqrt (by positivity)
-    have : (0:Real) < (2:Real) ^ (-(2 * (i:Int))) := by positivity; linarith
+  have hpos : (0 : Real) < (2 : Real) ^ (-(2 * (i : Int))) := by positivity
+  have hlt : (2 : Real) ^ (-(2 * (i : Int))) < 1 := by
+    rw [show (-(2 * (i : Int))) = -(2 * (i : Int)) from rfl,
+        show (1 : Real) = (2 : Real) ^ (0 : Int) from (zpow_zero _).symm]
+    exact zpow_lt_zpow_right (by norm_num : (1 : Real) < 2) hexp_neg
+  refine ⟨?_, ?_⟩
+  · unfold hyp_gain_factor
+    apply Real.sqrt_pos.mpr
+    linarith
+  · unfold hyp_gain_factor
+    rw [show (1 : Real) = Real.sqrt 1 from Real.sqrt_one.symm]
+    apply Real.sqrt_lt_sqrt (by linarith)
+    linarith
 
 def exp_init (K_inv : Real) (a : Real) : HypCordicState := { x := K_inv, y := K_inv, z := a }
 def tanh_init (a : Real) : HypCordicState := { x := 1, y := 0, z := a }

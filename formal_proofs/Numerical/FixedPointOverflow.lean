@@ -17,7 +17,7 @@ structure Q16_16 where
   raw : Int
   h_range : -2^31 ≤ raw ∧ raw < 2^31
 
-def RAC_ITERS : ℕ := 16
+abbrev RAC_ITERS : ℕ := 16
 
 def atanTableQ16 : Fin RAC_ITERS → Int
   | ⟨0, _⟩ => 51472 | ⟨1, _⟩ => 30386 | ⟨2, _⟩ => 16055 | ⟨3, _⟩ => 8150
@@ -32,7 +32,11 @@ def arithRightShift (v : Int) (n : ℕ) : Int :=
 theorem arithRightShift_neg_is_neg {v : Int} {n : ℕ} (hv : v < 0) :
     arithRightShift v n < 0 := by
   unfold arithRightShift
-  simp only [show ¬(v ≥ 0) from not_le.mpr hv, ite_false]; omega
+  simp only [show ¬(v ≥ 0) from not_le.mpr hv, ite_false]
+  have hpow : (0 : Int) < 2 ^ n := by positivity
+  have hd : (0 : Int) ≤ (-v - 1) / 2 ^ n :=
+    Int.ediv_nonneg (by linarith) hpow.le
+  linarith
 
 theorem arithRightShift_nonneg_is_nonneg {v : Int} {n : ℕ} (hv : 0 ≤ v) :
     0 ≤ arithRightShift v n := by
@@ -41,7 +45,9 @@ theorem arithRightShift_nonneg_is_nonneg {v : Int} {n : ℕ} (hv : 0 ≤ v) :
   exact Int.ediv_nonneg hv (by positivity)
 
 structure CORDICState where
-  x : Int; y : Int; z : Int
+  x : Int
+  y : Int
+  z : Int
 
 def cordicStep (s : CORDICState) (i : Fin RAC_ITERS) : CORDICState :=
   let d := if s.z ≥ 0 then (1 : Int) else (-1 : Int)
