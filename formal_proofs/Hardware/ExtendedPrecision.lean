@@ -11,9 +11,7 @@ theorem error_monotone (m n : Nat) (h : m < n) : cordic_error n < cordic_error m
   unfold cordic_error
   have hcast : (m : ℤ) < (n : ℤ) := by exact_mod_cast h
   have hexp : (-(n : ℤ) + 1) < (-(m : ℤ) + 1) := by linarith
-  exact zpow_lt_zpow_right₀ (by norm_num : (1 : ℝ) < 2) hexp
-  -- NEEDS_VERIFICATION: in older Mathlib this lemma is `zpow_lt_zpow_right`
-  -- (no ₀ suffix). Both have signature `1 < a → m < n → a^m < a^n`.
+  exact zpow_lt_zpow (by norm_num : (1 : ℝ) < 2) hexp
 
 /-- 24-iteration CORDIC matches FP32 mantissa precision: error = 2^(-23). -/
 theorem training_matches_fp32 : cordic_error 24 = (2 : ℝ)^(-(23:ℤ)) := by
