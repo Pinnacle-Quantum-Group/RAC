@@ -8,10 +8,11 @@
 
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic
 import Mathlib.Data.Real.Basic
+import Mathlib.Algebra.BigOperators.Basic
 import Mathlib.Tactic
 
 noncomputable section
-open Real
+open Real Finset BigOperators
 
 namespace RAC.Cordic.MacEquivalence
 
