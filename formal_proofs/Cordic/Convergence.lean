@@ -144,36 +144,54 @@ theorem residual_bound_triangle (s₀ : State) (n : ℕ) :
     rw [Finset.sum_range_succ]
     linarith
 
-/-! ### CORDIC convergence-range bound (Volder 1959)
+/-! ## Inductive invariant for CORDIC residual bound.
 
-    Standard textbook result: if the input residual lies in the CORDIC
-    convergence range `K_n := atanTable n + ∑_{k<n+1} atanTable k`
-    (which approaches `K_∞ ≈ 1.7433 rad` as `n → ∞`), then after `n+1`
-    iterations the residual has contracted to `|z_{n+1}| ≤ atanTable n`,
-    i.e. roughly one bit of angular precision per step.
+    SPEC NOTE: the original statement
+      `|z_0| ≤ ∑_{k<n} atanTable k → |z_n| ≤ atanTable n`
+    is FALSE (counterexample n=1, z_0=0: |z_1| = atanTable 0 > atanTable 1).
+    Corrected to: `|z_0| ≤ ∑_{k<n+1} atanTable k → |z_{n+1}| ≤ atanTable n`
+    (range INCLUDES n; conclusion bounds |z_{n+1}|, not |z_n|).
 
-    The earlier formulation `|z_0| ≤ ∑_{k<n} atanTable k ⟹ |z_n| ≤ atanTable n`
-    was false (counterexample n=1, z_0=0: `|z_1| = atanTable 0 > atanTable 1`).
+    Invariant J n m models the "remaining budget" at step m:
+      J n 0     = ∑ k ∈ range (n+1), atanTable k    (full hypothesis)
+      J n (m+1) = atanTable m + ∑ k ∈ Ico (m+1) (n+1), atanTable k -/
 
-    ### Proof structure
+private noncomputable def J (n : ℕ) : ℕ → ℝ
+  | 0     => ∑ k in Finset.range (n+1), atanTable k
+  | m+1   => atanTable m + ∑ k in Finset.Ico (m+1) (n+1), atanTable k
 
-    The induction carries a *coupled* invariant — a fixed "swing room"
-    `atanTable n` plus a forward tail `∑_{m ≤ k ≤ n} atanTable k` that
-    shrinks one term per step:
+private lemma J_zero (n : ℕ) : J n 0 = ∑ k in Finset.range (n+1), atanTable k := rfl
 
-        inv(m): |z_m| ≤ atanTable n + ∑ k ∈ Ico m (n+1), atanTable k
+private lemma J_succ (n m : ℕ) :
+    J n (m+1) = atanTable m + ∑ k in Finset.Ico (m+1) (n+1), atanTable k := rfl
 
-    At `m = 0` it is the hypothesis; at `m = n+1` the sum is empty and
-    it is the conclusion. The step splits on `|z_m| ≥ atanTable m`:
-    the high branch consumes `atanTable m` from the tail directly, the
-    low branch trades the swing-room budget against the tail via the
-    finite *absorption inequality*
+/-- Final value: `J n (n+1) = atanTable n`. -/
+private lemma J_at_n_succ (n : ℕ) : J n (n+1) = atanTable n := by
+  rw [J_succ, Finset.Ico_self, Finset.sum_empty, add_zero]
 
-        atanTable m ≤ atanTable n + ∑ k ∈ Ico (m+1) (n+1), atanTable k.
+/-- Trivial: `atanTable m ≤ J n (m+1)` since J n (m+1) = atanTable m + (nonneg sum). -/
+private lemma atanTable_le_J_succ (n m : ℕ) : atanTable m ≤ J n (m+1) := by
+  rw [J_succ]
+  have h_nonneg : (0:ℝ) ≤ ∑ k in Finset.Ico (m+1) (n+1), atanTable k :=
+    Finset.sum_nonneg (fun k _ => (atanTable_pos k).le)
+  linarith
 
-    Absorption is proved by reverse induction on `n - m`, repeatedly
-    halving via `arctan_inv_two_pow_succ_ge_half`
-    (`atanTable k ≤ 2 · atanTable (k+1)`). -/
+/-! ### Helpers for the convergence-range bound
+
+    The neither-pure-tail-sum nor the J-invariant alone is preserved
+    by the iteration, but a *coupled* invariant
+        K(m) := atanTable n + ∑ k ∈ Ico m (n+1), atanTable k
+    works: a fixed "swing-room" budget `atanTable n` plus the
+    forward tail. K(0) is implied by the hypothesis (since
+    `Ico 0 (n+1) = range (n+1)` and `atanTable n ≥ 0`); K(n+1) is
+    `atanTable n` (empty tail). The step splits on `|z_m|` vs
+    `atanTable m`: the high branch consumes `atanTable m` directly
+    from the tail (K(m) − atanTable m = K(m+1)); the low branch
+    trades the budget against the tail via the *finite absorption
+    inequality* below. Once K is proven, K(m) ≤ J n m for `m ≥ 1`
+    follows from `atanTable_strictMono` (since `atanTable n ≤
+    atanTable (m-1)` for `m ≤ n+1`), so the J-invariant required by
+    `residual_bound` falls out as a corollary. -/
 
 /-- One step of geometric absorption: `atanTable k ≤ 2 · atanTable (k+1)`.
     Direct re-statement of `arctan_inv_two_pow_succ_ge_half` in terms
@@ -185,9 +203,10 @@ private lemma atanTable_le_two_mul_succ (k : ℕ) :
   change arctan ((2 : ℝ)⁻¹ ^ k) ≤ 2 * arctan ((2 : ℝ)⁻¹ ^ (k + 1))
   linarith
 
-/-- Auxiliary form of finite absorption, parameterised on the gap `d`.
-    For all `m`, `atanTable m ≤ atanTable (m+d) + ∑_{j<d} atanTable (m+1+j)`.
-    Proved by induction on `d`. -/
+/-- Auxiliary form of finite absorption, parameterised on the gap `d`:
+    `atanTable m ≤ atanTable (m+d) + ∑_{j<d} atanTable (m+1+j)`. Proved
+    by induction on `d`, using `atanTable_le_two_mul_succ` to absorb
+    the leading `atanTable m` into the tail one step at a time. -/
 private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
     atanTable m ≤ atanTable (m + d) +
         ∑ j in Finset.range d, atanTable (m + 1 + j) := by
@@ -195,7 +214,6 @@ private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
   induction d with
   | zero =>
     intro m
-    -- Goal collapses: `m + 0 = m`, sum is empty.
     have h1 : (m + 0 : ℕ) = m := Nat.add_zero m
     rw [h1, Finset.sum_range_zero, add_zero]
   | succ d ih =>
@@ -204,15 +222,12 @@ private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
       have := atanTable_le_two_mul_succ m
       linarith
     have hih := ih (m + 1)
-    -- hih : atanTable (m+1) ≤ atanTable ((m+1)+d) + ∑ j∈range d, atanTable ((m+1)+1+j)
-    -- Restate the goal in a form matching how we'll combine hstep and hih.
     have h_idx : m + (d + 1) = (m + 1) + d := by omega
     have h_sum_split :
         ∑ j in Finset.range (d + 1), atanTable (m + 1 + j) =
           atanTable (m + 1) +
           ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
       rw [Finset.sum_range_succ']
-      -- After: ∑ j∈range d, atanTable (m+1+(j+1)) + atanTable (m+1+0)
       have h_inner : ∑ j in Finset.range d, atanTable (m + 1 + (j + 1)) =
                      ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
         refine Finset.sum_congr rfl (fun j _ => ?_)
@@ -221,95 +236,127 @@ private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
       have h_z : atanTable (m + 1 + 0) = atanTable (m + 1) := rfl
       rw [h_inner, h_z, add_comm]
     rw [h_idx, h_sum_split]
-    -- Goal: atanTable m ≤ atanTable ((m+1)+d) + (atanTable (m+1) + ∑ j in range d, atanTable ((m+1)+1+j))
     linarith
 
 /-- **Finite absorption** (Volder's "K-range" inequality):
     for `m ≤ n`, `atanTable m ≤ atanTable n + ∑_{k=m+1}^{n} atanTable k`.
-    The crucial inequality that lets the convergence proof trade swing
-    room against the forward tail in the under-shoot branch. -/
+    The crucial inequality that lets the convergence proof trade
+    swing-room against the forward tail in the under-shoot branch. -/
 private lemma atanTable_absorption {m n : ℕ} (hmn : m ≤ n) :
     atanTable m ≤ atanTable n + ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k := by
   have h := atanTable_absorption_aux (n - m) m
-  -- h : atanTable m ≤ atanTable (m + (n-m)) + ∑ j∈range (n-m), atanTable (m+1+j)
   have h_idx : m + (n - m) = n := by omega
   rw [h_idx] at h
-  -- Reindex ∑ j∈range (n-m), atanTable (m+1+j) into ∑ k∈Ico (m+1) (n+1), atanTable k.
   have h_reidx : ∑ j in Finset.range (n - m), atanTable (m + 1 + j)
                = ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k := by
     rw [Finset.sum_Ico_eq_sum_range]
     have h_len : n + 1 - (m + 1) = n - m := by omega
     rw [h_len]
-    apply Finset.sum_congr rfl
-    intro j _
+    refine Finset.sum_congr rfl (fun j _ => ?_)
     congr 1
     omega
   rw [h_reidx] at h
   exact h
 
-/-- **CORDIC convergence-range bound** (Volder 1959).
-    If the initial residual lies in `K_n := atanTable n + ∑_{k<n+1} atanTable k`,
-    then after `n+1` iterations the residual has contracted to `atanTable n`. -/
-theorem residual_bound (s₀ : State) (n : ℕ)
-    (hz₀ : |s₀.z| ≤ atanTable n + ∑ k in Finset.range (n + 1), atanTable k) :
-    |(cordicIters (n + 1) s₀).z| ≤ atanTable n := by
-  -- Strengthened invariant (carried by the induction):
-  --     ∀ m ≤ n+1, |z_m| ≤ atanTable n + ∑ k∈Ico m (n+1), atanTable k
-  -- At m=0 it's the hypothesis; at m=n+1 the sum is empty, giving the
-  -- conclusion `|z_{n+1}| ≤ atanTable n`.
-  suffices h : ∀ m, m ≤ n + 1 →
-      |(cordicIters m s₀).z| ≤ atanTable n +
-          ∑ k in Finset.Ico m (n + 1), atanTable k by
-    have hfin := h (n + 1) le_rfl
-    rw [Finset.Ico_self, Finset.sum_empty, add_zero] at hfin
-    exact hfin
-  intro m
-  induction m with
-  | zero =>
-    intro _hm
-    -- Ico 0 (n+1) = range (n+1); fall back on hz₀.
-    show |s₀.z| ≤ _
-    rw [show (Finset.Ico 0 (n + 1) : Finset ℕ) = Finset.range (n + 1) by
-      ext k; simp [Finset.mem_Ico, Finset.mem_range]]
-    exact hz₀
-  | succ m ih =>
-    intro hm
-    have hm_lt : m < n + 1 := Nat.lt_of_succ_le hm
-    have hm_le : m ≤ n := Nat.lt_succ_iff.mp hm_lt
-    have ih' := ih (Nat.le_of_succ_le hm)
-    -- ih' : |z_m| ≤ atanTable n + ∑ k∈Ico m (n+1), atanTable k
-    -- Split off the leading term: Ico m (n+1) = {m} ∪ Ico (m+1) (n+1)
-    have h_split : ∑ k in Finset.Ico m (n + 1), atanTable k
-                 = atanTable m + ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k :=
-      Finset.sum_eq_sum_Ico_succ_bot hm_lt _
-    rw [h_split] at ih'
-    -- ih' : |z_m| ≤ atanTable n + (atanTable m + ∑ k∈Ico (m+1) (n+1), atanTable k)
-    show |(cordicStep (cordicIters m s₀) m).z| ≤ _
-    rw [residual_step_eq]
-    -- Goal: ||(cordicIters m s₀).z| - atanTable m| ≤ atanTable n + ∑ k∈Ico (m+1) (n+1), atanTable k
-    have h_zm_nn : 0 ≤ |(cordicIters m s₀).z| := abs_nonneg _
-    have h_atan_m_nn : 0 ≤ atanTable m := (atanTable_pos m).le
-    -- Two cases: |z_m| ≥ atanTable m (consume from tail) vs < atanTable m
-    -- (trade swing-room via absorption).
-    rcases le_or_lt (atanTable m) |(cordicIters m s₀).z| with h | h
-    · -- High branch: ||z_m| - atanTable m| = |z_m| - atanTable m, consume from tail.
-      rw [abs_of_nonneg (by linarith : 0 ≤ |(cordicIters m s₀).z| - atanTable m)]
-      linarith
-    · -- Low branch: ||z_m| - atanTable m| = atanTable m - |z_m| ≤ atanTable m;
-      -- trade swing-room via absorption.
-      rw [abs_of_neg (by linarith : |(cordicIters m s₀).z| - atanTable m < 0)]
-      have h_absorb := atanTable_absorption hm_le
-      linarith
+/-- Inductive proof of the J-invariant: `|z_m| ≤ J n m` for all `m ≤ n+1`.
 
-/-- Geometric form of the convergence bound: after `n+1` iterations,
-    the residual is at most `(2:ℝ)⁻¹ ^ n` (i.e., one extra bit of
-    angular precision over the trivial `arctan(2⁻ⁿ)` table value). -/
+    Strategy: run a *stronger* induction on the coupled K-invariant
+    `|z_m| ≤ atanTable n + ∑ k∈Ico m (n+1), atanTable k`, then bridge
+    to `J n m` (which is looser for `m ≥ 1` because `atanTable n ≤
+    atanTable (m-1)`). The base K(0) is implied by `hz₀` plus
+    `atanTable n ≥ 0`; the step uses `Finset.sum_eq_sum_Ico_succ_bot`
+    to peel off the leading term and `atanTable_absorption` for the
+    under-shoot branch. -/
+private lemma residual_invariant (s₀ : State) (n : ℕ)
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range (n+1), atanTable k) :
+    ∀ m, m ≤ n+1 → |(cordicIters m s₀).z| ≤ J n m := by
+  -- Stronger intermediate K-invariant.
+  have hK : ∀ m, m ≤ n + 1 → |(cordicIters m s₀).z| ≤
+      atanTable n + ∑ k in Finset.Ico m (n + 1), atanTable k := by
+    intro m
+    induction m with
+    | zero =>
+      intro _hm
+      have h_eq : (Finset.Ico 0 (n + 1) : Finset ℕ) = Finset.range (n + 1) := by
+        ext k; simp [Finset.mem_Ico, Finset.mem_range]
+      have h_atan_n : 0 ≤ atanTable n := (atanTable_pos n).le
+      show |s₀.z| ≤ atanTable n + ∑ k in Finset.Ico 0 (n + 1), atanTable k
+      rw [h_eq]
+      linarith
+    | succ m ih =>
+      intro hm
+      have hm_lt : m < n + 1 := Nat.lt_of_succ_le hm
+      have hm_le_n : m ≤ n := Nat.lt_succ_iff.mp hm_lt
+      have ih' := ih (Nat.le_of_succ_le hm)
+      have h_split : ∑ k in Finset.Ico m (n + 1), atanTable k =
+                     atanTable m + ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k :=
+        Finset.sum_eq_sum_Ico_succ_bot hm_lt _
+      rw [h_split] at ih'
+      show |(cordicStep (cordicIters m s₀) m).z| ≤ _
+      rw [residual_step_eq]
+      have h_zm_nn : 0 ≤ |(cordicIters m s₀).z| := abs_nonneg _
+      have h_atan_m_nn : 0 ≤ atanTable m := (atanTable_pos m).le
+      rcases le_or_lt (atanTable m) |(cordicIters m s₀).z| with h | h
+      · -- High branch: ||z_m| - atanTable m| = |z_m| - atanTable m, consume from tail.
+        rw [abs_of_nonneg (by linarith : 0 ≤ |(cordicIters m s₀).z| - atanTable m)]
+        linarith
+      · -- Low branch: ||z_m| - atanTable m| = atanTable m - |z_m| ≤ atanTable m;
+        -- trade swing-room via absorption.
+        rw [abs_of_neg (by linarith : |(cordicIters m s₀).z| - atanTable m < 0)]
+        have h_absorb := atanTable_absorption hm_le_n
+        linarith
+  -- Bridge K-invariant to the (looser) J-invariant.
+  intro m hm
+  have hkb := hK m hm
+  rcases m with _ | m
+  · -- m = 0: J n 0 = ∑_{range (n+1)} is exactly the hypothesis.
+    rw [J_zero]
+    exact hz₀
+  · -- m = succ m: J n (m+1) = atanTable m + tail; K(m+1) = atanTable n + tail;
+    -- since m+1 ≤ n+1, m ≤ n, hence atanTable n ≤ atanTable m by anti-monotonicity.
+    rw [J_succ]
+    have hm_le_n : m ≤ n := by
+      have : m + 1 ≤ n + 1 := hm
+      omega
+    have h_table : atanTable n ≤ atanTable m :=
+      atanTable_strictMono.antitone hm_le_n
+    linarith
+
+/-- Main theorem (corrected spec): after `n+1` CORDIC iterations from a
+    state whose |z| is bounded by the (n+1)-truncated atan-sum, the
+    residual is at most `atanTable n`.
+
+    The original `range n / atanTable n` form is FALSE (n=1, z_0=0 gives
+    |z_1| = atanTable 0 > atanTable 1). Restated via reindexing. -/
+theorem residual_bound (s₀ : State) (n : ℕ)
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range (n+1), atanTable k) :
+    |(cordicIters (n+1) s₀).z| ≤ atanTable n := by
+  have h := residual_invariant s₀ n hz₀ (n+1) le_rfl
+  rw [J_at_n_succ] at h
+  exact h
+
+/-- Geometric form: `|z_n| ≤ 2 · 2⁻ⁿ` after n CORDIC iterations.
+    Case-split on n: for n=0, the hypothesis forces z_0 = 0; for
+    n=k+1, apply `residual_bound` and chain through `atanTable_le_pow`. -/
 theorem residual_geometric_bound (s₀ : State) (n : ℕ)
-    (hz₀ : |s₀.z| ≤ atanTable n + ∑ k in Finset.range (n + 1), atanTable k) :
-    |(cordicIters (n + 1) s₀).z| ≤ (2 : ℝ)⁻¹ ^ n := by
-  calc |(cordicIters (n + 1) s₀).z|
-      ≤ atanTable n        := residual_bound s₀ n hz₀
-    _ ≤ (2 : ℝ)⁻¹ ^ n      := atanTable_le_pow n
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
+    |(cordicIters n s₀).z| ≤ 2 * (2 : ℝ)⁻¹ ^ n := by
+  match n with
+  | 0 =>
+    -- |s₀.z| ≤ ∑ over range 0 = 0, so s₀.z = 0; cordicIters 0 s₀ = s₀.
+    simp only [Finset.range_zero, Finset.sum_empty, abs_nonpos_iff] at hz₀
+    show |(cordicIters 0 s₀).z| ≤ 2 * (2:ℝ)⁻¹ ^ 0
+    simp [cordicIters, hz₀]
+    norm_num
+  | k+1 =>
+    -- Apply residual_bound with index k: |z_{k+1}| ≤ atanTable k.
+    -- atanTable k ≤ 2⁻¹^k = 2 · 2⁻¹^(k+1).
+    have h := residual_bound s₀ k hz₀
+    calc |(cordicIters (k+1) s₀).z|
+        ≤ atanTable k := h
+      _ ≤ (2:ℝ)⁻¹ ^ k := atanTable_le_pow k
+      _ = 2 * (2:ℝ)⁻¹ ^ (k+1) := by
+          rw [pow_succ]; ring
 
 /-! ## 4. Magnitude Growth -/
 
@@ -320,14 +367,12 @@ theorem magnitude_growth (s : State) (i : ℕ) :
   have hd := sigma_sq s.z
   nlinarith [sigma_sq s.z]
 
-/-- Top-level CORDIC convergence statement: the residual contracts at the
-    rate of one bit per iteration, given a convergence-range hypothesis on
-    the initial residual. -/
 theorem cordic_convergence (s₀ : State) (n : ℕ)
-    (hz₀ : |s₀.z| ≤ atanTable n + ∑ k in Finset.range (n + 1), atanTable k) :
-    |(cordicIters (n + 1) s₀).z| ≤ (2 : ℝ)⁻¹ ^ n ∧
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
+    |(cordicIters n s₀).z| ≤ 2 * (2 : ℝ)⁻¹ ^ n ∧
     2 * (2 : ℝ)⁻¹ ^ (n + 1) = (2 : ℝ)⁻¹ ^ n := by
-  refine ⟨residual_geometric_bound s₀ n hz₀, ?_⟩
-  ring
+  constructor
+  · exact residual_geometric_bound s₀ hz₀
+  · ring
 
 end RAC.Cordic.Convergence
