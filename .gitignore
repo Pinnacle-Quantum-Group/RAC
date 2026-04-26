@@ -5,3 +5,7 @@ lib/rust/Cargo.lock
 *.gcda
 *.gcno
 *.gcov
+
+# Lean
+.lake/
+lakefile.olean
