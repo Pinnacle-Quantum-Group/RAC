@@ -144,11 +144,33 @@ theorem residual_bound_triangle (s₀ : State) (n : ℕ) :
 
 /-- **The CORDIC convergence-range bound** is the deeper claim:
     `|z_n| ≤ atanTable n` (1-bit-per-step contraction) when
-    `|z_0| ≤ ∑_{k<∞} atanTable k`. The classical proof requires the
-    inductive invariant `atanTable k ≤ ∑_{j>k} atanTable j` (the
-    "absorption" property of atan(2⁻ᵏ) — Volder 1959, restated by
-    Walther 1971), which in turn requires careful summation analysis
-    of `atan(2⁻ᵏ)` vs `2⁻ᵏ`. Tractable but ~100 lines, deferred. -/
+    `|z_0| ≤ ∑_{k<∞} atanTable k`.
+
+    NOTE — SPEC ISSUE: the current statement with finite hypothesis
+    `|z_0| ≤ ∑_{k<n} atanTable k` is FALSE in general. Counterexample
+    n=1, z_0 = 0: |z_1| = atanTable 0 > atanTable 1. The correct
+    formulation uses either:
+      (a) infinite convergence range `|z_0| ≤ K_∞ := ∑_{k≥0} atanTable k`
+          ⟹ `|z_n| ≤ atanTable n`, OR
+      (b) wider finite range `|z_0| ≤ ∑_{k<n} + atanTable (n-1)`
+          ⟹ `|z_n| ≤ atanTable (n-1)`.
+
+    PROOF DEPENDENCIES (for the corrected version):
+    1. Maclaurin lower bound `x - x³/3 ≤ arctan x` for x ≥ 0
+       — DONE in `RAC.Trig.ArctanBounds.arctan_lb`.
+    2. A TIGHTER upper bound `arctan x ≤ x - c·x³` for some c > 0
+       on x ∈ [0, 1] — needs the next-order Maclaurin term
+       (alternating series gives `arctan x ≤ x - x³/3 + x⁵/5`).
+       NOT yet built; would extend ArctanBounds with `arctan_ub_taylor`.
+    3. Geometric series tail bounds:
+       `∑_{j>k} 2⁻ʲ = 2⁻ᵏ`, `∑_{j>k} 8⁻ʲ = 8⁻ᵏ/7`.
+    4. Absorption property `atanTable k ≤ ∑_{j>k} atanTable j` derived
+       from (1)–(3) — the heart of Volder's argument.
+    5. Inductive invariant `|z_k| ≤ ∑_{j≥k} atanTable j` (infinite tail
+       sum), preserved by `residual_step_eq` + absorption.
+
+    The Maclaurin foundation is in place; the remaining steps form
+    a self-contained ~80-line follow-up. Stubbed. -/
 theorem residual_bound (s₀ : State)
     (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
     |(cordicIters n s₀).z| ≤ atanTable n := by sorry
