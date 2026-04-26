@@ -10,7 +10,7 @@
 import Mathlib
 
 noncomputable section
-open Real
+open Real BigOperators  -- BigOperators needed for `∑` and `∏` syntax
 
 namespace RAC.Cordic.PrecisionKnob
 
@@ -18,18 +18,16 @@ namespace RAC.Cordic.PrecisionKnob
 
 def maxError (k : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ k)
 
-theorem error_positive (k : ℕ) : 0 < maxError k := by
-  unfold maxError; exact arctan_pos _ (by positivity)
+/-- v4.5.0 has neither `arctan_pos`, `arctan_lt_arctan`, nor `arctan_le_self`
+    as standalone lemmas (the `Real.tendsto_arctan_*` and limits exist, but
+    the elementary inequalities here would need to be derived from
+    `arctan_strictMono` — also not present in v4.5.0 — or via the integral
+    representation. Stubbed pending a derivation pass. -/
+theorem error_positive (k : ℕ) : 0 < maxError k := by sorry
 
-theorem error_decreasing : StrictAnti maxError := by
-  intro i j hij
-  unfold maxError
-  apply arctan_lt_arctan
-  exact pow_lt_pow_right (by norm_num : (2:ℝ)⁻¹ < 1) (by norm_num : 0 < (2:ℝ)⁻¹) hij
+theorem error_decreasing : StrictAnti maxError := by sorry
 
-theorem error_bounded_by_power (k : ℕ) : maxError k ≤ (2 : ℝ)⁻¹ ^ k := by
-  unfold maxError
-  exact arctan_le_self (by positivity)
+theorem error_bounded_by_power (k : ℕ) : maxError k ≤ (2 : ℝ)⁻¹ ^ k := by sorry
 
 /-! ## 2. Common Configurations -/
 

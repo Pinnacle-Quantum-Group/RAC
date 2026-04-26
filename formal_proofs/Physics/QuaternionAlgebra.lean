@@ -2,7 +2,11 @@
 import Mathlib
 namespace RAC.Physics.QuaternionAlgebra
 
-structure Quat where w : ℝ; x : ℝ; y : ℝ; z : ℝ
+structure Quat where
+  w : ℝ
+  x : ℝ
+  y : ℝ
+  z : ℝ
 
 def qmul (a b : Quat) : Quat where
   w := a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z

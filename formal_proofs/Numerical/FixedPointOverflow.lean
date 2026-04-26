@@ -41,7 +41,9 @@ theorem arithRightShift_nonneg_is_nonneg {v : Int} {n : ℕ} (hv : 0 ≤ v) :
   exact Int.ediv_nonneg hv (by positivity)
 
 structure CORDICState where
-  x : Int; y : Int; z : Int
+  x : Int
+  y : Int
+  z : Int
 
 def cordicStep (s : CORDICState) (i : Fin RAC_ITERS) : CORDICState :=
   let d := if s.z ≥ 0 then (1 : Int) else (-1 : Int)
