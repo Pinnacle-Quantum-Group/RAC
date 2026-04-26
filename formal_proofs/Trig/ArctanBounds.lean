@@ -153,8 +153,9 @@ private lemma deriv_h₂_pos {y : ℝ} (hy : y ≠ 0) : 0 < deriv h₂ y := by
 
 private lemma continuous_h₂ : Continuous h₂ := by
   unfold h₂
-  exact (Real.continuous_arctan.comp (continuous_id.div_const 2)).const_mul 2 |>.sub
-        Real.continuous_arctan
+  -- `Continuous.const_mul` isn't in Mathlib v4.5.0; use `continuity`
+  -- which closes routine continuity goals (sub, comp, mul, arctan).
+  continuity
 
 /-- `arctan(x)/2 ≤ arctan(x/2)` for `x ≥ 0`.  Concavity-style bound
     derived via `h₂(y) := 2·arctan(y/2) - arctan(y)`, mono with
