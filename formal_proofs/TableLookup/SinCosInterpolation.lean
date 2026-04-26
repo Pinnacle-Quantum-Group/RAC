@@ -33,9 +33,11 @@ theorem interp_error_bound : step_size ^ 2 / 8 < 8e-5 := by
     have h256 : ((256 : ℕ) : ℝ) = 256 := by norm_cast
     rw [h256]; field_simp; ring
   rw [h_eq, div_lt_iff (by norm_num : (0:ℝ) < 131072)]
-  -- 8e-5 * 131072 = 10.48576, and π² < 9.9225 < 10.48576.
+  -- Goal: π² < 8e-5 * 131072.  Rewrite the rhs to a concrete decimal
+  -- so linarith can chain with h_pi_sq.
   have h_const : (8e-5 : ℝ) * 131072 = 10.48576 := by norm_num
-  linarith [h_pi_sq, h_const]
+  rw [h_const]
+  linarith [h_pi_sq]
 
 /-- Any θ wraps into [0, 2π) preserving cos and sin.  Use `Real.toIocMod`-
     style construction.  For now we exhibit `θ - 2π · ⌊θ/(2π)⌋`. -/

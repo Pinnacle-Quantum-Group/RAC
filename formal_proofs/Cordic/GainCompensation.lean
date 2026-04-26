@@ -60,9 +60,11 @@ theorem rac_rotate_preserves_magnitude (x₀ y₀ : ℝ) (n : ℕ) :
   -- post-`field_simp` goal which contains `sqrt (gainSq n) ^ 2`.
   have hself : Real.sqrt (gainSq n) ^ 2 = gainSq n := Real.sq_sqrt hsq_pos
   field_simp [hsq_ne]
-  -- Goal LHS reduces to `(x²+y²) · (gainSq - sqrt²) = 0`, hence the
-  -- linear_combination coefficient is `-(x²+y²)` against `sqrt² - gainSq = 0`.
-  linear_combination -(x₀^2 + y₀^2) * hself
+  -- Goal reduces to `(x²+y²) · (gainSq - sqrt²) = 0`. Rewrite `gainSq`
+  -- as `sqrt²` via hself.symm so ring closes directly without needing
+  -- the right linear_combination sign convention.
+  rw [← hself]
+  ring
 
 /-- gainSq 16 < 2.71234 — tight numerical bound on the 16-term product
     `∏_{i=0}^{15} (1 + 4⁻ⁱ)`.  Direct expansion via `Finset.prod_range_succ`
