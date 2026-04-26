@@ -46,6 +46,10 @@ theorem quantization_error_bound (x : ℝ) :
     field_simp
     ring
   rw [h_eq, abs_mul, abs_of_pos hq]
+  -- Make `r` opaque: the let-binding `r := x/q + 1/2` exposes `x/q`
+  -- (non-linear in q) when linarith unfolds. Treat r as a pure ℝ-variable
+  -- constrained only by h_le and h_lt.
+  clear_value r
   have h_bound : |r - 1 / 2 - (⌊r⌋ : ℝ)| ≤ 1 / 2 := by
     rw [abs_le]
     refine ⟨?_, ?_⟩ <;> linarith
