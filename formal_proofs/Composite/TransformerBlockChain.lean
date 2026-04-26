@@ -59,9 +59,9 @@ theorem attention_weights_le_one (scores : Fin n → ℝ)
   · -- `exp (scores i) ≤ ∑ j, exp (scores j)` because `exp (scores i)` is
     -- one term in a sum of non-negatives. Lift to the singleton sum first.
     calc exp (scores i)
-        = ∑ j ∈ ({i} : Finset (Fin n)), exp (scores j) :=
+        = ∑ j in ({i} : Finset (Fin n)), exp (scores j) :=
           (Finset.sum_singleton _ _).symm
-      _ ≤ ∑ j ∈ Finset.univ, exp (scores j) :=
+      _ ≤ ∑ j in Finset.univ, exp (scores j) :=
           Finset.sum_le_sum_of_subset_of_nonneg (Finset.subset_univ _)
             (fun j _ _ => le_of_lt (hpos j))
   · exact Finset.sum_nonneg fun j _ => le_of_lt (hpos j)
