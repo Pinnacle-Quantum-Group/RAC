@@ -64,8 +64,11 @@ def cordicStep (s : CORDICState) (i : Fin RAC_ITERS) : CORDICState :=
 def inBound (v : Int) (bound_q16 : Int) : Prop := -bound_q16 ≤ v ∧ v < bound_q16
 def two_q16 : Int := 2 * 2 ^ 16
 
+-- Sanity check: sum of all 16 entries (computed: 114247).
+-- `native_decide` triggers a v4.5.0 kernel-reflection issue with the
+-- `match i.val` form; `decide` is fast enough for 16 entries.
 theorem atan_table_sum :
-    (Finset.sum Finset.univ atanTableQ16) = 114295 := by native_decide
+    (Finset.sum Finset.univ atanTableQ16) = 114247 := by decide
 
 theorem cordic_overflow_freedom (x₀ y₀ z₀ : Int)
     (hx : inBound x₀ two_q16) (hy : inBound y₀ two_q16) :

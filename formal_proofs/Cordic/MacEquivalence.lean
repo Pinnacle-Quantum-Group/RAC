@@ -11,7 +11,7 @@ import Mathlib.Data.Real.Basic
 import Mathlib.Tactic
 
 noncomputable section
-open Real
+open Real BigOperators  -- BigOperators needed for `∑` notation
 
 namespace RAC.Cordic.MacEquivalence
 

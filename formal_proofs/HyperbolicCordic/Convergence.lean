@@ -42,11 +42,15 @@ theorem hyp_gain_factor_pos (i : Nat) (hi : i >= 1) :
     zpow_pos_of_pos (by norm_num) _
   constructor
   · unfold hyp_gain_factor; apply Real.sqrt_pos_of_pos; linarith
-  · unfold hyp_gain_factor
-    -- `sqrt(1 - x) < 1` ⟺ `1 - x < 1` (when 1 - x ≥ 0); use the iff form.
-    rw [show (1 : Real) = Real.sqrt 1 from Real.sqrt_one.symm]
-    rw [Real.sqrt_lt_sqrt_iff (by linarith)]
-    linarith
+  · -- `sqrt(1 - x) < 1` via `sqrt(1 - x) < sqrt 1` and `Real.sqrt_one`.
+    -- The iff form `Real.sqrt_lt_sqrt_iff` rewrites *every* occurrence of `1`,
+    -- which then leaves `sqrt 1` opaque to `linarith` — use `calc` instead.
+    unfold hyp_gain_factor
+    have h1 : (0 : Real) ≤ 1 - (2 : Real) ^ (-(2 * (i : Int))) := by linarith
+    have h2 : 1 - (2 : Real) ^ (-(2 * (i : Int))) < 1 := by linarith
+    calc Real.sqrt (1 - (2 : Real) ^ (-(2 * (i : Int))))
+        < Real.sqrt 1 := Real.sqrt_lt_sqrt h1 h2
+      _ = 1 := Real.sqrt_one
 
 def exp_init (K_inv : Real) (a : Real) : HypCordicState := { x := K_inv, y := K_inv, z := a }
 def tanh_init (a : Real) : HypCordicState := { x := 1, y := 0, z := a }

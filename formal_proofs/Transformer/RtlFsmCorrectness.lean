@@ -51,8 +51,8 @@ theorem iter_progression :
     next (.iter 7) false = .iter 8 ∧
     next (.iter 14) false = .iter 15 ∧
     next (.iter 15) false = .done := by
-  -- Each branch is a concrete `if k < 15 then .iter (k+1) else .done`;
-  -- decide closes after `simp [next]` reduces.
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> simp [next]
+  -- Each conjunct is concretely decidable; `simp [next]` unfolds the
+  -- match, then `decide` evaluates the remaining `if k < 15 then ...`.
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> (simp only [next]; decide)
 
 end RAC.Transformer.RtlFsm

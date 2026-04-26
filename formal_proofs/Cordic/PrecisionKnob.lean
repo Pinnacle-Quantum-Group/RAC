@@ -40,10 +40,15 @@ theorem error_24bit : maxError 24 ≤ (2 : ℝ)⁻¹ ^ 24 := error_bounded_by_po
 def totalCoverage (k : ℕ) : ℝ := ∑ i in Finset.range k, arctan ((2 : ℝ)⁻¹ ^ i)
 
 theorem coverage_monotone : Monotone totalCoverage := by
-  intro i j hij
+  -- Avoid reusing the bound name `i` (used inside the sum) for the outer index;
+  -- rename to `m n` so unification doesn't shadow.
+  intro m n hmn
   unfold totalCoverage
-  apply Finset.sum_le_sum_of_subset
-  exact Finset.range_mono hij
+  -- For non-negative summand on `Finset.range n \ Finset.range m`, the larger
+  -- range has a larger sum.
+  apply Finset.sum_le_sum_of_subset_of_nonneg (Finset.range_mono hmn)
+  intro i _ _
+  exact (error_positive i).le
 
 theorem coverage_first_is_pi_over_4 :
     arctan ((2 : ℝ)⁻¹ ^ 0) = π / 4 := by
