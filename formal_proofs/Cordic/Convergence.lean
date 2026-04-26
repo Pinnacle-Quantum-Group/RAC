@@ -98,8 +98,8 @@ def cordicIters : ℕ → State → State
 /-- **Universal CORDIC residual equality** — the heart of single-step
     convergence analysis. -/
 theorem residual_step_eq (s : State) (i : ℕ) :
-    |(cordicStep s i).z| = ||s.z| - atanTable i| := by
-  show |s.z - sigma s.z * atanTable i| = ||s.z| - atanTable i|
+    |(cordicStep s i).z| = | |s.z| - atanTable i | := by
+  show |s.z - sigma s.z * atanTable i| = | |s.z| - atanTable i |
   have h_atan_nonneg : 0 ≤ atanTable i := (atanTable_pos i).le
   unfold sigma
   split_ifs with hz
@@ -136,9 +136,9 @@ theorem residual_bound_triangle (s₀ : State) (n : ℕ) :
     rw [residual_step_eq]
     have h_atan_nonneg : 0 ≤ atanTable n := (atanTable_pos n).le
     -- ||z_n| - atanTable n| ≤ |z_n| + atanTable n  (triangle inequality)
-    have h_tri : ||cordicIters n s₀ .z| - atanTable n| ≤
-        |cordicIters n s₀ .z| + atanTable n := by
-      rcases le_or_lt 0 (|cordicIters n s₀ .z| - atanTable n) with h | h
+    have h_tri : | |(cordicIters n s₀).z| - atanTable n | ≤
+        |(cordicIters n s₀).z| + atanTable n := by
+      rcases le_or_lt 0 (|(cordicIters n s₀).z| - atanTable n) with h | h
       · rw [abs_of_nonneg h]; linarith [abs_nonneg (cordicIters n s₀).z]
       · rw [abs_of_neg h]; linarith [abs_nonneg (cordicIters n s₀).z]
     rw [Finset.sum_range_succ]
@@ -253,8 +253,9 @@ private lemma atanTable_absorption {m n : ℕ} (hmn : m ≤ n) :
     have h_len : n + 1 - (m + 1) = n - m := by omega
     rw [h_len]
     refine Finset.sum_congr rfl (fun j _ => ?_)
-    congr 1
-    omega
+    -- Goal `atanTable (j + (m+1)) = atanTable (m + 1 + j)` reduces via
+    -- `congrArg atanTable` to a Nat equality closed by `omega`.
+    exact congrArg atanTable (by omega)
   rw [h_reidx] at h
   exact h
 
@@ -372,7 +373,7 @@ theorem cordic_convergence (s₀ : State) (n : ℕ)
     |(cordicIters n s₀).z| ≤ 2 * (2 : ℝ)⁻¹ ^ n ∧
     2 * (2 : ℝ)⁻¹ ^ (n + 1) = (2 : ℝ)⁻¹ ^ n := by
   constructor
-  · exact residual_geometric_bound s₀ hz₀
+  · exact residual_geometric_bound s₀ n hz₀
   · ring
 
 end RAC.Cordic.Convergence
