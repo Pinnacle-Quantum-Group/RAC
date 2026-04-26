@@ -195,32 +195,33 @@ private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
   induction d with
   | zero =>
     intro m
-    simp [Finset.sum_range_zero, le_refl]
+    -- Goal collapses: `m + 0 = m`, sum is empty.
+    have h1 : (m + 0 : ℕ) = m := Nat.add_zero m
+    rw [h1, Finset.sum_range_zero, add_zero]
   | succ d ih =>
     intro m
-    -- atanTable m ≤ atanTable (m+1) + atanTable (m+1)
     have hstep : atanTable m ≤ atanTable (m + 1) + atanTable (m + 1) := by
       have := atanTable_le_two_mul_succ m
       linarith
-    -- Apply the IH at (m+1).
     have hih := ih (m + 1)
     -- hih : atanTable (m+1) ≤ atanTable ((m+1)+d) + ∑ j∈range d, atanTable ((m+1)+1+j)
-    -- Reindex the goal sum via Finset.sum_range_succ' (peeling off j=0):
-    --   ∑ j∈range (d+1), atanTable (m+1+j)
-    --     = (∑ j∈range d, atanTable (m+1+(j+1))) + atanTable (m+1+0)
+    -- Restate the goal in a form matching how we'll combine hstep and hih.
     have h_idx : m + (d + 1) = (m + 1) + d := by omega
-    rw [h_idx, Finset.sum_range_succ']
-    -- Match the inner-summand index `m+1+(j+1)` to `(m+1)+1+j` in `hih`.
-    have h_sum_eq : ∑ j in Finset.range d, atanTable (m + 1 + (j + 1))
-                  = ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
-      apply Finset.sum_congr rfl
-      intro j _
-      congr 1
-      omega
-    rw [h_sum_eq]
-    -- Goal now matches: hih + atanTable(m+1) ≥ goal RHS, with hstep on the LHS.
-    have h_simp_zero : (m + 1 + 0 : ℕ) = m + 1 := by omega
-    rw [h_simp_zero]
+    have h_sum_split :
+        ∑ j in Finset.range (d + 1), atanTable (m + 1 + j) =
+          atanTable (m + 1) +
+          ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
+      rw [Finset.sum_range_succ']
+      -- After: ∑ j∈range d, atanTable (m+1+(j+1)) + atanTable (m+1+0)
+      have h_inner : ∑ j in Finset.range d, atanTable (m + 1 + (j + 1)) =
+                     ∑ j in Finset.range d, atanTable ((m + 1) + 1 + j) := by
+        refine Finset.sum_congr rfl (fun j _ => ?_)
+        congr 1
+        omega
+      have h_z : atanTable (m + 1 + 0) = atanTable (m + 1) := rfl
+      rw [h_inner, h_z, add_comm]
+    rw [h_idx, h_sum_split]
+    -- Goal: atanTable m ≤ atanTable ((m+1)+d) + (atanTable (m+1) + ∑ j in range d, atanTable ((m+1)+1+j))
     linarith
 
 /-- **Finite absorption** (Volder's "K-range" inequality):
