@@ -28,7 +28,6 @@ theorem layerNorm_mean_zero (hd : 0 < d) (x : Fin d → Real) (eps : Real) (_hep
   -- Algebra: ∑ (x i - μ)/s = (∑ (x i - μ))/s = (∑ x i - d·μ)/s = 0
   -- since μ := (∑ x i)/d, so d·μ = ∑ x i.
   unfold vecMean layerNormOutput
-  simp only []
   have hd_ne : (d : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (by omega)
   -- Set μ to abbreviate; σ² stays inside sqrt as opaque.
   set μ := (∑ i, x i) / (d : ℝ) with hμ_def

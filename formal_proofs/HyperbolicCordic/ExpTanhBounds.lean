@@ -75,7 +75,11 @@ theorem sigmoid_eq (x : ℝ) : sigmoid x = 1 / (1 + exp (-x)) := by
   have hey : (0:ℝ) < Real.exp (-(x/2)) := Real.exp_pos _
   have hsum_ne : Real.exp (x/2) + Real.exp (-(x/2)) ≠ 0 := by positivity
   have hrhs_ne : (1:ℝ) + Real.exp (-(x/2)) * Real.exp (-(x/2)) ≠ 0 := by positivity
+  -- field_simp introduces a `Real.exp (-x / 2)` form (from `(-x)/2`) that
+  -- ring can't unify with `Real.exp (-(x/2))`; pre-normalise.
+  have h_neg_form : Real.exp (-x / 2) = Real.exp (-(x / 2)) := by congr 1; ring
   field_simp
+  rw [h_neg_form]
   -- Residual reduces to `(e·ē - 1)·ē = 0`; close via h_inv.
   linear_combination 2 * Real.exp (-(x/2)) * h_inv
 

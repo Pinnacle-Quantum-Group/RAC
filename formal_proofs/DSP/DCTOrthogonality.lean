@@ -117,18 +117,14 @@ theorem dct_basis_orthogonal (N : Nat) (hN : N > 0) (k l : Nat)
   have h_theta_d_in_range : -π < θ_d ∧ θ_d < π := by
     rw [hθd_def]
     refine ⟨?_, ?_⟩
-    · -- -π < π(k-l)/(2N): equiv to -(2N) < k-l, true since k ≥ 0, l < N ⟹ k-l > -N > -2N.
+    · -- -π < π(k-l)/(2N) ⟺ -π · (2N) < π · (k-l) ⟺ -(2N) < k-l (π > 0 cancels).
       have h1 : -(2 * (N:ℝ)) < (↑k - ↑l : ℝ) := by linarith
-      have h2 : -(π * (2*↑N)) < π * (↑k - ↑l : ℝ) := by
-        have := mul_lt_mul_of_pos_left h1 h_pi_pos
-        linarith
-      rw [show (-π : ℝ) = -(π * (2*↑N)) / (2*↑N) by field_simp]
-      exact (div_lt_div_iff hN_pos_real hN_pos_real).mpr (by nlinarith)
-    · -- π(k-l)/(2N) < π: equiv to k-l < 2N, true since k < N, l ≥ 0 ⟹ k-l < N < 2N.
+      rw [lt_div_iff hN_pos_real]
+      nlinarith [h_pi_pos, h1]
+    · -- π(k-l)/(2N) < π ⟺ π(k-l) < π · (2N) ⟺ k-l < 2N.
       have h1 : (↑k - ↑l : ℝ) < 2 * ↑N := by linarith
-      have h2 : π * (↑k - ↑l : ℝ) < π * (2*↑N) := mul_lt_mul_of_pos_left h1 h_pi_pos
-      rw [show (π : ℝ) = π * (2*↑N) / (2*↑N) by field_simp]
-      exact (div_lt_div_iff hN_pos_real hN_pos_real).mpr (by nlinarith)
+      rw [div_lt_iff hN_pos_real]
+      nlinarith [h_pi_pos, h1]
   have h_sin_d_ne : sin θ_d ≠ 0 := by
     intro h_sin_zero
     have := (Real.sin_eq_zero_iff_of_lt_of_lt h_theta_d_in_range.1 h_theta_d_in_range.2).mp h_sin_zero
@@ -163,11 +159,10 @@ theorem dct_basis_orthogonal (N : Nat) (hN : N > 0) (k l : Nat)
         · exact mul_nonneg h_pi_pos.le (by linarith)
         · linarith
       linarith
-    · -- π(k+l)/(2N) < π: equiv to k+l < 2N. True since k,l < N.
+    · -- π(k+l)/(2N) < π ⟺ π(k+l) < π · (2N) ⟺ k+l < 2N.
       have h1 : (↑k + ↑l : ℝ) < 2 * ↑N := by linarith
-      have h2 : π * (↑k + ↑l : ℝ) < π * (2*↑N) := mul_lt_mul_of_pos_left h1 h_pi_pos
-      rw [show (π : ℝ) = π * (2*↑N) / (2*↑N) by field_simp]
-      exact (div_lt_div_iff hN_pos_real hN_pos_real).mpr (by nlinarith)
+      rw [div_lt_iff hN_pos_real]
+      nlinarith [h_pi_pos, h1]
   have h_sin_s_ne : sin θ_s ≠ 0 := by
     intro h_sin_zero
     have := (Real.sin_eq_zero_iff_of_lt_of_lt h_theta_s_in_range.1 h_theta_s_in_range.2).mp h_sin_zero
