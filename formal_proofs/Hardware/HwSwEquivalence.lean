@@ -44,9 +44,12 @@ theorem quantization_error_bound (x : ℝ) :
     field_simp
     ring
   rw [h_eq, abs_mul, abs_of_pos hq]
-  -- |r - 0.5 - ⌊r⌋| ≤ 1/2 from the floor bounds
+  -- |r - 0.5 - ⌊r⌋| ≤ 1/2 from the floor bounds.
+  -- `linarith` doesn't see `0.5` (OfScientific) as `1/2`; rewrite explicitly.
+  have h_half : (0.5 : ℝ) = 1 / 2 := by norm_num
   have h_bound : |r - 0.5 - (⌊r⌋ : ℝ)| ≤ 1 / 2 := by
-    rw [abs_le]; refine ⟨?_, ?_⟩ <;> linarith
+    rw [h_half, abs_le]
+    refine ⟨?_, ?_⟩ <;> linarith
   calc q16Resolution * |r - 0.5 - (⌊r⌋ : ℝ)|
       ≤ q16Resolution * (1 / 2) :=
         mul_le_mul_of_nonneg_left h_bound (le_of_lt hq)
@@ -119,7 +122,8 @@ theorem roundtrip_identity (n : ℤ) : quantize (dequantize n) = n := by
   -- (↑n * q) / q + 0.5 = ↑n + 0.5; floor of that is n (since n is integer).
   rw [mul_div_assoc, div_self hq_ne, mul_one]
   apply Int.floor_eq_iff.mpr
-  refine ⟨?_, ?_⟩ <;> simp <;> linarith
+  -- linarith doesn't see `0.5` literal; norm_num closes both bounds.
+  refine ⟨?_, ?_⟩ <;> push_cast <;> norm_num
 
 theorem roundtrip_error (x : ℝ) :
     |dequantize (quantize x) - x| ≤ q16Resolution / 2 := by
