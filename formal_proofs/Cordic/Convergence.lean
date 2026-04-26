@@ -182,7 +182,7 @@ private lemma atanTable_le_two_mul_succ (k : ℕ) :
     atanTable k ≤ 2 * atanTable (k + 1) := by
   have h := arctan_inv_two_pow_succ_ge_half k
   -- h : arctan ((2:ℝ)⁻¹^k) / 2 ≤ arctan ((2:ℝ)⁻¹^(k+1))
-  unfold atanTable
+  change arctan ((2 : ℝ)⁻¹ ^ k) ≤ 2 * arctan ((2 : ℝ)⁻¹ ^ (k + 1))
   linarith
 
 /-- Auxiliary form of finite absorption, parameterised on the gap `d`.
@@ -195,7 +195,7 @@ private lemma atanTable_absorption_aux : ∀ (d m : ℕ),
   induction d with
   | zero =>
     intro m
-    simp [Finset.sum_range_zero]
+    simp [Finset.sum_range_zero, le_refl]
   | succ d ih =>
     intro m
     -- atanTable m ≤ atanTable (m+1) + atanTable (m+1)
