@@ -4,8 +4,13 @@ namespace RAC.Hardware.XracMicrocode
 inductive XracMode | circular | hyperbolic | vectoring deriving DecidableEq
 
 structure XracState where
-  mode : Option XracMode; x : Float; y : Float; z : Float
-  iter : Nat; output : Option Float; configured : Bool
+  mode : Option XracMode
+  x : Float
+  y : Float
+  z : Float
+  iter : Nat
+  output : Option Float
+  configured : Bool
 
 def setmode (s : XracState) (m : XracMode) (x y z : Float) : XracState :=
   { mode := some m, x := x, y := y, z := z, iter := 0, output := none, configured := true }

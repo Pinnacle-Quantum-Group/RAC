@@ -8,7 +8,10 @@ noncomputable section
 open Real Matrix
 namespace RAC.Transformer.RoPE
 
-structure Vec2 where x : Real; y : Real
+@[ext]
+structure Vec2 where
+  x : Real
+  y : Real
 
 def exactRotation (v : Vec2) (θ : Real) : Vec2 :=
   { x := v.x * cos θ - v.y * sin θ,

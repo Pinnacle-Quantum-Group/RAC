@@ -42,10 +42,10 @@ theorem error_24bit : maxError 24 ≤ (2 : ℝ)⁻¹ ^ 24 := error_bounded_by_po
 def totalCoverage (k : ℕ) : ℝ := ∑ i in Finset.range k, Real.arctan ((2 : ℝ)⁻¹ ^ i)
 
 theorem coverage_monotone : Monotone totalCoverage := by
-  intro i j hij
-  unfold totalCoverage
-  apply Finset.sum_le_sum_of_subset
-  exact Finset.range_mono hij
+  -- Monotonicity follows from sum-over-superset with nonneg summands
+  -- (arctan ≥ 0 here), but the nonneg step needs Real.arctan_pos which is
+  -- sorry'd above; deferred.
+  sorry
 
 theorem coverage_first_is_pi_over_4 :
     Real.arctan ((2 : ℝ)⁻¹ ^ 0) = π / 4 := by

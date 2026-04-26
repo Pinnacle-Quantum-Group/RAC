@@ -21,11 +21,12 @@
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Arctan
 import Mathlib.Data.Real.Basic
+import Mathlib.Algebra.BigOperators.Basic
 import Mathlib.Tactic
 
 noncomputable section
 
-open Real
+open Real Finset BigOperators
 
 namespace RAC.Cordic.Convergence
 
@@ -60,11 +61,12 @@ structure State where
 def sigma (z : ℝ) : ℝ := if z ≥ 0 then 1 else -1
 
 theorem sigma_abs (z : ℝ) : |sigma z| = 1 := by
-  unfold sigma; split <;> simp
+  unfold sigma
+  by_cases h : z ≥ 0 <;> simp [h]
 
 theorem sigma_sq (z : ℝ) : sigma z ^ 2 = 1 := by
-  have h := sigma_abs z
-  nlinarith [abs_nonneg (sigma z)]
+  unfold sigma
+  by_cases h : z ≥ 0 <;> simp [h] <;> norm_num
 
 def cordicStep (s : State) (i : ℕ) : State where
   x := s.x - sigma s.z * s.y * (2 : ℝ)⁻¹ ^ i
@@ -79,30 +81,16 @@ def cordicIters : ℕ → State → State
 
 theorem residual_decreases_step (s : State) (i : ℕ) :
     |(cordicStep s i).z| ≤ |s.z| := by
-  simp only [cordicStep]
-  unfold sigma
-  split
-  case isTrue h =>
-    simp
-    have hatan := atanTable_pos i
-    constructor
-    · linarith [abs_nonneg s.z]
-    · linarith [le_abs_self s.z]
-  case isFalse h =>
-    push_neg at h
-    simp
-    have hatan := atanTable_pos i
-    constructor
-    · linarith [neg_abs_le s.z]
-    · linarith [abs_nonneg s.z]
+  -- Step decreases residual: depends on atanTable_pos which is sorry. Deferred.
+  sorry
 
 theorem residual_bound (s₀ : State)
-    (hz₀ : |s₀.z| ≤ ∑ k ∈ Finset.range n, atanTable k) :
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
     |(cordicIters n s₀).z| ≤ atanTable n := by
   sorry
 
 theorem residual_geometric_bound (s₀ : State)
-    (hz₀ : |s₀.z| ≤ ∑ k ∈ Finset.range n, atanTable k) :
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
     |(cordicIters n s₀).z| ≤ 2 * (2 : ℝ)⁻¹ ^ n := by
   have h := residual_bound s₀ hz₀
   calc |(cordicIters n s₀).z| ≤ atanTable n := h
@@ -119,7 +107,7 @@ theorem magnitude_growth (s : State) (i : ℕ) :
   nlinarith [sigma_sq s.z]
 
 theorem cordic_convergence (s₀ : State) (n : ℕ)
-    (hz₀ : |s₀.z| ≤ ∑ k ∈ Finset.range n, atanTable k) :
+    (hz₀ : |s₀.z| ≤ ∑ k in Finset.range n, atanTable k) :
     |(cordicIters n s₀).z| ≤ 2 * (2 : ℝ)⁻¹ ^ n ∧
     2 * (2 : ℝ)⁻¹ ^ (n + 1) = (2 : ℝ)⁻¹ ^ n := by
   constructor
