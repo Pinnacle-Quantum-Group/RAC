@@ -62,7 +62,7 @@ private lemma deriv_g_pos {y : ℝ} (hy : 0 < y) : 0 < deriv g y := by
   exact div_pos h_y4_pos h_denom_pos
 
 private lemma continuous_g : Continuous g := by
-  unfold_let g
+  unfold g
   exact (Real.continuous_arctan.sub continuous_id).add ((continuous_pow 3).div_const _)
 
 /-- `arctan` Maclaurin lower bound: `x - x³/3 ≤ arctan x` for `x ≥ 0`.
@@ -152,7 +152,7 @@ private lemma deriv_h₂_pos {y : ℝ} (hy : y ≠ 0) : 0 < deriv h₂ y := by
   · exact h_denom
 
 private lemma continuous_h₂ : Continuous h₂ := by
-  unfold_let h₂
+  unfold h₂
   exact (Real.continuous_arctan.comp (continuous_id.div_const 2)).const_mul 2 |>.sub
         Real.continuous_arctan
 
@@ -174,7 +174,9 @@ theorem arctan_half_ge {x : ℝ} (hx : 0 ≤ x) : arctan x / 2 ≤ arctan (x / 2
     have h_x_mem : x ∈ Ici (0:ℝ) := hx
     have h_strict := h_mono h_zero_mem h_x_mem hx_pos
     rw [h₂_zero] at h_strict
-    -- 0 < h₂ x = 2·arctan(x/2) - arctan(x)
+    -- 0 < h₂ x; expand `h₂` so linarith sees the linear form
+    -- `0 < 2·arctan(x/2) - arctan(x)`.
+    unfold h₂ at h_strict
     linarith
 
 /-! ## Specialization for CORDIC: bounds on atan(2⁻ᵏ).
