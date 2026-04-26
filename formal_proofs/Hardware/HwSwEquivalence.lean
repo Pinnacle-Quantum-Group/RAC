@@ -100,6 +100,28 @@ def stateError (hw : HwState) (sw : SwState) : ℝ :=
 
 /-! ## 5. Per-Step Error Growth -/
 
+/-- Per-step error growth: HW vs SW state error grows by ≤ 3·q16Resolution.
+
+    PROOF SKETCH (~50-100 lines, deferred):
+    Each component (x, y, z) of `stateError`'s `max` chain decomposes as:
+      Δx' = (dequantize(s.x) - sw.x)
+          + (sw.y · 2⁻ⁱ - dequantize(s.y >>> i))
+    where `s.y >>> i` (arithmetic right shift on ℤ) introduces a
+    rounding error ≤ q16Resolution per shift, and the residual
+    `sw.y · 2⁻ⁱ - dequantize(s.y) · 2⁻ⁱ ≤ 2⁻ⁱ · ε ≤ ε`.
+
+    Three sources of q16Resolution-level error (one per component
+    update) sum to the `3 · q16Resolution` slack.
+
+    Subtle prereq: HW and SW must agree on the σ sign decision, which
+    holds when `|dequantize(hw.z) - sw.z| < |sw.z|` — automatic from
+    `h_init` away from sign flip points. The fully rigorous proof needs:
+      * `dequantize_add` linearity lemma
+      * `Int.shiftRight_eq_div` (HW shift = ℤ-division by 2ⁱ)
+      * `quantize_div_pow_two_error` (quantization error of shift)
+      * triangle inequality on the 3-component max.
+
+    Tractable but substantial. Stubbed. -/
 theorem hw_sw_step_error_bound (hw : HwState) (sw : SwState) (i : ℕ)
     (atanEntry : ℤ) (atanVal : ℝ)
     (h_init : stateError hw sw ≤ ε)

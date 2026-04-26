@@ -89,9 +89,33 @@ theorem gain_factor_pos (k : ℕ) : 0 < gainFactor k := by
   intro i _
   exact sqrt_pos.mpr (by positivity)
 
+/-- gainFactor is monotone increasing — each new factor `sqrt(1 + 4⁻ⁱ) ≥ 1`. -/
+lemma gainFactor_mono : Monotone gainFactor := by
+  intro m n hmn
+  unfold gainFactor
+  apply Finset.prod_le_prod_of_subset_of_one_le' (Finset.range_mono hmn)
+  intros i _ _
+  rw [show (1 : ℝ) = Real.sqrt 1 from Real.sqrt_one.symm]
+  apply Real.sqrt_le_sqrt
+  have : (0 : ℝ) ≤ (2 : ℝ)⁻¹ ^ (2 * i) := by positivity
+  linarith
+
+/-- gainFactor → K for some K ∈ (1.6, 1.65).
+
+    The classical CORDIC gain `K_∞ ≈ 1.64676` (Volder 1959, Walther 1971)
+    is the supremum of the monotone-bounded sequence `gainFactor n`.
+
+    Existence: monotone + bounded above ⟹ converges to sup, via
+    `tendsto_atTop_ciSup`.
+
+    Bounds (deferred): the tight `1.6 < K < 1.65` requires
+    (a) lower: `gainFactor 16 > 1.6` (numerical, like `gain16_bound` below)
+    (b) upper: `K ≤ 1.65` requires bounding the infinite product
+        `∏_{i≥16} sqrt(1 + 4⁻ⁱ)` via `1 + x ≤ exp x` and the tail sum
+        `∑_{i≥16} 4⁻ⁱ = 4⁻¹⁵/3 ≈ 3·10⁻¹⁰` — a multi-step Lean proof.
+        Stubbed pending dedicated effort. -/
 theorem gain_approaches_constant :
     ∃ K : ℝ, 1.6 < K ∧ K < 1.65 ∧
-    Filter.Tendsto gainFactor Filter.atTop (nhds K) := by
-  sorry
+    Filter.Tendsto gainFactor Filter.atTop (nhds K) := by sorry
 
 end RAC.Cordic.PrecisionKnob
