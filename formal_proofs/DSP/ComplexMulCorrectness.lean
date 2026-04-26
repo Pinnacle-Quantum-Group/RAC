@@ -4,6 +4,7 @@ noncomputable section
 open Real
 namespace RAC.DSP.ComplexMul
 
+@[ext]
 structure CplxR where
   re : Real
   im : Real

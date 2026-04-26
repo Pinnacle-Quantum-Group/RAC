@@ -2,6 +2,7 @@
 import Mathlib
 namespace RAC.Physics.QuaternionAlgebra
 
+@[ext]
 structure Quat where
   w : ℝ
   x : ℝ

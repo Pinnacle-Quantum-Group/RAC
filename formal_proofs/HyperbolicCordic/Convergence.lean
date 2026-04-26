@@ -32,17 +32,20 @@ theorem hyp_gain_factor_pos (i : Nat) (hi : i >= 1) :
     0 < hyp_gain_factor i ∧ hyp_gain_factor i < 1 := by
   have h2 : (1 : Real) < 2 := by norm_num
   have hexp_neg : (-(2 * (i : Int))) < 0 := by omega
+  -- `zpow_lt_zpow` lives in Group; ℝ as a DivisionRing uses `zpow_strictMono`
+  -- from Algebra/Order/Field/Power.lean.
   have h_lt_one : (2 : Real) ^ (-(2 * (i : Int))) < 1 := by
     calc (2 : Real) ^ (-(2 * (i : Int)))
-        < (2 : Real) ^ (0 : ℤ) := zpow_lt_zpow h2 hexp_neg
+        < (2 : Real) ^ (0 : ℤ) := zpow_strictMono h2 hexp_neg
       _ = 1 := zpow_zero _
   have h_pos : (0 : Real) < (2 : Real) ^ (-(2 * (i : Int))) :=
     zpow_pos_of_pos (by norm_num) _
   constructor
   · unfold hyp_gain_factor; apply Real.sqrt_pos_of_pos; linarith
   · unfold hyp_gain_factor
+    -- `sqrt(1 - x) < 1` ⟺ `1 - x < 1` (when 1 - x ≥ 0); use the iff form.
     rw [show (1 : Real) = Real.sqrt 1 from Real.sqrt_one.symm]
-    apply Real.sqrt_lt_sqrt (by linarith)
+    rw [Real.sqrt_lt_sqrt_iff (by linarith)]
     linarith
 
 def exp_init (K_inv : Real) (a : Real) : HypCordicState := { x := K_inv, y := K_inv, z := a }
