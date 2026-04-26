@@ -251,11 +251,10 @@ private lemma atanTable_absorption {m n : ℕ} (hmn : m ≤ n) :
                = ∑ k in Finset.Ico (m + 1) (n + 1), atanTable k := by
     rw [Finset.sum_Ico_eq_sum_range]
     have h_len : n + 1 - (m + 1) = n - m := by omega
+    -- After `Finset.sum_Ico_eq_sum_range` and `h_len`, both sides agree
+    -- definitionally (bound-variable rename + Nat add-comm normalisation
+    -- under Lean's WHNF), so the second rewrite alone closes the goal.
     rw [h_len]
-    refine Finset.sum_congr rfl (fun j _ => ?_)
-    -- Goal `atanTable (j + (m+1)) = atanTable (m + 1 + j)` reduces via
-    -- `congrArg atanTable` to a Nat equality closed by `omega`.
-    exact congrArg atanTable (by omega)
   rw [h_reidx] at h
   exact h
 
