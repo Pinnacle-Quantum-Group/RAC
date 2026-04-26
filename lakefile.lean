@@ -19,5 +19,6 @@ lean_lib «RACFormalProofs» where
     .submodules `Numerical,
     .submodules `Physics,
     .submodules `TableLookup,
-    .submodules `Transformer
+    .submodules `Transformer,
+    .submodules `Trig
   ]
