@@ -62,18 +62,62 @@ theorem rac_rotate_preserves_magnitude (x₀ y₀ : ℝ) (n : ℕ) :
   -- After clearing fractions, the residual is `(x²+y²) · (sqrt² - gainSq) = 0`.
   linear_combination (x₀^2 + y₀^2) * hself
 
-/-- gain 16 < 1.647: the standard CORDIC convergence constant.
-    gainSq 16 = ∏_{i=0}^{15} (1 + 4^{-i}) ≈ 2.7138 < 1.647² = 2.713409.
-    Wait — actually the standard product converges to ≈ 2.71436, so the bound
-    1.647 is TIGHT and may not hold exactly at n=16. The classical CORDIC
-    constant K ≈ 1.64676; gain 16 ≈ 1.64676 < 1.647 holds with some margin.
-    Proof requires careful expansion of the 16-term product over ℝ; tractable
-    via `Finset.prod_range_succ` repeated unfolds + `norm_num` but tedious.
-    Stubbed pending a numerical evaluation pass. -/
-theorem gain16_bound : gain 16 < 1.647 := by sorry
+/-- gainSq 16 < 2.71234 — tight numerical bound on the 16-term product
+    `∏_{i=0}^{15} (1 + 4⁻ⁱ)`.  Direct expansion via `Finset.prod_range_succ`
+    16 times gives the explicit rational, which `norm_num` evaluates.
+    Actual value ≈ 2.7118367976; the bound 2.71234 has ~0.0005 margin. -/
+private lemma gainSq_16_lt : gainSq 16 < 2.71234 := by
+  unfold gainSq gainSqFactor
+  simp only [show (16 : ℕ) = 15 + 1 from rfl, Finset.prod_range_succ,
+             Finset.prod_range_zero]
+  norm_num
 
-/-- gainInv 16 = 1/gain 16. From gain 16 < 1.647 (above), gainInv > 1/1.647 ≈ 0.60716.
-    Stubbed: depends on `gain16_bound`. -/
-theorem gainInv16_bound : 0.6072 < gainInv 16 := by sorry
+/-- gain 16 < 1.647 = sqrt(2.713409). Use sqrt monotonicity + the
+    tighter bound gainSq 16 < 2.71234 < 2.713409. -/
+theorem gain16_bound : gain 16 < 1.647 := by
+  unfold gain
+  -- Show via sqrt mono: gainSq 16 < 1.647² and rewrite 1.647 = sqrt(1.647²).
+  have h_target : Real.sqrt (1.647 * 1.647) = 1.647 :=
+    Real.sqrt_mul_self (by norm_num : (0:ℝ) ≤ 1.647)
+  rw [← h_target]
+  apply Real.sqrt_lt_sqrt (gainSq_pos 16).le
+  calc gainSq 16 < 2.71234 := gainSq_16_lt
+    _ < 1.647 * 1.647 := by norm_num
+
+/-- gainInv 16 > 0.6072.  Equivalent to gain 16 < 1/0.6072 ≈ 1.64691.
+    Need gainSq 16 < (1/0.6072)² ≈ 2.71237. Same bound. -/
+theorem gainInv16_bound : 0.6072 < gainInv 16 := by
+  unfold gainInv
+  -- 0.6072 < 1/gain 16 ⟺ 0.6072 * gain 16 < 1 ⟺ gain 16 < 1/0.6072
+  rw [lt_div_iff (gain_pos 16)]
+  -- Goal: 0.6072 * gain 16 < 1
+  -- Use gain 16 < 1.647 (gain16_bound)
+  have h1 : gain 16 < 1.647 := gain16_bound
+  -- 0.6072 * 1.647 = 1.0000584 > 1, so this approach doesn't work directly.
+  -- Need tighter: gain 16 < 1/0.6072 = 10000/6072 = 1250/759 ≈ 1.64690...
+  -- From gainSq 16 < 2.71234 < 2.71237 ≈ (1/0.6072)², so gain 16 < 1/0.6072.
+  have h_sq : gain 16 * gain 16 < 1 / (0.6072 * 0.6072) := by
+    show gain 16 * gain 16 < 1 / (0.6072 * 0.6072)
+    have h_gain_sq_eq : gain 16 * gain 16 = gainSq 16 := by
+      unfold gain
+      exact Real.mul_self_sqrt (gainSq_pos 16).le
+    rw [h_gain_sq_eq]
+    calc gainSq 16 < 2.71234 := gainSq_16_lt
+      _ < 1 / (0.6072 * 0.6072) := by norm_num
+  -- (0.6072 * gain 16)² = 0.6072² * gain 16² < 0.6072² * (1/0.6072²) = 1.
+  -- Therefore 0.6072 * gain 16 < 1 (since both positive).
+  have h_prod_pos : 0 < 0.6072 * gain 16 := by
+    apply mul_pos (by norm_num) (gain_pos 16)
+  have h_prod_sq : (0.6072 * gain 16) * (0.6072 * gain 16) < 1 := by
+    have : (0.6072 * gain 16) * (0.6072 * gain 16) =
+        (0.6072 * 0.6072) * (gain 16 * gain 16) := by ring
+    rw [this]
+    have h_pos_const : (0:ℝ) < 0.6072 * 0.6072 := by norm_num
+    calc (0.6072 * 0.6072) * (gain 16 * gain 16)
+        < (0.6072 * 0.6072) * (1 / (0.6072 * 0.6072)) :=
+          (mul_lt_mul_left h_pos_const).mpr h_sq
+      _ = 1 := by field_simp
+  -- From x² < 1 and x > 0, get x < 1.
+  nlinarith [h_prod_sq, h_prod_pos]
 
 end RAC.Cordic.GainCompensation
