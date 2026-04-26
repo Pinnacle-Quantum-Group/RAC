@@ -11,7 +11,11 @@ def walther_schedule (n : Nat) : List Nat :=
 
 def direction (z : Real) : Real := if z >= 0 then 1 else -1
 
-structure HypCordicState where x : Real; y : Real; z : Real deriving Inhabited
+structure HypCordicState where
+  x : Real
+  y : Real
+  z : Real
+  deriving Inhabited
 
 def hyp_cordic_step (s : HypCordicState) (i : Nat) : HypCordicState :=
   let d := direction s.z
@@ -26,13 +30,27 @@ def hyp_gain_factor (i : Nat) : Real := Real.sqrt (1 - (2 : Real) ^ (-(2 * (i : 
 
 theorem hyp_gain_factor_pos (i : Nat) (hi : i >= 1) :
     0 < hyp_gain_factor i ∧ hyp_gain_factor i < 1 := by
+  have h2 : (1 : Real) < 2 := by norm_num
+  have hexp_neg : (-(2 * (i : Int))) < 0 := by omega
+  -- `zpow_lt_zpow` lives in Group; ℝ as a DivisionRing uses `zpow_strictMono`
+  -- from Algebra/Order/Field/Power.lean.
+  have h_lt_one : (2 : Real) ^ (-(2 * (i : Int))) < 1 := by
+    calc (2 : Real) ^ (-(2 * (i : Int)))
+        < (2 : Real) ^ (0 : ℤ) := zpow_strictMono h2 hexp_neg
+      _ = 1 := zpow_zero _
+  have h_pos : (0 : Real) < (2 : Real) ^ (-(2 * (i : Int))) :=
+    zpow_pos_of_pos (by norm_num) _
   constructor
-  · unfold hyp_gain_factor; apply Real.sqrt_pos_of_pos
-    have : (2 : Real) ^ (-(2 * (i : Int))) < 1 := zpow_lt_one_of_neg (by norm_num) (by omega)
-    linarith
-  · unfold hyp_gain_factor; rw [show (1:Real) = Real.sqrt 1 from Real.sqrt_one.symm]
-    apply Real.sqrt_lt_sqrt (by positivity)
-    have : (0:Real) < (2:Real) ^ (-(2 * (i:Int))) := by positivity; linarith
+  · unfold hyp_gain_factor; apply Real.sqrt_pos_of_pos; linarith
+  · -- `sqrt(1 - x) < 1` via `sqrt(1 - x) < sqrt 1` and `Real.sqrt_one`.
+    -- The iff form `Real.sqrt_lt_sqrt_iff` rewrites *every* occurrence of `1`,
+    -- which then leaves `sqrt 1` opaque to `linarith` — use `calc` instead.
+    unfold hyp_gain_factor
+    have h1 : (0 : Real) ≤ 1 - (2 : Real) ^ (-(2 * (i : Int))) := by linarith
+    have h2 : 1 - (2 : Real) ^ (-(2 * (i : Int))) < 1 := by linarith
+    calc Real.sqrt (1 - (2 : Real) ^ (-(2 * (i : Int))))
+        < Real.sqrt 1 := Real.sqrt_lt_sqrt h1 h2
+      _ = 1 := Real.sqrt_one
 
 def exp_init (K_inv : Real) (a : Real) : HypCordicState := { x := K_inv, y := K_inv, z := a }
 def tanh_init (a : Real) : HypCordicState := { x := 1, y := 0, z := a }

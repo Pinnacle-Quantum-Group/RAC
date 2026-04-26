@@ -8,7 +8,10 @@ noncomputable section
 open Real Matrix
 namespace RAC.Transformer.RoPE
 
-structure Vec2 where x : Real; y : Real
+@[ext]
+structure Vec2 where
+  x : Real
+  y : Real
 
 def exactRotation (v : Vec2) (θ : Real) : Vec2 :=
   { x := v.x * cos θ - v.y * sin θ,
@@ -23,7 +26,9 @@ theorem exactRotation_preserves_normSq (v : Vec2) (θ : Real) :
 
 theorem exactRotation_preserves_innerProduct (u v : Vec2) (θ : Real) :
     innerProduct (exactRotation u θ) (exactRotation v θ) = innerProduct u v := by
-  simp only [innerProduct, exactRotation]; nlinarith [sin_sq_add_cos_sq θ]
+  simp only [innerProduct, exactRotation]
+  -- Bilinear in u.x, u.y, v.x, v.y, sin θ, cos θ; ring + sin²+cos²=1.
+  linear_combination (u.x * v.x + u.y * v.y) * sin_sq_add_cos_sq θ
 
 theorem exactRotation_compose (v : Vec2) (α β : Real) :
     exactRotation (exactRotation v α) β = exactRotation v (α + β) := by

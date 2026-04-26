@@ -11,7 +11,7 @@ import Mathlib.Data.Real.Basic
 import Mathlib.Tactic
 
 noncomputable section
-open Real
+open Real BigOperators  -- BigOperators needed for `∑` notation
 
 namespace RAC.Cordic.MacEquivalence
 
@@ -27,10 +27,10 @@ theorem mac_equivalence (a b : ℝ) :
     let angle_b := if b ≥ 0 then (0 : ℝ) else π
     project a 0 angle_b * |b| = a * b := by
   simp only
-  split
-  case isTrue h => rw [project_zero, abs_of_nonneg h]
-  case isFalse h =>
-    push_neg at h
+  -- v4.5.0 split-ifs idiom: positional bullets, not `case isTrue`/`isFalse`.
+  split_ifs with h
+  · rw [project_zero, abs_of_nonneg h]
+  · push_neg at h
     rw [project_pi, abs_of_neg h]; ring
 
 def racInner (a b : Fin n → ℝ) : ℝ :=

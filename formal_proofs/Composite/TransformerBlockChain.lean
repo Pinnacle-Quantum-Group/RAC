@@ -20,11 +20,18 @@ def ropeRotate (x y θ : ℝ) : ℝ × ℝ :=
 
 theorem rope_preserves_norm (x y θ : ℝ) :
     (ropeRotate x y θ).1 ^ 2 + (ropeRotate x y θ).2 ^ 2 = x ^ 2 + y ^ 2 := by
-  unfold ropeRotate; simp; nlinarith [sin_sq_add_cos_sq θ, cos_sq_add_sin_sq θ]
+  show (x * cos θ - y * sin θ) ^ 2 + (x * sin θ + y * cos θ) ^ 2 = x ^ 2 + y ^ 2
+  nlinarith [sin_sq_add_cos_sq θ, sq_nonneg (cos θ), sq_nonneg (sin θ)]
 
 theorem rope_invertible (x y θ : ℝ) :
     ropeRotate (ropeRotate x y θ).1 (ropeRotate x y θ).2 (-θ) = (x, y) := by
-  unfold ropeRotate; simp [cos_neg, sin_neg]; constructor <;> nlinarith [sin_sq_add_cos_sq θ]
+  -- After Prod.mk.injEq the components are degree-3 in {x, y, sin θ, cos θ};
+  -- nlinarith can't handle that, but `linear_combination` (ring + named
+  -- substitution) closes each side using sin² + cos² = 1.
+  simp only [ropeRotate, cos_neg, sin_neg, Prod.mk.injEq]
+  refine ⟨?_, ?_⟩
+  · linear_combination x * sin_sq_add_cos_sq θ
+  · linear_combination y * sin_sq_add_cos_sq θ
 
 /-! ## 2. Attention Weights Form Valid Distribution -/
 
@@ -39,7 +46,9 @@ theorem attention_weights_nonneg (scores : Fin n → ℝ)
 theorem attention_weights_sum_one (scores : Fin n → ℝ) (hn : 0 < n)
     (hpos : ∀ i, 0 < exp (scores i)) :
     ∑ i, attentionWeights scores hpos i = 1 := by
-  unfold attentionWeights; rw [Finset.sum_div]
+  unfold attentionWeights
+  -- Same parse as softmax_sum_eq_one: `∑ i, (e_i / total) = 1`. Collapse.
+  rw [← Finset.sum_div]
   exact div_self (ne_of_gt (Finset.sum_pos (fun j _ => hpos j) ⟨⟨0, hn⟩, mem_univ _⟩))
 
 theorem attention_weights_le_one (scores : Fin n → ℝ)
@@ -47,8 +56,14 @@ theorem attention_weights_le_one (scores : Fin n → ℝ)
     attentionWeights scores hpos i ≤ 1 := by
   unfold attentionWeights
   apply div_le_one_of_le
-  · exact le_sum_of_subset_of_nonneg (Finset.subset_univ {i})
-      (fun j _ _ => le_of_lt (hpos j)) |>.trans (by simp)
+  · -- `exp (scores i) ≤ ∑ j, exp (scores j)` because `exp (scores i)` is
+    -- one term in a sum of non-negatives. Lift to the singleton sum first.
+    calc exp (scores i)
+        = ∑ j in ({i} : Finset (Fin n)), exp (scores j) :=
+          (Finset.sum_singleton _ _).symm
+      _ ≤ ∑ j in Finset.univ, exp (scores j) :=
+          Finset.sum_le_sum_of_subset_of_nonneg (Finset.subset_univ _)
+            (fun j _ _ => le_of_lt (hpos j))
   · exact Finset.sum_nonneg fun j _ => le_of_lt (hpos j)
 
 /-! ## 3. Scaling Factor Normalization -/

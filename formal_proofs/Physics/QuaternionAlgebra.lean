@@ -2,7 +2,12 @@
 import Mathlib
 namespace RAC.Physics.QuaternionAlgebra
 
-structure Quat where w : ℝ; x : ℝ; y : ℝ; z : ℝ
+@[ext]
+structure Quat where
+  w : ℝ
+  x : ℝ
+  y : ℝ
+  z : ℝ
 
 def qmul (a b : Quat) : Quat where
   w := a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
@@ -20,6 +25,9 @@ theorem mul_conj (q : Quat) : qmul q (conj q) = ⟨normSq q, 0, 0, 0⟩ := by
   unfold qmul conj normSq; ext <;> simp <;> ring
 
 theorem noncommutative : qmul ⟨0,1,0,0⟩ ⟨0,0,1,0⟩ ≠ qmul ⟨0,0,1,0⟩ ⟨0,1,0,0⟩ := by
-  unfold qmul; simp [Quat.mk.injEq]; norm_num
+  unfold qmul
+  -- simp + Quat.mk.injEq + norm-arithmetic closes; the prior `norm_num`
+  -- ran on a no-goals state and failed.
+  simp [Quat.mk.injEq]
 
 end RAC.Physics.QuaternionAlgebra

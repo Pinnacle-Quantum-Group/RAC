@@ -50,6 +50,9 @@ theorem iter_progression :
     next (.iter 0) false = .iter 1 ∧
     next (.iter 7) false = .iter 8 ∧
     next (.iter 14) false = .iter 15 ∧
-    next (.iter 15) false = .done := by simp [next]
+    next (.iter 15) false = .done := by
+  -- Each conjunct is concretely decidable; `simp [next]` unfolds the
+  -- match, then `decide` evaluates the remaining `if k < 15 then ...`.
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> (simp only [next]; decide)
 
 end RAC.Transformer.RtlFsm

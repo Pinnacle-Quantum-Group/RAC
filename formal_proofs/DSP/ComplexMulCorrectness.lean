@@ -4,7 +4,11 @@ noncomputable section
 open Real
 namespace RAC.DSP.ComplexMul
 
-structure CplxR where re : Real; im : Real deriving Inhabited
+@[ext]
+structure CplxR where
+  re : Real
+  im : Real
+  deriving Inhabited
 
 def cplx_mul (a b : CplxR) : CplxR :=
   { re := a.re * b.re - a.im * b.im, im := a.re * b.im + a.im * b.re }
