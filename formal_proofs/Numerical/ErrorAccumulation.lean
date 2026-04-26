@@ -10,7 +10,7 @@
 import Mathlib
 
 noncomputable section
-open Finset BigOperators
+open Finset BigOperators Filter Topology
 
 namespace RAC.Numerical.ErrorAccumulation
 

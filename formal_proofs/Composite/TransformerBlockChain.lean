@@ -25,8 +25,10 @@ theorem rope_preserves_norm (x y θ : ℝ) :
 
 theorem rope_invertible (x y θ : ℝ) :
     ropeRotate (ropeRotate x y θ).1 (ropeRotate x y θ).2 (-θ) = (x, y) := by
-  simp only [ropeRotate, cos_neg, sin_neg]
-  refine Prod.ext ?_ ?_ <;> nlinarith [sin_sq_add_cos_sq θ]
+  -- Prod.mk.injEq exposes the two component equalities so nlinarith
+  -- doesn't have to see through Prod.fst/Prod.snd projections.
+  simp only [ropeRotate, cos_neg, sin_neg, Prod.mk.injEq]
+  refine ⟨?_, ?_⟩ <;> nlinarith [sin_sq_add_cos_sq θ]
 
 /-! ## 2. Attention Weights Form Valid Distribution -/
 
