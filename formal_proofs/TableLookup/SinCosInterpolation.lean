@@ -26,13 +26,16 @@ theorem interp_error_bound : step_size ^ 2 / 8 < 8e-5 := by
     have h_sum_pos : 0 < 3.15 + π := by linarith
     have h_diff_pos : 0 < 3.15 - π := by linarith
     have h_prod : 0 < (3.15 + π) * (3.15 - π) := mul_pos h_sum_pos h_diff_pos
-    nlinarith [h_prod]
+    -- Expand the product so linarith sees the relation as linear in π^2.
+    have h_expand : (3.15 + π) * (3.15 - π) = 9.9225 - π ^ 2 := by ring
+    linarith [h_expand ▸ h_prod]
   have h_eq : ((2 : ℝ) * π / ↑(256 : ℕ)) ^ 2 / 8 = π ^ 2 / 131072 := by
     have h256 : ((256 : ℕ) : ℝ) = 256 := by norm_cast
     rw [h256]; field_simp; ring
   rw [h_eq, div_lt_iff (by norm_num : (0:ℝ) < 131072)]
   -- 8e-5 * 131072 = 10.48576, and π² < 9.9225 < 10.48576.
-  nlinarith [h_pi_sq]
+  have h_const : (8e-5 : ℝ) * 131072 = 10.48576 := by norm_num
+  linarith [h_pi_sq, h_const]
 
 /-- Any θ wraps into [0, 2π) preserving cos and sin.  Use `Real.toIocMod`-
     style construction.  For now we exhibit `θ - 2π · ⌊θ/(2π)⌋`. -/

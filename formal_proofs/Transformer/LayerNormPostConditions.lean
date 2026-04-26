@@ -36,6 +36,7 @@ theorem layerNorm_mean_zero (hd : 0 < d) (x : Fin d → Real) (eps : Real) (_hep
     rw [Finset.sum_sub_distrib, Finset.sum_const, Finset.card_univ,
         Fintype.card_fin, nsmul_eq_mul]
     field_simp
+    ring
   rw [h_sum, zero_div, zero_div]
 
 def rmsNormOutput (x : Fin d → Real) (eps : Real) : Fin d → Real :=
