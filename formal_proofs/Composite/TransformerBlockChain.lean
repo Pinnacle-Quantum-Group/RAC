@@ -78,10 +78,17 @@ def layerNormOutput (x : Fin n → ℝ) (μ σ : ℝ) (hσ : σ > 0) (i : Fin n)
   (x i - μ) / σ
 
 theorem layerNorm_mean_zero (x : Fin n → ℝ) (hn : 0 < n) (σ : ℝ) (hσ : σ > 0)
-    (hμ : (∑ i, x i) / n = (∑ i, x i) / n) :
+    (_hμ : (∑ i, x i) / n = (∑ i, x i) / n) :
     ∑ i, layerNormOutput x ((∑ i, x i) / ↑n) σ hσ i =
     (∑ i, x i - (∑ i, x i)) / σ := by
-  sorry
+  -- Both sides equal 0/σ; the LHS unfolds to (∑(x - μ))/σ where μ := (∑x)/n.
+  unfold layerNormOutput
+  rw [← Finset.sum_div]
+  congr 1
+  rw [Finset.sum_sub_distrib, Finset.sum_const, Finset.card_univ, Fintype.card_fin,
+      nsmul_eq_mul]
+  have hn_ne : (n : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (by omega)
+  field_simp
 
 /-! ## 5. Full Pipeline: RoPE preserves structure through attention -/
 
