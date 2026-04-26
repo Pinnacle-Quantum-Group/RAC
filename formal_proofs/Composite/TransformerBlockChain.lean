@@ -89,6 +89,7 @@ theorem layerNorm_mean_zero (x : Fin n → ℝ) (hn : 0 < n) (σ : ℝ) (hσ : �
       nsmul_eq_mul]
   have hn_ne : (n : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (by omega)
   field_simp
+  ring
 
 /-! ## 5. Full Pipeline: RoPE preserves structure through attention -/
 

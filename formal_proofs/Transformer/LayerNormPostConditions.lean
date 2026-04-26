@@ -25,20 +25,18 @@ def layerNormOutput (x : Fin d → Real) (eps : Real) : Fin d → Real :=
 
 theorem layerNorm_mean_zero (hd : 0 < d) (x : Fin d → Real) (eps : Real) (_heps : 0 < eps) :
     vecMean (layerNormOutput x eps) = 0 := by
-  -- Algebra: ∑ (x i - μ)/s = (∑ (x i - μ))/s = (∑ x i - d·μ)/s = 0
-  -- since μ := (∑ x i)/d, so d·μ = ∑ x i.
-  unfold vecMean layerNormOutput
-  simp only []
+  -- Algebra: ∑ (x i - μ)/s = (∑ (x i - μ))/s = 0/s = 0 since ∑ (x i - μ) = 0.
+  -- Use simp only [vecMean, layerNormOutput] (more aggressive than `unfold` for
+  -- nested let-bindings — `unfold vecMean` only touches the outermost call,
+  -- leaving `vecMean x` inside the µ-binding).
+  simp only [vecMean, layerNormOutput]
   have hd_ne : (d : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (by omega)
-  -- Set μ to abbreviate; σ² stays inside sqrt as opaque.
-  set μ := (∑ i, x i) / (d : ℝ) with hμ_def
-  -- Pull 1/sqrt out of the sum.
   rw [← Finset.sum_div]
-  -- Show numerator = 0.
-  have h_sum : ∑ i : Fin d, (x i - μ) = 0 := by
+  have h_sum : ∑ i : Fin d, (x i - (∑ j, x j) / (d : ℝ)) = 0 := by
     rw [Finset.sum_sub_distrib, Finset.sum_const, Finset.card_univ,
-        Fintype.card_fin, nsmul_eq_mul, hμ_def]
+        Fintype.card_fin, nsmul_eq_mul]
     field_simp
+    ring
   rw [h_sum, zero_div, zero_div]
 
 def rmsNormOutput (x : Fin d → Real) (eps : Real) : Fin d → Real :=
