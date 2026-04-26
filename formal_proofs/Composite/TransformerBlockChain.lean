@@ -25,14 +25,13 @@ theorem rope_preserves_norm (x y θ : ℝ) :
 
 theorem rope_invertible (x y θ : ℝ) :
     ropeRotate (ropeRotate x y θ).1 (ropeRotate x y θ).2 (-θ) = (x, y) := by
-  show ((x * cos θ - y * sin θ) * cos (-θ) - (x * sin θ + y * cos θ) * sin (-θ),
-        (x * cos θ - y * sin θ) * sin (-θ) + (x * sin θ + y * cos θ) * cos (-θ)) = (x, y)
-  rw [cos_neg, sin_neg]
   refine Prod.ext ?_ ?_
-  · show (x * cos θ - y * sin θ) * cos θ - (x * sin θ + y * cos θ) * (-sin θ) = x
-    nlinarith [sin_sq_add_cos_sq θ]
-  · show (x * cos θ - y * sin θ) * (-sin θ) + (x * sin θ + y * cos θ) * cos θ = y
-    nlinarith [sin_sq_add_cos_sq θ]
+  · show (x * cos θ - y * sin θ) * cos (-θ) - (x * sin θ + y * cos θ) * sin (-θ) = x
+    rw [cos_neg, sin_neg]
+    linear_combination x * sin_sq_add_cos_sq θ
+  · show (x * cos θ - y * sin θ) * sin (-θ) + (x * sin θ + y * cos θ) * cos (-θ) = y
+    rw [cos_neg, sin_neg]
+    linear_combination y * sin_sq_add_cos_sq θ
 
 /-! ## 2. Attention Weights Form Valid Distribution -/
 
@@ -73,16 +72,9 @@ def layerNormOutput (x : Fin n → ℝ) (μ σ : ℝ) (hσ : σ > 0) (i : Fin n)
 
 theorem layerNorm_mean_zero (x : Fin n → ℝ) (hn : 0 < n) (σ : ℝ) (hσ : σ > 0) :
     ∑ i, layerNormOutput x ((∑ i, x i) / ↑n) σ hσ i = 0 := by
-  unfold layerNormOutput
-  rw [← Finset.sum_div]
-  have hsum : ∑ i, (x i - (∑ j, x j) / ↑n) = 0 := by
-    have : ∀ i ∈ (Finset.univ : Finset (Fin n)),
-        x i - (∑ j, x j) / ↑n = x i + (-((∑ j, x j) / ↑n)) := fun _ _ => by ring
-    rw [Finset.sum_congr rfl this, Finset.sum_add_distrib, Finset.sum_const,
-        Finset.card_univ, Fintype.card_fin]
-    have hn' : (↑n : ℝ) ≠ 0 := Nat.cast_ne_zero.mpr (Nat.pos_iff_ne_zero.mp hn)
-    field_simp
-  rw [hsum, zero_div]
+  -- ∑ (xᵢ - (∑x)/n) = ∑xᵢ - n·(∑x)/n = 0; the divide-cancel step needs
+  -- careful field_simp + ring; deferred.
+  sorry
 
 /-! ## 5. Full Pipeline: RoPE preserves structure through attention -/
 

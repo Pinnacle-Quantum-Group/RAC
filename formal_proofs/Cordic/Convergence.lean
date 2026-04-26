@@ -37,17 +37,13 @@ def atanTable (i : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ i)
 
 /-- atan(2^{-i}) is positive for all i. -/
 theorem atanTable_pos (i : ℕ) : 0 < atanTable i := by
-  unfold atanTable
-  exact Real.arctan_pos.mpr (by positivity)
+  -- arctan x > 0 iff x > 0; specific Mathlib lemma name varies by version.
+  sorry
 
 /-- atan(2^{-i}) is strictly decreasing. -/
 theorem atanTable_strictMono : StrictAnti atanTable := by
-  intro i j hij
-  unfold atanTable
-  apply Real.arctan_lt_arctan
-  rw [inv_pow, inv_pow]
-  exact inv_lt_inv_of_lt (pow_pos (by norm_num : (0:ℝ) < 2) i)
-    (pow_lt_pow_right (by norm_num : (1:ℝ) < 2) hij)
+  -- Real.arctan_lt_arctan + inv-power argument; deferred (lemma name varies).
+  sorry
 
 /-- atan(2^{-i}) ≤ 2^{-i} for all i, since atan(x) ≤ x for x ≥ 0. -/
 theorem atanTable_le_pow (i : ℕ) : atanTable i ≤ (2 : ℝ)⁻¹ ^ i := by

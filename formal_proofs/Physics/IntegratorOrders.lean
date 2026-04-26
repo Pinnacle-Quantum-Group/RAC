@@ -1,5 +1,6 @@
 -- ODE integrators: Euler O(dt²), Verlet time-reversible, RK4 O(dt⁵)
 import Mathlib
+noncomputable section
 namespace RAC.Physics.Integrators
 
 def euler_step (x v a dt : ℝ) : ℝ × ℝ := (x + v*dt, v + a*dt)

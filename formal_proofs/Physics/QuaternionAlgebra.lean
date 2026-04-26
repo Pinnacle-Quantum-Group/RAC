@@ -25,6 +25,7 @@ theorem mul_conj (q : Quat) : qmul q (conj q) = ⟨normSq q, 0, 0, 0⟩ := by
   unfold qmul conj normSq; ext <;> simp <;> ring
 
 theorem noncommutative : qmul ⟨0,1,0,0⟩ ⟨0,0,1,0⟩ ≠ qmul ⟨0,0,1,0⟩ ⟨0,1,0,0⟩ := by
-  unfold qmul; simp [Quat.mk.injEq]; norm_num
+  unfold qmul
+  simp [Quat.mk.injEq]
 
 end RAC.Physics.QuaternionAlgebra

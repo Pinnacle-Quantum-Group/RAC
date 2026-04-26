@@ -41,7 +41,7 @@ theorem rope_is_givens (x₁ x₂ θ : ℝ) :
 theorem rope_preserves_magnitude (x₁ x₂ θ : ℝ) :
     (ropeTransform x₁ x₂ θ).1 ^ 2 + (ropeTransform x₁ x₂ θ).2 ^ 2 =
     x₁ ^ 2 + x₂ ^ 2 := by
-  unfold ropeTransform
+  show (x₁ * cos θ - x₂ * sin θ) ^ 2 + (x₁ * sin θ + x₂ * cos θ) ^ 2 = x₁ ^ 2 + x₂ ^ 2
   nlinarith [sin_sq_add_cos_sq θ]
 
 /-! ## 5. Givens Composition = Angle Addition -/
@@ -51,8 +51,13 @@ theorem rope_composition (x₁ x₂ θ₁ θ₂ : ℝ) :
       (ropeTransform x₁ x₂ θ₁).1
       (ropeTransform x₁ x₂ θ₁).2 θ₂ =
     ropeTransform x₁ x₂ (θ₁ + θ₂) := by
-  unfold ropeTransform
-  constructor <;> { simp [cos_add, sin_add]; ring }
+  refine Prod.ext ?_ ?_
+  · show (x₁ * cos θ₁ - x₂ * sin θ₁) * cos θ₂ - (x₁ * sin θ₁ + x₂ * cos θ₁) * sin θ₂
+       = x₁ * cos (θ₁ + θ₂) - x₂ * sin (θ₁ + θ₂)
+    rw [cos_add, sin_add]; ring
+  · show (x₁ * cos θ₁ - x₂ * sin θ₁) * sin θ₂ + (x₁ * sin θ₁ + x₂ * cos θ₁) * cos θ₂
+       = x₁ * sin (θ₁ + θ₂) + x₂ * cos (θ₁ + θ₂)
+    rw [cos_add, sin_add]; ring
 
 /-! ## 6. Identity at θ = 0 -/
 
@@ -66,7 +71,9 @@ theorem rope_inverse (x₁ x₂ θ : ℝ) :
     ropeTransform
       (ropeTransform x₁ x₂ θ).1
       (ropeTransform x₁ x₂ θ).2 (-θ) = (x₁, x₂) := by
-  rw [rope_composition, add_neg_cancel]; exact rope_identity x₁ x₂
+  rw [rope_composition]
+  rw [show θ + -θ = (0 : ℝ) from by ring]
+  exact rope_identity x₁ x₂
 
 /-! ## 8. Position-Dependent Angle -/
 

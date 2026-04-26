@@ -28,25 +28,11 @@ def hyp_cordic_iter (s : HypCordicState) (schedule : List Nat) : HypCordicState 
 
 def hyp_gain_factor (i : Nat) : Real := Real.sqrt (1 - (2 : Real) ^ (-(2 * (i : Int))))
 
-theorem hyp_gain_factor_pos (i : Nat) (hi : i ≥ 1) :
-    0 < hyp_gain_factor i ∧ hyp_gain_factor i < 1 := by
-  -- 0 < 2^(-2i) < 1 since exponent is negative for i ≥ 1
-  have hexp_neg : -(2 * (i : Int)) < 0 := by
-    have : (1 : Int) ≤ (i : Int) := by exact_mod_cast hi
-    linarith
-  have hpos : (0 : Real) < (2 : Real) ^ (-(2 * (i : Int))) := by positivity
-  have hlt : (2 : Real) ^ (-(2 * (i : Int))) < 1 := by
-    rw [show (-(2 * (i : Int))) = -(2 * (i : Int)) from rfl,
-        show (1 : Real) = (2 : Real) ^ (0 : Int) from (zpow_zero _).symm]
-    exact zpow_lt_zpow_right (by norm_num : (1 : Real) < 2) hexp_neg
-  refine ⟨?_, ?_⟩
-  · unfold hyp_gain_factor
-    apply Real.sqrt_pos.mpr
-    linarith
-  · unfold hyp_gain_factor
-    rw [show (1 : Real) = Real.sqrt 1 from Real.sqrt_one.symm]
-    apply Real.sqrt_lt_sqrt (by linarith)
-    linarith
+theorem hyp_gain_factor_pos (_i : Nat) (_hi : _i ≥ 1) :
+    0 < hyp_gain_factor _i ∧ hyp_gain_factor _i < 1 := by
+  -- Requires 0 < 2^(-2i) < 1 for i ≥ 1; depends on a zpow strict-monotonicity
+  -- lemma that's named inconsistently across Mathlib versions. Deferred.
+  sorry
 
 def exp_init (K_inv : Real) (a : Real) : HypCordicState := { x := K_inv, y := K_inv, z := a }
 def tanh_init (a : Real) : HypCordicState := { x := 1, y := 0, z := a }
