@@ -22,10 +22,12 @@ import Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Arctan
 import Mathlib.Data.Real.Basic
 import Mathlib.Tactic
+import RAC.Cordic.ArctanFacts
 
 noncomputable section
 
 open Real BigOperators  -- BigOperators needed for `∑` notation
+open RAC.Cordic.ArctanFacts
 
 namespace RAC.Cordic.Convergence
 
@@ -36,17 +38,21 @@ namespace RAC.Cordic.Convergence
 def atanTable (i : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ i)
 
 /-- atan(2^{-i}) is positive for all i.
-    NOTE: Mathlib v4.5.0 doesn't ship `Real.arctan_pos`, `Real.arctan_lt_arctan`,
-    or `Real.arctan_le_self` as named lemmas. These are textbook results
-    (Volder 1959, derivable from the integral form `arctan x = ∫_0^x dt/(1+t²)`)
-    but require a derivation pass to prove from current v4.5.0 primitives. -/
-theorem atanTable_pos (i : ℕ) : 0 < atanTable i := by sorry
+    Closed via `RAC.Cordic.ArctanFacts.arctan_pos` (round 8 — derived
+    in v4.5.0 from `tan_arctan` + `strictMonoOn_tan` + `arctan_zero`). -/
+theorem atanTable_pos (i : ℕ) : 0 < atanTable i :=
+  arctan_pos (inv_two_pow_pos i)
 
-/-- atan(2^{-i}) is strictly decreasing. -/
-theorem atanTable_strictMono : StrictAnti atanTable := by sorry
+/-- atan(2^{-i}) is strictly decreasing in i.  Composition of:
+    `(2:ℝ)⁻¹ ^ ·` strictly anti on ℕ (since `2⁻¹ ∈ (0,1)`), and
+    `arctan` strictly mono on ℝ. -/
+theorem atanTable_strictMono : StrictAnti atanTable :=
+  arctan_strictMono.comp_strictAnti inv_two_pow_strictAnti
 
-/-- atan(2^{-i}) ≤ 2^{-i} for all i, since atan(x) ≤ x for x ≥ 0. -/
-theorem atanTable_le_pow (i : ℕ) : atanTable i ≤ (2 : ℝ)⁻¹ ^ i := by sorry
+/-- atan(2^{-i}) ≤ 2^{-i} for all i.  Direct from
+    `arctan_le_self_of_nonneg` since `(2:ℝ)⁻¹^i ≥ 0`. -/
+theorem atanTable_le_pow (i : ℕ) : atanTable i ≤ (2 : ℝ)⁻¹ ^ i :=
+  arctan_le_self_of_nonneg (inv_two_pow_pos i).le
 
 /-! ## 2. CORDIC State and Iteration -/
 
