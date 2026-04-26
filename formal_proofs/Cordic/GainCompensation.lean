@@ -56,11 +56,10 @@ theorem rac_rotate_preserves_magnitude (x₀ y₀ : ℝ) (n : ℕ) :
   have hsq_ne : gainSq n ≠ 0 := ne_of_gt (gainSq_pos n)
   have hsqrt_pos : 0 < Real.sqrt (gainSq n) := Real.sqrt_pos.mpr (gainSq_pos n)
   have hsqrt_ne : Real.sqrt (gainSq n) ≠ 0 := ne_of_gt hsqrt_pos
-  -- Key algebraic input: sqrt(gainSq n) · sqrt(gainSq n) = gainSq n.
-  have hself : Real.sqrt (gainSq n) * Real.sqrt (gainSq n) = gainSq n :=
-    Real.mul_self_sqrt hsq_pos
+  -- Use the `^2` form (Real.sq_sqrt) so the ring closer can match the
+  -- post-`field_simp` goal which contains `sqrt (gainSq n) ^ 2`.
+  have hself : Real.sqrt (gainSq n) ^ 2 = gainSq n := Real.sq_sqrt hsq_pos
   field_simp [hsq_ne]
-  -- After clearing fractions, the residual is `(x²+y²) · (sqrt² - gainSq) = 0`.
   linear_combination (x₀^2 + y₀^2) * hself
 
 /-- gainSq 16 < 2.71234 — tight numerical bound on the 16-term product

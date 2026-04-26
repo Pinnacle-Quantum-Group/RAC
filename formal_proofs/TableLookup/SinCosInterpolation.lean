@@ -20,16 +20,19 @@ theorem interp_error_bound : step_size ^ 2 / 8 < 8e-5 := by
   unfold step_size TABLE_SIZE
   have h_pi_upper : π < 3.15 := by linarith [Real.pi_lt_315]
   have h_pi_pos : 0 < π := Real.pi_pos
+  -- Bound π² via the difference-of-squares trick:
+  -- (3.15 + π) · (3.15 - π) > 0 ⟹ 3.15² > π² ⟹ π² < 9.9225.
   have h_pi_sq : π ^ 2 < 9.9225 := by
-    have h1 : π * π < 3.15 * π := (mul_lt_mul_right h_pi_pos).mpr h_pi_upper
-    have h2 : 3.15 * π < 3.15 * 3.15 :=
-      (mul_lt_mul_left (by norm_num : (0:ℝ) < 3.15)).mpr h_pi_upper
-    nlinarith [h1, h2]
+    have h_sum_pos : 0 < 3.15 + π := by linarith
+    have h_diff_pos : 0 < 3.15 - π := by linarith
+    have h_prod : 0 < (3.15 + π) * (3.15 - π) := mul_pos h_sum_pos h_diff_pos
+    nlinarith [h_prod]
   have h_eq : ((2 : ℝ) * π / ↑(256 : ℕ)) ^ 2 / 8 = π ^ 2 / 131072 := by
     have h256 : ((256 : ℕ) : ℝ) = 256 := by norm_cast
     rw [h256]; field_simp; ring
   rw [h_eq, div_lt_iff (by norm_num : (0:ℝ) < 131072)]
-  linarith [h_pi_sq]
+  -- 8e-5 * 131072 = 10.48576, and π² < 9.9225 < 10.48576.
+  nlinarith [h_pi_sq]
 
 /-- Any θ wraps into [0, 2π) preserving cos and sin.  Use `Real.toIocMod`-
     style construction.  For now we exhibit `θ - 2π · ⌊θ/(2π)⌋`. -/
