@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,4 +35,35 @@ jobs:
         run: lake exe cache get || true
 
       - name: lake build
-        run: lake build
+        id: build
+        run: |
+          set -o pipefail
+          lake build 2>&1 | tee build.log
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo '### lake build (tail)' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -200 build.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment failure log on PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('build.log', 'utf8'); }
+            catch (e) { log = '(no build.log produced)'; }
+            const lines = log.split('\n');
+            const tail = lines.slice(Math.max(0, lines.length - 200)).join('\n');
+            const body = '## Lean build failure (commit ' + context.sha.slice(0,7) + ')\n\n' +
+              '```\n' + tail + '\n```';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
