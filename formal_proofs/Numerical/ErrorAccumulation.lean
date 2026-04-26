@@ -37,6 +37,7 @@ def chainedError (n k : ℕ) : ℝ := ↑n * singleStepError k
 theorem chainedError_bound (n k : ℕ) :
     chainedError n k = ↑n * (2 : ℝ)⁻¹ ^ k := by
   unfold chainedError singleStepError
+  rfl
 
 theorem chainedError_nonneg (n k : ℕ) : 0 ≤ chainedError n k := by
   unfold chainedError; exact mul_nonneg (Nat.cast_nonneg) (le_of_lt (singleStepError_pos k))
