@@ -34,15 +34,6 @@ jobs:
       - name: Fetch Mathlib cache
         run: (lake exe cache get 2>&1 | tee -a /tmp/build.log) || true
 
-      - name: lake build (foundations first)
-        run: |
-          set -o pipefail
-          # Build the foundational RAC modules in dependency order to avoid
-          # a parallel-build race where downstream files invoke lean before
-          # `Cordic.ArctanFacts` / `Trig.ArctanBounds` finish (causing
-          # spurious "unknown package 'RAC'" errors that fail the workflow).
-          lake build Cordic.ArctanFacts Trig.ArctanBounds 2>&1 | tee -a /tmp/build.log
-
       - name: lake build
         id: lake_build
         continue-on-error: true
