@@ -8,9 +8,11 @@
   Reference: rac_cuda.cu RAC_ITERS, lib/c/rac_cordic.c
 -/
 import Mathlib
+import RAC.Cordic.ArctanFacts
 
 noncomputable section
 open Real BigOperators  -- BigOperators needed for `∑` and `∏` syntax
+open RAC.Cordic.ArctanFacts
 
 namespace RAC.Cordic.PrecisionKnob
 
@@ -18,16 +20,15 @@ namespace RAC.Cordic.PrecisionKnob
 
 def maxError (k : ℕ) : ℝ := arctan ((2 : ℝ)⁻¹ ^ k)
 
-/-- v4.5.0 has neither `arctan_pos`, `arctan_lt_arctan`, nor `arctan_le_self`
-    as standalone lemmas (the `Real.tendsto_arctan_*` and limits exist, but
-    the elementary inequalities here would need to be derived from
-    `arctan_strictMono` — also not present in v4.5.0 — or via the integral
-    representation. Stubbed pending a derivation pass. -/
-theorem error_positive (k : ℕ) : 0 < maxError k := by sorry
+/-- Closed via `RAC.Cordic.ArctanFacts` (round 8). -/
+theorem error_positive (k : ℕ) : 0 < maxError k :=
+  arctan_pos (inv_two_pow_pos k)
 
-theorem error_decreasing : StrictAnti maxError := by sorry
+theorem error_decreasing : StrictAnti maxError :=
+  arctan_strictMono.comp_strictAnti inv_two_pow_strictAnti
 
-theorem error_bounded_by_power (k : ℕ) : maxError k ≤ (2 : ℝ)⁻¹ ^ k := by sorry
+theorem error_bounded_by_power (k : ℕ) : maxError k ≤ (2 : ℝ)⁻¹ ^ k :=
+  arctan_le_self_of_nonneg (inv_two_pow_pos k).le
 
 /-! ## 2. Common Configurations -/
 
