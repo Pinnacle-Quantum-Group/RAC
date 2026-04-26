@@ -98,8 +98,8 @@ def cordicIters : ℕ → State → State
 /-- **Universal CORDIC residual equality** — the heart of single-step
     convergence analysis. -/
 theorem residual_step_eq (s : State) (i : ℕ) :
-    |(cordicStep s i).z| = | |s.z| - atanTable i | := by
-  show |s.z - sigma s.z * atanTable i| = | |s.z| - atanTable i |
+    |(cordicStep s i).z| = abs (|s.z| - atanTable i) := by
+  show |s.z - sigma s.z * atanTable i| = abs (|s.z| - atanTable i)
   have h_atan_nonneg : 0 ≤ atanTable i := (atanTable_pos i).le
   unfold sigma
   split_ifs with hz
@@ -136,7 +136,7 @@ theorem residual_bound_triangle (s₀ : State) (n : ℕ) :
     rw [residual_step_eq]
     have h_atan_nonneg : 0 ≤ atanTable n := (atanTable_pos n).le
     -- ||z_n| - atanTable n| ≤ |z_n| + atanTable n  (triangle inequality)
-    have h_tri : | |(cordicIters n s₀).z| - atanTable n | ≤
+    have h_tri : abs (|(cordicIters n s₀).z| - atanTable n) ≤
         |(cordicIters n s₀).z| + atanTable n := by
       rcases le_or_lt 0 (|(cordicIters n s₀).z| - atanTable n) with h | h
       · rw [abs_of_nonneg h]; linarith [abs_nonneg (cordicIters n s₀).z]
