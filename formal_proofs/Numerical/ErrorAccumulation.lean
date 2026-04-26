@@ -56,7 +56,15 @@ theorem more_iterations_less_error (n k₁ k₂ : ℕ) (hk : k₁ < k₂) (hn : 
 
 theorem error_vanishes_with_precision (n : ℕ) (ε : ℝ) (hε : 0 < ε) :
     ∃ k : ℕ, chainedError n k < ε := by
-  sorry
+  -- chainedError n k = ↑n * (1/2)^k, and (1/2)^k → 0, so the product → 0.
+  have h_pow : Tendsto (fun k : ℕ => ((2 : ℝ)⁻¹) ^ k) atTop (nhds 0) :=
+    tendsto_pow_atTop_nhds_zero_of_lt_one (by norm_num) (by norm_num)
+  have h_chain : Tendsto (fun k : ℕ => chainedError n k) atTop (nhds 0) := by
+    have h_mul := h_pow.const_mul (↑n : ℝ)
+    simpa [chainedError, singleStepError, mul_zero] using h_mul
+  -- Eventually (chainedError n k < ε); extract a witness.
+  rcases (h_chain.eventually (Iio_mem_nhds hε)).exists with ⟨K, hK⟩
+  exact ⟨K, hK⟩
 
 /-! ## 5. Composition of Error Bounds -/
 

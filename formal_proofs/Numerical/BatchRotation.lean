@@ -21,7 +21,10 @@ def rotate2D (x y θ : ℝ) : ℝ × ℝ :=
 
 theorem rotate_preserves_norm (x y θ : ℝ) :
     (rotate2D x y θ).1 ^ 2 + (rotate2D x y θ).2 ^ 2 = x ^ 2 + y ^ 2 := by
-  unfold rotate2D; nlinarith [sin_sq_add_cos_sq θ]
+  -- nlinarith doesn't auto-reduce Prod.fst/snd projections; show the
+  -- unfolded polynomial form and feed the trig identity sin² + cos² = 1.
+  show (x * cos θ - y * sin θ) ^ 2 + (x * sin θ + y * cos θ) ^ 2 = x ^ 2 + y ^ 2
+  nlinarith [sin_sq_add_cos_sq θ, sq_nonneg (cos θ), sq_nonneg (sin θ)]
 
 /-! ## 2. Batch Rotation Definition -/
 
@@ -49,18 +52,17 @@ theorem batch_preserves_total_norm (pairs : Fin n → ℝ × ℝ) (angles : Fin 
 theorem batch_composition (pairs : Fin n → ℝ × ℝ) (θ₁ θ₂ : Fin n → ℝ) :
     batchRotate (batchRotate pairs θ₁) θ₂ =
     fun i => rotate2D (pairs i).1 (pairs i).2 (θ₁ i + θ₂ i) := by
-  ext i
-  unfold batchRotate rotate2D
-  simp [cos_add, sin_add]
-  constructor <;> ring
+  funext i
+  simp only [batchRotate, rotate2D, cos_add, sin_add]
+  exact Prod.ext (by ring) (by ring)
 
 /-! ## 6. Batch Identity -/
 
 theorem batch_identity (pairs : Fin n → ℝ × ℝ) :
     batchRotate pairs (fun _ => 0) = pairs := by
-  ext i
-  unfold batchRotate rotate2D
-  simp [cos_zero, sin_zero]
+  funext i
+  simp only [batchRotate, rotate2D, cos_zero, sin_zero]
+  exact Prod.ext (by ring) (by ring)
 
 /-! ## 7. Batch Inverse -/
 

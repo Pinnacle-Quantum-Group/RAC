@@ -20,11 +20,13 @@ def ropeRotate (x y θ : ℝ) : ℝ × ℝ :=
 
 theorem rope_preserves_norm (x y θ : ℝ) :
     (ropeRotate x y θ).1 ^ 2 + (ropeRotate x y θ).2 ^ 2 = x ^ 2 + y ^ 2 := by
-  unfold ropeRotate; simp; nlinarith [sin_sq_add_cos_sq θ, cos_sq_add_sin_sq θ]
+  show (x * cos θ - y * sin θ) ^ 2 + (x * sin θ + y * cos θ) ^ 2 = x ^ 2 + y ^ 2
+  nlinarith [sin_sq_add_cos_sq θ, sq_nonneg (cos θ), sq_nonneg (sin θ)]
 
 theorem rope_invertible (x y θ : ℝ) :
     ropeRotate (ropeRotate x y θ).1 (ropeRotate x y θ).2 (-θ) = (x, y) := by
-  unfold ropeRotate; simp [cos_neg, sin_neg]; constructor <;> nlinarith [sin_sq_add_cos_sq θ]
+  simp only [ropeRotate, cos_neg, sin_neg]
+  refine Prod.ext ?_ ?_ <;> nlinarith [sin_sq_add_cos_sq θ]
 
 /-! ## 2. Attention Weights Form Valid Distribution -/
 
