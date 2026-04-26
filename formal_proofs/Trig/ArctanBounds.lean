@@ -16,7 +16,7 @@
 -/
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.ArctanDeriv
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Bounds
-import RAC.Cordic.ArctanFacts
+import Cordic.ArctanFacts
 
 noncomputable section
 open Real Set

@@ -22,8 +22,8 @@ import Mathlib.Analysis.SpecialFunctions.Trigonometric.Basic
 import Mathlib.Analysis.SpecialFunctions.Trigonometric.Arctan
 import Mathlib.Data.Real.Basic
 import Mathlib.Tactic
-import RAC.Cordic.ArctanFacts
-import RAC.Trig.ArctanBounds
+import Cordic.ArctanFacts
+import Trig.ArctanBounds
 
 noncomputable section
 

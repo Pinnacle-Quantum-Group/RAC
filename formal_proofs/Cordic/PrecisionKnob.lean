@@ -8,7 +8,7 @@
   Reference: rac_cuda.cu RAC_ITERS, lib/c/rac_cordic.c
 -/
 import Mathlib
-import RAC.Cordic.ArctanFacts
+import Cordic.ArctanFacts
 
 noncomputable section
 open Real BigOperators
