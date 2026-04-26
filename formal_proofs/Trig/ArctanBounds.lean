@@ -100,13 +100,92 @@ theorem arctan_lb {x : ℝ} (hx : 0 ≤ x) : x - x^3 / 3 ≤ arctan x := by
 theorem arctan_ub {x : ℝ} (hx : 0 ≤ x) : arctan x ≤ x :=
   arctan_le_self_of_nonneg hx
 
+/-! ## Half-argument bound: `arctan(x)/2 ≤ arctan(x/2)` for x ≥ 0.
+
+    Equivalent to `arctan(x/2) ≥ arctan(x)/2`. Derived via
+    h(y) := 2·arctan(y/2) - arctan(y), with h(0) = 0 and
+    h'(y) = 3y² / ((4+y²)(1+y²)) ≥ 0.
+
+    Consequence: `atanTable (k+1) = arctan(2⁻ᵏ⁻¹) = arctan((2⁻ᵏ)/2) ≥
+    arctan(2⁻ᵏ)/2 = atanTable k / 2`.  This is the geometric inequality
+    that drives Volder's absorption property
+      `atanTable k ≤ ∑_{j>k} atanTable j`. -/
+
+private def h₂ (y : ℝ) : ℝ := 2 * arctan (y / 2) - arctan y
+
+private lemma h₂_zero : h₂ 0 = 0 := by simp [h₂, Real.arctan_zero]
+
+private lemma hasDerivAt_h₂ (y : ℝ) :
+    HasDerivAt h₂ (3 * y^2 / ((4 + y^2) * (1 + y^2))) y := by
+  -- d/dy arctan(y/2) = (1/2) · 1/(1 + (y/2)²)
+  have h_id_div : HasDerivAt (fun z : ℝ => z / 2) (1/2 : ℝ) y := by
+    simpa using (hasDerivAt_id y).div_const 2
+  have h_arctan_half : HasDerivAt (fun z : ℝ => arctan (z / 2))
+      ((1 / (1 + (y/2)^2)) * (1/2)) y :=
+    (Real.hasDerivAt_arctan (y/2)).comp y h_id_div
+  have h_arctan : HasDerivAt arctan (1 / (1 + y^2)) y := Real.hasDerivAt_arctan y
+  have : HasDerivAt h₂ (2 * ((1 / (1 + (y/2)^2)) * (1/2)) - 1 / (1 + y^2)) y :=
+    (h_arctan_half.const_mul 2).sub h_arctan
+  convert this using 1
+  have h_denom1 : (0 : ℝ) < 1 + (y/2)^2 := by positivity
+  have h_denom2 : (0 : ℝ) < 1 + y^2 := by positivity
+  have h_denom1_ne : (1 + (y/2)^2 : ℝ) ≠ 0 := ne_of_gt h_denom1
+  have h_denom2_ne : (1 + y^2 : ℝ) ≠ 0 := ne_of_gt h_denom2
+  have h_denom_4 : (4 + y^2 : ℝ) ≠ 0 := by positivity
+  -- 1/(1 + (y/2)²) = 4/(4 + y²)
+  field_simp
+  ring
+
+private lemma deriv_h₂_nonneg (y : ℝ) : 0 ≤ deriv h₂ y := by
+  rw [(hasDerivAt_h₂ y).deriv]
+  have h_denom : (0 : ℝ) < (4 + y^2) * (1 + y^2) := by positivity
+  apply div_nonneg
+  · positivity
+  · exact h_denom.le
+
+private lemma deriv_h₂_pos {y : ℝ} (hy : y ≠ 0) : 0 < deriv h₂ y := by
+  rw [(hasDerivAt_h₂ y).deriv]
+  have h_y2_pos : 0 < y^2 := by positivity
+  have h_denom : (0 : ℝ) < (4 + y^2) * (1 + y^2) := by positivity
+  apply div_pos
+  · linarith
+  · exact h_denom
+
+private lemma continuous_h₂ : Continuous h₂ := by
+  unfold_let h₂
+  exact (Real.continuous_arctan.comp (continuous_id.div_const 2)).const_mul 2 |>.sub
+        Real.continuous_arctan
+
+/-- `arctan(x)/2 ≤ arctan(x/2)` for `x ≥ 0`.  Concavity-style bound
+    derived via `h₂(y) := 2·arctan(y/2) - arctan(y)`, mono with
+    h₂(0) = 0 ⟹ h₂(x) ≥ 0 ⟹ arctan(x) ≤ 2·arctan(x/2). -/
+theorem arctan_half_ge {x : ℝ} (hx : 0 ≤ x) : arctan x / 2 ≤ arctan (x / 2) := by
+  rcases eq_or_lt_of_le hx with hx0 | hx_pos
+  · subst hx0; simp [Real.arctan_zero]
+  · have h_cont : ContinuousOn h₂ (Ici (0:ℝ)) := continuous_h₂.continuousOn
+    have h_interior : interior (Ici (0:ℝ)) = Ioi 0 := interior_Ici
+    have h_deriv_pos_on : ∀ y, y ∈ interior (Ici (0:ℝ)) → 0 < deriv h₂ y := by
+      intro y hy
+      rw [h_interior] at hy
+      exact deriv_h₂_pos (ne_of_gt hy)
+    have h_mono : StrictMonoOn h₂ (Ici (0:ℝ)) :=
+      Convex.strictMonoOn_of_deriv_pos (convex_Ici 0) h_cont h_deriv_pos_on
+    have h_zero_mem : (0:ℝ) ∈ Ici (0:ℝ) := left_mem_Ici
+    have h_x_mem : x ∈ Ici (0:ℝ) := hx
+    have h_strict := h_mono h_zero_mem h_x_mem hx_pos
+    rw [h₂_zero] at h_strict
+    -- 0 < h₂ x = 2·arctan(x/2) - arctan(x)
+    linarith
+
 /-! ## Specialization for CORDIC: bounds on atan(2⁻ᵏ).
 
     `atanTable i = arctan ((1/2)^i)` in the CORDIC modules.  Here we
     expose:
       atanTable_lb : (1/2)^i - (1/2)^(3i)/3 ≤ arctan ((1/2)^i)
       atanTable_ub :                          arctan ((1/2)^i) ≤ (1/2)^i
-    which are the inputs to the absorption-property analysis.  -/
+      atanTable_half : arctan (2^(-(k+1))) ≥ arctan (2^(-k)) / 2
+    The third is the geometric chain that yields absorption via
+      ∑_{j>k} atanTable j ≥ atanTable k · ∑_{j≥1} 2⁻ʲ = atanTable k. -/
 
 theorem arctan_inv_two_pow_lb (i : ℕ) :
     (2:ℝ)⁻¹^i - ((2:ℝ)⁻¹^i)^3 / 3 ≤ arctan ((2:ℝ)⁻¹^i) := by
@@ -117,5 +196,14 @@ theorem arctan_inv_two_pow_ub (i : ℕ) :
     arctan ((2:ℝ)⁻¹^i) ≤ (2:ℝ)⁻¹^i := by
   have h : (0 : ℝ) ≤ (2:ℝ)⁻¹^i := by positivity
   exact arctan_ub h
+
+/-- Geometric chain: `atan(2⁻⁽ᵏ⁺¹⁾) ≥ atan(2⁻ᵏ) / 2`. -/
+theorem arctan_inv_two_pow_succ_ge_half (k : ℕ) :
+    arctan ((2:ℝ)⁻¹^k) / 2 ≤ arctan ((2:ℝ)⁻¹^(k+1)) := by
+  have h_nonneg : (0 : ℝ) ≤ (2:ℝ)⁻¹^k := by positivity
+  have h_eq : (2:ℝ)⁻¹^(k+1) = (2:ℝ)⁻¹^k / 2 := by
+    rw [pow_succ]; ring
+  rw [h_eq]
+  exact arctan_half_ge h_nonneg
 
 end RAC.Trig.ArctanBounds
