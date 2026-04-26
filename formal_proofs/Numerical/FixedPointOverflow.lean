@@ -19,11 +19,16 @@ structure Q16_16 where
 
 def RAC_ITERS : ℕ := 16
 
-def atanTableQ16 : Fin RAC_ITERS → Int
-  | ⟨0, _⟩ => 51472 | ⟨1, _⟩ => 30386 | ⟨2, _⟩ => 16055 | ⟨3, _⟩ => 8150
-  | ⟨4, _⟩ => 4091  | ⟨5, _⟩ => 2047  | ⟨6, _⟩ => 1024  | ⟨7, _⟩ => 512
-  | ⟨8, _⟩ => 256   | ⟨9, _⟩ => 128   | ⟨10, _⟩ => 64   | ⟨11, _⟩ => 32
-  | ⟨12, _⟩ => 16   | ⟨13, _⟩ => 8    | ⟨14, _⟩ => 4    | ⟨15, _⟩ => 2
+def atanTableQ16 (i : Fin RAC_ITERS) : Int :=
+  -- Pattern-match on `i.val` so Lean doesn't require exhaustiveness over
+  -- the abstract `Fin RAC_ITERS` constructors. Default 0 is unreachable
+  -- since `i.val < RAC_ITERS = 16`.
+  match i.val with
+  | 0 => 51472 | 1 => 30386 | 2 => 16055 | 3 => 8150
+  | 4 => 4091  | 5 => 2047  | 6 => 1024  | 7 => 512
+  | 8 => 256   | 9 => 128   | 10 => 64   | 11 => 32
+  | 12 => 16   | 13 => 8    | 14 => 4    | 15 => 2
+  | _ => 0  -- unreachable: i.val < 16
 
 def arithRightShift (v : Int) (n : ℕ) : Int :=
   if v ≥ 0 then v / (2 ^ n : Int)
@@ -32,7 +37,12 @@ def arithRightShift (v : Int) (n : ℕ) : Int :=
 theorem arithRightShift_neg_is_neg {v : Int} {n : ℕ} (hv : v < 0) :
     arithRightShift v n < 0 := by
   unfold arithRightShift
-  simp only [show ¬(v ≥ 0) from not_le.mpr hv, ite_false]; omega
+  simp only [show ¬(v ≥ 0) from not_le.mpr hv, ite_false]
+  -- Goal: -((-v - 1) / (2^n) + 1) < 0. Use positivity of div quotient.
+  have h2 : (0 : Int) < 2 ^ n := by positivity
+  have hnv : (0 : Int) ≤ -v - 1 := by omega
+  have hdiv : (0 : Int) ≤ (-v - 1) / 2 ^ n := Int.ediv_nonneg hnv (le_of_lt h2)
+  linarith
 
 theorem arithRightShift_nonneg_is_nonneg {v : Int} {n : ℕ} (hv : 0 ≤ v) :
     0 ≤ arithRightShift v n := by

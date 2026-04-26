@@ -50,6 +50,9 @@ theorem iter_progression :
     next (.iter 0) false = .iter 1 ∧
     next (.iter 7) false = .iter 8 ∧
     next (.iter 14) false = .iter 15 ∧
-    next (.iter 15) false = .done := by simp [next]
+    next (.iter 15) false = .done := by
+  -- Each branch is a concrete `if k < 15 then .iter (k+1) else .done`;
+  -- decide closes after `simp [next]` reduces.
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> simp [next]
 
 end RAC.Transformer.RtlFsm
