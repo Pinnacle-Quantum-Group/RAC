@@ -29,28 +29,27 @@ theorem q16_resolution_pos : 0 < q16Resolution := by
 
 theorem quantization_error_bound (x : ℝ) :
     |x - dequantize (quantize x)| ≤ q16Resolution / 2 := by
+  -- Normalize the OfScientific literal `0.5` to `1/2` BEFORE `set` so the
+  -- let-binding for `r` doesn't thread `0.5` through downstream linarith calls.
+  have h05 : (0.5 : ℝ) = 1 / 2 := by norm_num
   unfold quantize dequantize
+  rw [h05]
   have hq : 0 < q16Resolution := q16_resolution_pos
   have hq_ne : (q16Resolution : ℝ) ≠ 0 := ne_of_gt hq
-  set r : ℝ := x / q16Resolution + 0.5 with hr_def
-  -- Int.floor bounds: ⌊r⌋ ≤ r < ⌊r⌋ + 1
+  set r : ℝ := x / q16Resolution + 1 / 2 with hr_def
   have h_le : (⌊r⌋ : ℝ) ≤ r := Int.floor_le r
   have h_lt : r < (⌊r⌋ : ℝ) + 1 := Int.lt_floor_add_one r
-  -- Algebraic factor: x - ⌊r⌋·q = q · (r - 0.5 - ⌊r⌋)
   have h_eq : x - (⌊r⌋ : ℝ) * q16Resolution =
-              q16Resolution * (r - 0.5 - (⌊r⌋ : ℝ)) := by
+              q16Resolution * (r - 1 / 2 - (⌊r⌋ : ℝ)) := by
     show x - (⌊r⌋ : ℝ) * q16Resolution =
-         q16Resolution * (x / q16Resolution + 0.5 - 0.5 - (⌊r⌋ : ℝ))
+         q16Resolution * (x / q16Resolution + 1 / 2 - 1 / 2 - (⌊r⌋ : ℝ))
     field_simp
     ring
   rw [h_eq, abs_mul, abs_of_pos hq]
-  -- |r - 0.5 - ⌊r⌋| ≤ 1/2 from the floor bounds.
-  -- `linarith` doesn't see `0.5` (OfScientific) as `1/2`; rewrite explicitly.
-  have h_half : (0.5 : ℝ) = 1 / 2 := by norm_num
-  have h_bound : |r - 0.5 - (⌊r⌋ : ℝ)| ≤ 1 / 2 := by
-    rw [h_half, abs_le]
+  have h_bound : |r - 1 / 2 - (⌊r⌋ : ℝ)| ≤ 1 / 2 := by
+    rw [abs_le]
     refine ⟨?_, ?_⟩ <;> linarith
-  calc q16Resolution * |r - 0.5 - (⌊r⌋ : ℝ)|
+  calc q16Resolution * |r - 1 / 2 - (⌊r⌋ : ℝ)|
       ≤ q16Resolution * (1 / 2) :=
         mul_le_mul_of_nonneg_left h_bound (le_of_lt hq)
     _ = q16Resolution / 2 := by ring
